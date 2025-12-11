@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
+syntax = "proto3";
+
+package openpenny.api;
+
+message StartTestRequest {
+  // Required flow selection.
+  string prefix = 1;      // e.g. "10.0.0.0"
+  uint32 mask_bits = 2;   // e.g. 24
+
+  // Optional label for caller correlation.
+  string test_id = 3;
+
+  // Optional forwarding controls.
+  optional bool forward_to_tun = 4; // Default: true if unset.
+  optional string tun_name = 5;     // Default: "xdp-tu" if unset.
+  optional string mode = 6;         // "active" (default) or "passive".
+  optional string stats_socket_path = 7; // Unix datagram socket path for live stats.
+  optional bool tun_multi_queue = 8;    // Attempt multi-queue TUN (default true).
+  optional uint32 tun_mtu = 9;          // MTU to set on TUN or forward interface.
+  optional bool forward_raw_socket = 10; // Forward via raw socket bound to an interface.
+  optional string forward_device = 11;   // Interface name for forwarding (TUN or raw).
+  optional string config_override_json = 12; // Inline JSON to override monitoring config for this request.
+}
+
+message StartTestResponse {
+  string test_id = 1;
+  string status = 2; // "ok" or error text
+  string json_summary = 19; // JSON-formatted summary (CLI-like).
+
+  // Summary from ModeResult.
+  uint64 packets_processed = 3;
+  uint64 packets_forwarded = 4;
+  uint64 forward_errors = 5;
+  uint64 pure_ack_packets = 6;
+  uint64 data_packets = 7;
+  uint64 duplicate_packets = 8;
+  uint64 in_order_packets = 9;
+  uint64 out_of_order_packets = 10;
+  uint64 retransmitted_packets = 11;
+  uint64 non_retransmitted_packets = 12;
+  uint64 pending_retransmissions = 13;
+  uint64 flows_tracked_syn = 14;
+  uint64 flows_tracked_data = 15;
+  bool penny_completed = 16;
+  bool aggregates_penny_completed = 17;
+  bool aggregates_enabled = 18;
+
+  // Active-mode aggregate evaluation details (CLI-like).
+  string aggregates_status = 20; // pending | closed_loop | not_closed_loop | duplicates_exceeded | n/a
+  bool aggregates_decision_complete = 21; // True if aggregate evaluation reached a terminal decision.
+  bool aggregates_has_eval = 22; // True if eval counters represent a completed aggregate decision.
+  uint64 aggregates_eval_data_packets = 23;
+  uint64 aggregates_eval_duplicate_packets = 24;
+  uint64 aggregates_eval_retransmitted_packets = 25;
+  uint64 aggregates_eval_non_retransmitted_packets = 26;
+  uint64 aggregates_snapshots = 27; // Drop snapshots collected across queues.
+  uint64 aggregate_flows_monitored = 28;
+  uint64 aggregate_flows_finished = 29;
+  uint64 aggregate_flows_closed_loop = 30;
+  uint64 aggregate_flows_not_closed_loop = 31;
+  uint64 aggregate_flows_rst = 32;
+  uint64 aggregate_flows_duplicates_exceeded = 33;
+}
+
+service PennyService {
+  // Starts a Penny test using YAML defaults, overriding prefix/mask from the request.
+  // The call blocks until the test completes and returns the summary.
+  rpc StartTest(StartTestRequest) returns (StartTestResponse);
+}

@@ -1,0 +1,231 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OpenPenny Configuration",
+  "type": "object",
+  "required": ["log", "input_sources", "traffic_forwarding", "monitoring", "grpc"],
+  "additionalProperties": false,
+  "properties": {
+    "log": {
+      "type": "object",
+      "required": ["mode", "level"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "type": "string", "enum": ["console", "file"] },
+        "level": { "type": "string", "enum": ["trace", "debug", "info", "warn", "error"] }
+      }
+    },
+
+    "input_sources": {
+      "type": "object",
+      "required": ["xdp", "dpdk"],
+      "additionalProperties": false,
+      "properties": {
+        "xdp": {
+          "type": "object",
+          "required": ["interface", "rx_queue", "drv_mode", "zerocopy", "frame_size", "num_frames", "rx_ring", "runtime"],
+          "additionalProperties": false,
+          "properties": {
+            "interface": { "type": "string" },
+            "rx_queue": { "type": "integer", "minimum": 0 },
+            "drv_mode": { "type": "boolean" },
+            "zerocopy": { "type": "boolean" },
+            "frame_size": { "type": "integer", "minimum": 512 },
+            "num_frames": { "type": "integer", "minimum": 1024 },
+            "rx_ring": { "type": "integer", "minimum": 64 },
+
+            "runtime": {
+              "type": "object",
+              "required": [
+                "enable", "attach_program", "detach_on_close",
+                "reuse_pins", "pin_maps", "update_conf_map", "verbose",
+                "drop_unmatched", "allow_ssh_bypass", "require_zerocopy",
+                "allow_skb_fallback", "force_copy_mode", "allow_copy_fallback",
+                "batch", "poll_timeout_ms", "bpf_object", "bpf_program",
+                "map_conf_name", "map_xsks_name", "map_stats_name",
+                "pin_conf_path", "pin_xsks_path", "pin_stats_path",
+                "prefix", "mask_bits"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "enable": { "type": "boolean" },
+                "attach_program": { "type": "boolean" },
+                "detach_on_close": { "type": "boolean" },
+                "reuse_pins": { "type": "boolean" },
+                "pin_maps": { "type": "boolean" },
+                "update_conf_map": { "type": "boolean" },
+                "verbose": { "type": "boolean" },
+                "drop_unmatched": { "type": "boolean" },
+                "allow_ssh_bypass": { "type": "boolean" },
+                "require_zerocopy": { "type": "boolean" },
+                "allow_skb_fallback": { "type": "boolean" },
+                "force_copy_mode": { "type": "boolean" },
+                "allow_copy_fallback": { "type": "boolean" },
+                "batch": { "type": "integer", "minimum": 1 },
+                "poll_timeout_ms": { "type": "integer", "minimum": 0 },
+                "bpf_object": { "type": "string" },
+                "bpf_program": { "type": "string" },
+                "map_conf_name": { "type": "string" },
+                "map_xsks_name": { "type": "string" },
+                "map_stats_name": { "type": "string" },
+                "pin_conf_path": { "type": "string" },
+                "pin_xsks_path": { "type": "string" },
+                "pin_stats_path": { "type": "string" },
+                "prefix": { "type": "string", "format": "ipv4" },
+                "mask_bits": { "type": "integer", "minimum": 0, "maximum": 32 }
+              }
+            }
+          }
+        },
+
+        "dpdk": {
+          "type": "object",
+          "required": ["enable", "burst"],
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "burst": { "type": "integer", "minimum": 1 },
+            "ifname": { "type": "string" },
+            "queue": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+
+    "traffic_forwarding": {
+      "type": "object",
+      "required": ["tun"],
+      "additionalProperties": false,
+      "properties": {
+        "tun": {
+          "type": "object",
+          "required": ["enable", "name", "multi_queue", "mtu"],
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "name": { "type": "string" },
+            "multi_queue": { "type": "boolean" },
+            "mtu": { "type": "integer", "minimum": 576 }
+          }
+        },
+
+        "raw_socket": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "device": { "type": "string" },
+            "bind_queue": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+
+    "monitoring": {
+      "type": "object",
+      "required": ["active", "passive"],
+      "additionalProperties": false,
+      "properties": {
+        "active": {
+          "type": "object",
+          "required": ["enabled", "aggregates", "drop_policy", "timeouts", "execution"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+
+            "aggregates": {
+              "type": "object",
+              "required": ["enabled", "max_monitored_flows", "fallback_to_individual", "min_individual_flows_for_closed_loop"],
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "max_monitored_flows": { "type": "integer", "minimum": 0 },
+                "fallback_to_individual": { "type": "boolean" },
+                "min_individual_flows_for_closed_loop": { "type": "integer", "minimum": 0 }
+              }
+            },
+
+            "drop_policy": {
+              "type": "object",
+              "required": ["packet_drop_probability", "max_duplicate_ratio", "max_reordering_ratio", "retransmission_observation_miss_rate"],
+              "additionalProperties": false,
+              "properties": {
+                "packet_drop_probability": { "type": "number", "minimum": 0, "maximum": 1 },
+                "max_duplicate_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+                "max_reordering_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+                "retransmission_observation_miss_rate": { "type": "number", "minimum": 0, "maximum": 1 }
+              }
+            },
+
+            "timeouts": {
+              "type": "object",
+              "required": ["admission_grace_period_seconds", "monitored_flow_idle_expiry_seconds"],
+              "oneOf": [
+                { "required": ["retransmission_timeout_multiplier"] },
+                { "required": ["retransmission_timeout_seconds"] }
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "retransmission_timeout_multiplier": { "type": "number", "exclusiveMinimum": 0 },
+                "retransmission_timeout_seconds": { "type": "number", "exclusiveMinimum": 0 },
+                "admission_grace_period_seconds": { "type": "number", "minimum": 0 },
+                "monitored_flow_idle_expiry_seconds": { "type": "number", "minimum": 0 }
+              }
+            },
+
+            "execution": {
+              "type": "object",
+              "required": ["max_packet_drops_per_flow", "max_packet_drops_global_aggregate"],
+              "additionalProperties": false,
+              "properties": {
+                "max_packet_drops_per_flow": { "type": "integer", "minimum": 0 },
+                "max_packet_drops_global_aggregate": { "type": "integer", "minimum": 0 },
+                "max_number_of_individual_flows": { "type": "integer", "minimum": 0 },
+                "stop_after_individual_flows": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        },
+
+        "passive": {
+          "type": "object",
+          "required": ["enabled", "min_number_of_flows_to_finish", "max_execution_time"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "min_number_of_flows_to_finish": { "type": "integer", "minimum": 0 },
+            "max_parallel_flows": { "type": "integer", "minimum": 0 },
+            "max_execution_time": { "type": "integer", "minimum": 0 },
+            "timeouts": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "admission_grace_period_seconds": { "type": "number", "minimum": 0 },
+                "monitored_flow_idle_expiry_seconds": { "type": "number", "minimum": 0 }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "grpc": {
+      "type": "object",
+      "required": ["enable", "listen_ip", "listen_port"],
+      "additionalProperties": false,
+      "properties": {
+        "enable": { "type": "boolean" },
+        "listen_ip": { "type": "string", "format": "ipv4" },
+        "listen_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enable": { "type": "boolean" },
+            "cert_file": { "type": "string" },
+            "key_file": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

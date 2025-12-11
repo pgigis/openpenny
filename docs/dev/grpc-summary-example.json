@@ -1,0 +1,42 @@
+{
+  "test_id": "demo-test",
+  "status": "ok",
+  "packets": {
+    "processed": 12345,
+    "forwarded": 12345,
+    "errors": 0,
+    "pure_ack": 10,
+    "data": 12000,
+    "duplicate": 15,
+    "in_order": 11850,
+    "out_of_order": 150,
+    "retransmitted": 5,
+    "non_retransmitted": 2
+  },
+  "flows": {
+    "tracked_syn": 8,
+    "tracked_data": 12
+  },
+  "penny_completed": true,
+  "aggregates_completed": false,
+  "aggregates_enabled": true,
+  "aggregates_status": "pending",
+  "aggregates_decision_complete": false,
+  "aggregates_decision_state": "running",
+  "aggregates_has_eval": false,
+  "aggregates_snapshots": 1,
+  "aggregates_eval": {
+    "data": 0,
+    "duplicate": 0,
+    "retransmitted": 0,
+    "non_retransmitted": 0
+  },
+  "aggregate_flows": {
+    "monitored": 25,
+    "finished": 4,
+    "closed_loop": 0,
+    "not_closed_loop": 4,
+    "rst": 0,
+    "duplicates_exceeded": 0
+  }
+}

@@ -1,0 +1,12 @@
+# This is a generated file and its contents are an internal implementation detail.
+# The download step will be re-executed if anything in this file changes.
+# No other meaning or use of this file is supported.
+
+method=url
+command=/usr/local/Cellar/cmake/3.25.0/bin/cmake;-P;/Users/pgigis/git-repos/openpenny-testing/build/_deps/yaml-cpp-subbuild/yaml-cpp-populate-prefix/src/yaml-cpp-populate-stamp/download-yaml-cpp-populate.cmake;COMMAND;/usr/local/Cellar/cmake/3.25.0/bin/cmake;-P;/Users/pgigis/git-repos/openpenny-testing/build/_deps/yaml-cpp-subbuild/yaml-cpp-populate-prefix/src/yaml-cpp-populate-stamp/verify-yaml-cpp-populate.cmake;COMMAND;/usr/local/Cellar/cmake/3.25.0/bin/cmake;-P;/Users/pgigis/git-repos/openpenny-testing/build/_deps/yaml-cpp-subbuild/yaml-cpp-populate-prefix/src/yaml-cpp-populate-stamp/extract-yaml-cpp-populate.cmake
+source_dir=/Users/pgigis/git-repos/openpenny-testing/build/_deps/yaml-cpp-src
+work_dir=/Users/pgigis/git-repos/openpenny-testing/build/_deps
+url(s)=https://github.com/jbeder/yaml-cpp/archive/refs/tags/yaml-cpp-0.8.0.tar.gz
+hash=
+no_extract=
+

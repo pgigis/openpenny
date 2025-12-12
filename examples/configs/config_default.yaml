@@ -1,0 +1,131 @@
+log:
+  mode: console              # Log output backend: console or file.
+  level: debug                # Minimum log level to emit.
+
+input_sources:
+
+  # ========================================================================
+  # XDP packet capture (primary data plane)
+  # ========================================================================
+  xdp:
+    interface: ens5f0np0     # Network interface used for XDP and AF_XDP capture.
+    rx_queue: 0              # RX queue index for program attachment.
+
+    drv_mode: true           # Attempt driver (native) mode for XDP hooks.
+    zerocopy: true           # Enable AF_XDP zero-copy mode for UMEM.
+    frame_size: 2048         # Size of each frame in UMEM (bytes).
+    num_frames: 65536        # Number of frames allocated in UMEM.
+    rx_ring: 4096            # RX ring descriptor size.
+
+    runtime:
+      enable: true                # Enable the XDP capture path.
+      attach_program: true        # Attach the XDP BPF program on start.
+      detach_on_close: true       # Detach the XDP BPF program on shutdown.
+
+      reuse_pins: false            # Reuse pinned BPF object files when available.
+      pin_maps: true              # Pin BPF maps to bpffs for persistence.
+      update_conf_map: true       # Allow runtime updates to the conf map.
+
+      verbose: false              # Enable verbose runtime logging.
+      drop_unmatched: false       # Drop packets that do not match the destination prefix.
+      allow_ssh_bypass: true      # Permit SSH traffic to bypass XDP filters.
+
+      require_zerocopy: true      # Zero copy is mandatory; fail if unsupported.
+      allow_skb_fallback: false   # Allow SKB mode fallback when driver mode is unavailable.
+      allow_copy_fallback: false  # Allow copy mode fallback when zero copy is unavailable.
+      force_copy_mode: false      # Force copy mode even when zero copy is available.
+
+      batch: 512                 # Batch size per poll iteration.
+      poll_timeout_ms: 0        # Poll timeout (0 = busy poll, no sleep).
+
+      # BPF object and map names.
+      bpf_object: xdp_redirect_dstprefix.o  # Compiled BPF object file to load.
+      bpf_program: xdp_redirect_dstprefix   # XDP program section name in the BPF object.
+
+      map_conf_name: conf       # Name of the configuration map.
+      map_xsks_name: xsks_map   # Name of the AF_XDP sockets map.
+      map_stats_name: counters  # Name of the per-thread statistics map.
+
+      # bpffs map pin paths.
+      pin_conf_path: /sys/fs/bpf/openpenny/conf   # Destination pin path for conf map.
+      pin_xsks_path: /sys/fs/bpf/openpenny/xsks   # Destination pin path for AF_XDP XSK map.
+      pin_stats_path: /sys/fs/bpf/openpenny/stats # Destination pin path for counters map.
+
+      # Default prefix filter (disabled when mask_bits = 0).
+      prefix: 0.0.0.0          # Destination IPv4 prefix to match.
+      mask_bits: 0            # Prefix length in bits (0 = match all, no filtering).
+
+  # ========================================================================
+  # DPDK input path (example block)
+  # ========================================================================
+  dpdk:
+    enable: false            # Enable only when DPDK is explicitly configured for use.
+    burst: 64                # Maximum packets to read per RX burst poll.
+    #ifname: 0000:01:00.0    # Example: PCI address or DPDK port name.
+    #queue: 0                # Example: RX queue index.
+
+# ==========================================================================  
+# Packet reinjection and forwarding targets
+# ==========================================================================  
+traffic_forwarding:
+  tun:
+    enable: true            # Enable TUN device reinjection target.
+    name: xdp-tun           # TUN device name.
+    multi_queue: true       # Attempt multi-queue TUN mode when supported.
+    mtu: 9000              # MTU for the TUN interface (bytes).
+
+  #raw_socket:
+  #  enable: false          # Forward using a raw socket bound to a physical interface.
+  #  device: eth1           # Target network interface for raw socket reinjection.
+  #  bind_queue: 0          # Optional: Bind reinjection socket to a specific queue.
+
+# ==========================================================================  
+# Penny flow monitoring configuration
+# ==========================================================================  
+monitoring:
+  active:
+    enabled: true           # Enable active monitoring (with induced packet drops).
+
+    aggregates:
+      enabled: true         # Enable aggregate flow-level tracking.
+      max_monitored_flows: 100  # Maximum concurrent aggregate-level flows.
+      fallback_to_individual: true  # Switch to per-flow tracking when needed for closed-loop fidelity.
+      min_individual_flows_for_closed_loop: 2  # Minimum individual flows to assert aggregate closed-loop signal.
+
+    drop_policy:
+      packet_drop_probability: 0.05  # Per-packet drop probability applied to data packets.
+      max_duplicate_ratio: 0.15      # Terminate monitoring if duplicate packet ratio exceeds this threshold.
+      max_reordering_ratio: 0.80     # Terminate monitoring if reordering ratio exceeds this threshold.
+      retransmission_observation_miss_rate: 0.05  # Probability that a retransmission of a dropped packet is not observed.
+
+    timeouts:
+      retransmission_timeout_seconds: 3.0    # Absolute timeout before declaring a drop as expired.
+      admission_grace_period_seconds: 3.0    # Grace period before enabling drops for non-SYN discovered flows.
+      monitored_flow_idle_expiry_seconds: 30.0 # Evict flows after this idle window.
+
+    execution:
+      max_packet_drops_per_flow: 6           # Maximum induced drops per individual monitored flow.
+      max_packet_drops_global_aggregate: 12  # Global budget of induced drops across all threads/queues.
+      max_number_of_individual_flows: 10     # Maximum concurrent individual flows to monitor.
+      stop_after_individual_flows: 10        # Stop after this many individual flows have finished (0 disables).
+
+  passive:
+    enabled: false           # Enable passive-only flow monitoring.
+    min_number_of_flows_to_finish: 10  # Minimum flows to finish in passive mode before stopping (0 disables).
+    max_parallel_flows: 10    # Maximum concurrent passive flows tracked (0 = unlimited).
+    max_execution_time: 150    # Passive path exit timeout in seconds (0 = no timeout).
+
+    timeouts:
+      admission_grace_period_seconds: 3.0    # Grace period before enabling drops for non-SYN discovered flows.
+      monitored_flow_idle_expiry_seconds: 15.0 # Evict flows after this idle window.
+# ==========================================================================  
+# gRPC server defaults
+# ==========================================================================  
+grpc:
+  enable: true             # Enable gRPC server defaults.
+  listen_ip: 0.0.0.0       # Listen address for pennyd.
+  listen_port: 50051       # Listen port for pennyd.
+  #tls:
+  #  enable: false          # Enable TLS for gRPC server.
+  #  cert_file: /path/to/cert.pem
+  #  key_file: /path/to/key.pem

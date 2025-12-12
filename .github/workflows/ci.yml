@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libbpf-dev libxdp-dev libelf-dev libpcap-dev libssl-dev protobuf-compiler libprotobuf-dev libgrpc++-dev libgrpc-dev protobuf-compiler-grpc
+      - name: Configure
+        run: |
+          rm -rf build
+          cmake -S . -B build -DOPENPENNY_WITH_XDP=ON -DOPENPENNY_WITH_DPDK=OFF
+      - name: Build
+        run: cmake --build build
+      - name: Tests
+        run: ctest --test-dir build --output-on-failure

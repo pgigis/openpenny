@@ -1,0 +1,19 @@
+# Build outputs
+/build/
+/build*/
+
+# CMake artifacts
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+
+# Compiled objects
+*.o
+*.so
+*.dylib
+*.a
+
+# Editor and OS files
+.DS_Store
+*.swp

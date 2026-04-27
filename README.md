@@ -1,6 +1,6 @@
 # OpenPenny
 
-[![CI](https://github.com/pgigis/openpenny-testing/actions/workflows/ci.yml/badge.svg)](https://github.com/pgigis/openpenny-testing/actions/workflows/ci.yml)
+[![CI](https://github.com/pgigis/openpenny/actions/workflows/ci.yml/badge.svg)](https://github.com/pgigis/openpenny/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-BSD%202--Clause-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-1.1.0-green.svg)](docs/project/CHANGELOG.md)
 
@@ -183,7 +183,7 @@ Full map: [`docs/layout.md`](docs/layout.md). High-level:
 
 ## Project
 
-- Repository: <https://github.com/pgigis/openpenny-testing>
+- Repository: <https://github.com/pgigis/openpenny>
 - Contributing: see [`.github/pull_request_template.md`](.github/pull_request_template.md);
   use Issues for bugs/features.
 - Security: [`docs/project/SECURITY.md`](docs/project/SECURITY.md).
@@ -191,7 +191,7 @@ Full map: [`docs/layout.md`](docs/layout.md). High-level:
 - License: [BSD-2-Clause](LICENSE).
 
 Primary author: **Petros Gigis** ([`pgigis`](https://github.com/pgigis)).
-Contributors: <https://github.com/pgigis/openpenny-testing/graphs/contributors>.
+Contributors: <https://github.com/pgigis/openpenny/graphs/contributors>.
 
 The Penny mechanism was developed by **Petros Gigis, Mark Handley, and
 Stefano Vissicchio**. This project was supported by the

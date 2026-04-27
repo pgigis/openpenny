@@ -4,8 +4,120 @@ syntax = "proto3";
 
 package openpenny.api;
 
+enum TrafficDecision {
+  TRAFFIC_DECISION_UNSPECIFIED = 0;
+  TRAFFIC_DECISION_INCLUDE = 1;
+  TRAFFIC_DECISION_EXCLUDE = 2;
+}
+
+enum RuntimeMode {
+  RUNTIME_MODE_UNSPECIFIED = 0;
+  RUNTIME_MODE_ACTIVE = 1;
+  RUNTIME_MODE_PASSIVE = 2;
+}
+
+message TrafficRule {
+  optional string name = 1;
+  optional int32 priority = 2;
+  optional bool enabled = 3;
+  optional string src_prefix = 4; // CIDR prefix; a single IPv4 address is treated as /32.
+  optional string dst_prefix = 5; // CIDR prefix; a single IPv4 address is treated as /32.
+  optional string protocol = 6;   // "tcp", "udp", "icmp", or a numeric IPv4 protocol value.
+  optional uint32 src_port = 7;
+  optional uint32 dst_port = 8;
+  TrafficDecision decision = 9;
+}
+
+message TrafficPolicy {
+  TrafficDecision default_decision = 1;
+  repeated TrafficRule rules = 2;
+}
+
+message SafetyPolicy {
+  optional bool allow_ssh_bypass = 1;
+}
+
+message TestThresholds {
+  optional double packet_drop_probability = 1;
+  optional double max_duplicate_ratio = 2;
+  optional double max_reordering_ratio = 3;
+  optional double retransmission_observation_miss_rate = 4;
+  optional double retransmission_timeout_multiplier = 5;
+  optional double admission_grace_period_seconds = 6;
+  optional double monitored_flow_idle_expiry_seconds = 7;
+  optional double drop_state_seconds = 8;
+  optional uint32 min_packet_drops_per_flow = 9;
+  optional uint32 max_packet_drops_per_flow = 10;
+  optional uint32 max_packet_drops_global_aggregate = 11;
+  optional uint64 max_monitored_flows = 12;
+  optional uint64 stop_after_individual_flows = 13;
+  optional uint64 passive_min_flows_to_finish = 14;
+  optional uint64 passive_max_parallel_flows = 15;
+  optional double passive_max_execution_time_seconds = 16;
+  optional uint64 min_closed_loop_flows = 17;
+}
+
+message RuntimePolicy {
+  RuntimeMode mode = 1;
+  optional SafetyPolicy safety = 2;
+  optional TestThresholds thresholds = 3;
+}
+
+message PlatformProfile {
+  string name = 1;
+}
+
+message PennyConfig {
+  optional TrafficPolicy traffic_policy = 1;
+  optional RuntimePolicy runtime_policy = 2;
+  optional PlatformProfile platform_profile = 3;
+}
+
+message ConfigResponse {
+  string status = 1;
+  PennyConfig desired_config = 2;
+  string desired_config_json = 3;
+  string effective_config_json = 4;
+  repeated string warnings = 5;
+}
+
+message SetTrafficPolicyRequest {
+  TrafficPolicy traffic_policy = 1;
+}
+
+message SetRuntimePolicyRequest {
+  RuntimePolicy runtime_policy = 1;
+}
+
+message SetModeRequest {
+  RuntimeMode mode = 1;
+}
+
+message ApplyConfigRequest {
+  PennyConfig config = 1;
+}
+
+message GetConfigRequest {
+  bool include_platform_details = 1;
+}
+
+message ReloadConfigRequest {}
+
+message StopRequest {}
+
+message RuntimeStatusRequest {
+  bool include_effective_config = 1;
+}
+
+message RuntimeStatusResponse {
+  string status = 1;
+  RuntimeMode mode = 2;
+  string effective_config_json = 3;
+  repeated string warnings = 4;
+}
+
 message StartTestRequest {
-  // Required flow selection.
+  // Legacy flow-selection shortcut. New clients should use TrafficPolicy.
   string prefix = 1;      // e.g. "10.0.0.0"
   uint32 mask_bits = 2;   // e.g. 24
 
@@ -65,6 +177,33 @@ message StartTestResponse {
 }
 
 service PennyService {
+  // Applies high-level Penny intent. Dataplane maps and AF_XDP/DPDK internals are compiled by the daemon.
+  rpc ApplyConfig(ApplyConfigRequest) returns (ConfigResponse);
+
+  // Updates only traffic selection policy.
+  rpc SetTrafficPolicy(SetTrafficPolicyRequest) returns (ConfigResponse);
+
+  // Updates runtime policy: active/passive mode, thresholds, timers, budgets, and safety policy.
+  rpc SetRuntimePolicy(SetRuntimePolicyRequest) returns (ConfigResponse);
+
+  // Convenience method for switching Penny runtime mode.
+  rpc SetMode(SetModeRequest) returns (ConfigResponse);
+
+  // Returns the operator-facing desired configuration.
+  rpc GetDesiredConfig(GetConfigRequest) returns (ConfigResponse);
+
+  // Returns the compiled effective configuration. Platform detail is opt-in for admin debugging.
+  rpc GetEffectiveConfig(GetConfigRequest) returns (ConfigResponse);
+
+  // Reloads the daemon bootstrap config from disk.
+  rpc ReloadConfig(ReloadConfigRequest) returns (ConfigResponse);
+
+  // Stops a currently running daemon-managed test when supported by the process model.
+  rpc Stop(StopRequest) returns (ConfigResponse);
+
+  // Returns current daemon runtime status.
+  rpc GetRuntimeStatus(RuntimeStatusRequest) returns (RuntimeStatusResponse);
+
   // Starts a Penny test using YAML defaults, overriding prefix/mask from the request.
   // The call blocks until the test completes and returns the summary.
   rpc StartTest(StartTestRequest) returns (StartTestResponse);

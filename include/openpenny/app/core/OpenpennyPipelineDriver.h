@@ -4,8 +4,10 @@
 
 #include "openpenny/config/Config.h"
 #include "openpenny/agg/Stats.h"
+#include "openpenny/egress/PacketSink.h"
 #include "openpenny/penny/flow/state/PennySnapshot.h"
 #include "openpenny/app/core/PerThreadStats.h"
+#include "openpenny/net/TrafficMatch.h"
 
 #include <cstddef>
 #include <functional>
@@ -17,12 +19,19 @@
 #include <atomic>
 
 namespace openpenny {
-namespace net {
-class IPacketSourceFactory;
+namespace dataplane {
+class IFactory;
 }
 
 /**
  * @brief Configuration for a pipeline execution invocation.
+ *
+ * After Chunk 3, this struct only carries information that is specific
+ * to a single run of the pipeline: how many queues to drive, which mode
+ * to run in, an optional cancellation callback, traffic selection, and
+ * (for SDK users) an override egress sink. Everything else — TUN/raw
+ * socket selection, NIC/queue binding, BPF/XDP tuning — lives on
+ * Config and is read by the pipeline driver directly.
  */
 struct PipelineOptions {
     enum class Mode {
@@ -31,31 +40,30 @@ struct PipelineOptions {
     };
 
     // Strings
-    std::string prefix_ip;        // Raw dotted prefix entered by user.
-    std::string prefix_cidr;      // Canonical CIDR string derived from prefix/mask.
-    std::string tun_name;         // Friendly label for logging/UX.
-    std::string stats_socket_path; // Optional Unix datagram socket for live stats.
-    std::string forward_device;   // Optional non-TUN forward target label.
+    std::string stats_socket_path; ///< Optional Unix datagram socket for live stats.
+    net::TrafficMatchConfig traffic_match{}; ///< Per-run override of cfg.traffic_match.
 
     // Callbacks
-    std::function<bool()> should_stop; // Cooperative cancellation callback.
+    std::function<bool()> should_stop; ///< Cooperative cancellation callback.
 
     // Integral types
-    uint32_t prefix_host = 0;     // Host-order prefix used for fast comparisons.
-    uint32_t mask_host = 0;       // Host-order mask (0 means disabled).
-    unsigned queue_count = 1;     // How many queues/threads to spawn, starting at cfg.queue.
-    int mask_bits = 0;            // Original number of prefix bits (if provided).
-    int tun_fd = -1;              // Optional TUN file descriptor to forward to.
-    int forward_fd = -1;          // Generic forward target file descriptor (raw socket, pipe, etc.).
+    unsigned queue_count = 1;     ///< How many queues/threads to spawn, starting at cfg.queue.
 
     // Mode
     Mode mode{Mode::Active};
 
-    // Flags
-    bool has_prefix = false;      // Whether prefix filtering is enabled at all.
-    bool forward_to_tun = false;  // Mirror matched packets into a TUN device.
-    bool forward_raw_socket = false; // Forward packets via raw socket bound to an interface.
-    const net::IPacketSourceFactory* packet_source_factory = nullptr; // Optional override for source creation.
+    const dataplane::IFactory* dataplane_factory = nullptr; ///< Optional override for session creation.
+
+    /**
+     * @brief Optional caller-supplied egress sink.
+     *
+     * When non-null, the pipeline writes matched packets through this
+     * sink instead of constructing one from Config::egress. Intended
+     * primarily for tests and SDK callers that want to plug in their
+     * own PacketSink implementation; production binaries should leave
+     * this null and drive egress declaratively via Config::egress.
+     */
+    egress::PacketSinkPtr sink;
 };
 
 struct DropSnapshotRecord {

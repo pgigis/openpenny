@@ -1,0 +1,15 @@
+# Passive-mode forwarding profile: TUN reinjection turned off.
+#
+# Passive mode observes traffic without participating in delivery, so the
+# pipeline must not forward packets anywhere. This profile keeps the
+# `traffic_forwarding` schema happy by providing the required tun fields
+# while leaving the device disabled.
+#
+# Recommended pairing:
+#   runtime_policy.mode: passive
+#   egress.kind:         none
+tun:
+  enable: false
+  name: openpenny-tun
+  multi_queue: false
+  mtu: 1500

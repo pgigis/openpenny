@@ -24,7 +24,9 @@ AggregatesController::AggregatesController(const Config& cfg,
                          opts.mode == PipelineOptions::Mode::Active &&
                          required_drops_ > 0},
       individual_limit_enabled_{opts.mode == PipelineOptions::Mode::Active &&
-                                cfg.active.stop_after_individual_flows > 0} {}
+                                cfg.active.stop_after_individual_flows > 0},
+      min_closed_loop_enabled_{opts.mode == PipelineOptions::Mode::Active &&
+                               cfg.active.min_closed_loop_flows > 0} {}
 
 void AggregatesController::start() {
     if (collector_enabled_) {
@@ -38,12 +40,21 @@ void AggregatesController::start_individual_limit() {
     }
 }
 
+void AggregatesController::start_min_closed_loop() {
+    if (min_closed_loop_enabled_) {
+        min_closed_loop_thread_ = std::thread([this]() { min_closed_loop_loop(); });
+    }
+}
+
 void AggregatesController::join() {
     if (collector_thread_.joinable()) {
         collector_thread_.join();
     }
     if (individual_limit_thread_.joinable()) {
         individual_limit_thread_.join();
+    }
+    if (min_closed_loop_thread_.joinable()) {
+        min_closed_loop_thread_.join();
     }
 }
 
@@ -57,6 +68,10 @@ bool AggregatesController::aggregates_ready() const {
 
 bool AggregatesController::individual_stop_hit() const {
     return individual_stop_hit_.load(std::memory_order_relaxed);
+}
+
+bool AggregatesController::closed_loop_stop_hit() const {
+    return closed_loop_stop_hit_.load(std::memory_order_relaxed);
 }
 
 std::optional<openpenny::app::AggregatedCounters> AggregatesController::aggregates_snapshot() const {
@@ -113,15 +128,41 @@ void AggregatesController::evaluate_pending_if_needed(const Config& cfg,
 
 void AggregatesController::collector_loop() {
     using namespace std::chrono_literals;
+    // High-level contract for this loop:
+    //
+    //   1. Wait until `max_drops_aggregates` drop snapshots have been
+    //      collected across all worker threads (the "12-drop" trigger
+    //      point in the operator's mental model).
+    //   2. Evaluate the aggregate stats once.
+    //         - bidirectional / closed-loop -> stop the pipeline and
+    //           report CLOSED_LOOP.
+    //         - duplicates exceeded         -> stop and report
+    //           DUPLICATES_EXCEEDED.
+    //         - anything else (NON_CLOSED_LOOP or no verdict yet)
+    //           -> fall through to step 3.
+    //   3. Watch the per-flow CLOSED_LOOP termination tally and stop as
+    //      soon as it reaches `min_closed_loop_flows` (defaulting to 2
+    //      when the operator did not configure it). This is the
+    //      "look for the min flows" path and gives the run a chance
+    //      to upgrade to CLOSED_LOOP via per-flow evidence even when
+    //      the one-shot aggregate eval did not.
     auto& runtime = runtime_setup_mutable();
     bool aggregate_eval_done = false;
     bool wait_for_closed_loops = false;
     bool ready_logged = false;
+    // Resolve the closed-loop fallback threshold once. An explicit
+    // operator setting wins outright (including 1, for the rare
+    // "any single closed-loop flow is enough" mode); when unset, fall
+    // back to the historical default of 2 closed-loop flows.
+    const std::size_t closed_loop_required =
+        cfg_.active.min_closed_loop_flows > 0
+            ? cfg_.active.min_closed_loop_flows
+            : static_cast<std::size_t>(2);
     while (!stop_flag_.load(std::memory_order_relaxed)) {
         if (user_should_stop_ && user_should_stop_()) break;
         if (wait_for_closed_loops) {
             auto agg = openpenny::app::aggregate_counters();
-            if (agg.flows_closed_loop >= 2) {
+            if (agg.flows_closed_loop >= closed_loop_required) {
                 TCPLOG_INFO(
                     "[aggregates_closed_loop] flows_closed_loop=%llu flows_not_closed_loop=%llu flows_finished=%llu",
                     static_cast<unsigned long long>(agg.flows_closed_loop),
@@ -146,17 +187,43 @@ void AggregatesController::collector_loop() {
         bool pending = false;
         bool pending_rtx = false;
         std::size_t snapshot_count = 0;
+        std::size_t pending_snapshot_count = 0;
+        std::uint64_t pending_rtx_count = 0;
         {
             std::lock_guard<std::mutex> lock(collector_->mtx);
             snapshot_count = collector_->snapshots.size();
             for (const auto& rec : collector_->snapshots) {
                 if (rec.snapshot.state == penny::SnapshotState::Pending) {
                     pending = true;
-                    break;
+                    ++pending_snapshot_count;
                 }
             }
-            pending_rtx = openpenny::app::aggregate_counters().pending_retransmissions > 0;
+            pending_rtx_count = openpenny::app::aggregate_counters().pending_retransmissions;
+            pending_rtx = pending_rtx_count > 0;
             ready = snapshot_count >= required_drops_ && !pending && !pending_rtx;
+        }
+        // Periodic gate diagnostic: when snapshot_count has reached the
+        // required threshold but ready stays false, this line tells the
+        // operator EXACTLY which gate is still held closed.
+        if (snapshot_count >= required_drops_ && !ready) {
+            using Clock = std::chrono::steady_clock;
+            static std::atomic<Clock::rep> g_last_gate_log_ns{0};
+            const auto now_ns = Clock::now().time_since_epoch().count();
+            auto last = g_last_gate_log_ns.load(std::memory_order_relaxed);
+            const auto next =
+                (Clock::now() + std::chrono::seconds(5)).time_since_epoch().count();
+            if (now_ns - last >= std::chrono::seconds(5).count() &&
+                g_last_gate_log_ns.compare_exchange_strong(
+                    last, next, std::memory_order_acq_rel)) {
+                TCPLOG_INFO(
+                    "[aggregates_gate] snapshots=%zu/%zu pending_snapshots=%zu "
+                    "pending_rtx=%llu (waiting for both to reach 0 before "
+                    "evaluating)",
+                    snapshot_count,
+                    required_drops_,
+                    pending_snapshot_count,
+                    static_cast<unsigned long long>(pending_rtx_count));
+            }
         }
         if (ready) {
             aggregates_ready_.store(true, std::memory_order_relaxed);
@@ -289,8 +356,20 @@ void AggregatesController::collector_loop() {
 
                     if (cfg_.active.aggregates_enabled &&
                         eval.decision != penny::FlowEngine::FlowDecision::FINISHED_CLOSED_LOOP) {
+                        // Aggregate eval at `required_drops_` drops did not
+                        // produce a bidirectional verdict; switch to
+                        // step 3 of the contract and wait for
+                        // closed_loop_required per-flow CLOSED_LOOP
+                        // terminations before declaring the run done.
                         runtime.aggregates_active = false;
                         wait_for_closed_loops = true;
+                        TCPLOG_INFO(
+                            "[agg_eval_fallback] aggregate verdict %s after %zu drops; "
+                            "waiting for %llu closed-loop flow%s before finishing",
+                            penny::flow_decision_to_string(eval.decision),
+                            required_drops_,
+                            static_cast<unsigned long long>(closed_loop_required),
+                            closed_loop_required == 1 ? "" : "s");
                     } else {
                         {
                             std::lock_guard<std::mutex> lk(aggregates_snapshot_mtx_);
@@ -332,6 +411,54 @@ void AggregatesController::individual_limit_loop() {
             }
             stop_flag_.store(true, std::memory_order_relaxed);
             individual_stop_hit_.store(true, std::memory_order_relaxed);
+            break;
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+}
+
+void AggregatesController::min_closed_loop_loop() {
+    using namespace std::chrono_literals;
+    // Mirrors individual_limit_loop, but watches the per-flow CLOSED_LOOP
+    // tally instead of the total finished-flow count. Stops the pipeline
+    // as soon as the configured min_closed_loop_flows threshold is hit
+    // and the aggregate eval (if enabled) is not still pending.
+    while (!stop_flag_.load(std::memory_order_relaxed)) {
+        if (collector_enabled_ &&
+            runtime_setup_mutable().aggregates_status == RuntimeStatus::AggregatesStatus::PENDING) {
+            std::this_thread::sleep_for(100ms);
+            continue;
+        }
+        auto agg = openpenny::app::aggregate_counters();
+        if (agg.flows_closed_loop >= cfg_.active.min_closed_loop_flows) {
+            TCPLOG_INFO(
+                "[min_closed_loop] flows_closed_loop=%llu (threshold=%llu) "
+                "flows_finished=%llu not_closed_loop=%llu rst=%llu dup_exceeded=%llu",
+                static_cast<unsigned long long>(agg.flows_closed_loop),
+                static_cast<unsigned long long>(cfg_.active.min_closed_loop_flows),
+                static_cast<unsigned long long>(agg.flows_finished),
+                static_cast<unsigned long long>(agg.flows_not_closed_loop),
+                static_cast<unsigned long long>(agg.flows_rst),
+                static_cast<unsigned long long>(agg.flows_duplicates_exceeded));
+            {
+                std::lock_guard<std::mutex> lk(aggregates_snapshot_mtx_);
+                if (!aggregates_snapshot_) aggregates_snapshot_ = agg;
+            }
+            // If the aggregate eval has not produced a verdict yet, mark
+            // it CLOSED_LOOP since we have collected enough closed-loop
+            // evidence on its own.
+            auto& runtime = runtime_setup_mutable();
+            if (runtime.aggregates_status == RuntimeStatus::AggregatesStatus::PENDING) {
+                runtime.aggregates_status = RuntimeStatus::AggregatesStatus::CLOSED_LOOP;
+                runtime.has_aggregate_eval = true;
+                runtime.aggregate_eval_counters.data_packets = agg.droppable_packets;
+                runtime.aggregate_eval_counters.duplicate_packets = agg.duplicate_packets;
+                runtime.aggregate_eval_counters.retransmitted_packets = agg.retransmitted_packets;
+                runtime.aggregate_eval_counters.non_retransmitted_packets = agg.non_retransmitted_packets;
+            }
+            collector_completed_.store(true, std::memory_order_relaxed);
+            closed_loop_stop_hit_.store(true, std::memory_order_relaxed);
+            stop_flag_.store(true, std::memory_order_relaxed);
             break;
         }
         std::this_thread::sleep_for(100ms);

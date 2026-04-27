@@ -163,6 +163,9 @@ void ThreadFlowEventTimerManager::purge_flow(FlowEngine* flow) {
                        [flow](const Callback& cb) { return cb.flow == flow; }),
         callbacks_.end()
     );
+    // Resync the lock-free counter with the post-erase deque size so the
+    // drain_callbacks() fast path doesn't keep firing on stale entries.
+    pending_callbacks_.store(callbacks_.size(), std::memory_order_release);
 
     wake_locked(); // Wake timer loop to apply purge.
 }
@@ -254,6 +257,7 @@ void ThreadFlowEventTimerManager::timer_loop() {
                 callbacks_.push_back(Callback{
                     Callback::Kind::Expire, entry.packet_id, entry.flow, 0
                 });
+                pending_callbacks_.fetch_add(1, std::memory_order_release);
             }
 
             processed_item = true;
@@ -297,6 +301,7 @@ void ThreadFlowEventTimerManager::timer_loop() {
                     callbacks_.push_back(Callback{
                         Callback::Kind::Retransmit, ev.packet_id, it->second.flow, 0
                     });
+                    pending_callbacks_.fetch_add(1, std::memory_order_release);
                 }
             }
             else if (ev.kind == Event::Kind::Duplicate && ev.flow) {
@@ -310,6 +315,7 @@ void ThreadFlowEventTimerManager::timer_loop() {
                 callbacks_.push_back(Callback{
                     Callback::Kind::Duplicate, {}, ev.flow, ev.seq
                 });
+                pending_callbacks_.fetch_add(1, std::memory_order_release);
             }
 
             processed_item = true;
@@ -344,11 +350,21 @@ void ThreadFlowEventTimerManager::timer_loop() {
 }
 
 void ThreadFlowEventTimerManager::drain_callbacks() {
-    // Drain all pending snapshot mutation callbacks for immediate execution.
+    // Lock-free fast path. drain_callbacks() is called from every worker's
+    // before_poll() — i.e. potentially millions of times per second across
+    // busy-polling AF_XDP workers. Acquiring mutex_ on every call serialises
+    // the hot path on a single global lock; with many workers this becomes
+    // the dominant bottleneck. Skip the lock entirely when no callbacks
+    // are queued, which is the overwhelming common case.
+    if (pending_callbacks_.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+
     std::deque<Callback> pending;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pending.swap(callbacks_);
+        pending_callbacks_.store(0, std::memory_order_release);
     }
     run_callbacks(pending);
 }

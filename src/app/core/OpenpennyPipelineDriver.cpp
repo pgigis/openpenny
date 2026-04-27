@@ -11,8 +11,9 @@
 #include "openpenny/app/core/PerThreadStats.h"
 #include "openpenny/app/core/AggregatesController.h"
 #include "openpenny/app/core/RuntimeSetup.h"
-#include "openpenny/net/PacketSourceFactory.h"
+#include "openpenny/dataplane/Factory.h"
 #include "openpenny/log/Log.h"
+#include "openpenny/net/TrafficMatch.h"
 #include "openpenny/penny/flow/engine/FlowEvaluation.h"
 
 #include <atomic>
@@ -21,8 +22,41 @@
 #include <mutex>
 #include <chrono>
 
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#include <cstring>
+#endif
+
 namespace openpenny {
 namespace {
+
+#ifdef __linux__
+void pin_current_thread_to_cpu(unsigned cpu) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(static_cast<int>(cpu), &cpuset);
+    const int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (rc != 0) {
+        // Bubble pin failures up at WARN — they usually mean the worker count
+        // exceeds the available CPUs and the operator should know.
+        TCPLOG_WARN("Failed to pin queue worker to CPU %u: %s", cpu, std::strerror(rc));
+    } else {
+        // The success case fires once per worker thread. With many queues that
+        // is a lot of repeated lines, so we keep it at DEBUG.
+        TCPLOG_DEBUG("Pinned queue worker to CPU %u", cpu);
+    }
+}
+#else
+void pin_current_thread_to_cpu(unsigned) {}
+#endif
+
+unsigned cpu_for_queue_worker(const Config& cfg, unsigned idx) {
+    if (idx < cfg.worker_cpus.size()) {
+        return cfg.worker_cpus[idx];
+    }
+    return idx;
+}
 
 // Coordinates aggregate drop evaluation and optional individual stop limits for active mode.
 template <typename Matcher>
@@ -33,13 +67,18 @@ void run_queue_worker(unsigned idx,
                       DropCollectorPtr drop_collector,
                       std::vector<std::optional<ModeResult>>& results) {
     Config cfg_local = base_cfg;
+    // Preserve the invariant starting queue (queue_base) across per-worker mutation.
+    // Consumers like XdpReader::configure_from_config() rely on it to derive the
+    // full served-set for RSS coverage checks; cfg_local.queue is rewritten below.
+    cfg_local.queue_base = base_cfg.queue_base ? base_cfg.queue_base : base_cfg.queue;
     cfg_local.queue = base_cfg.queue + idx; // Map queue offset to physical queue.
 
     openpenny::app::set_thread_counter_index(idx);
+    pin_current_thread_to_cpu(cpu_for_queue_worker(base_cfg, idx));
 
-    const net::IPacketSourceFactory* factory = opts.packet_source_factory
-        ? opts.packet_source_factory
-        : &net::default_packet_source_factory();
+    const dataplane::IFactory* factory = opts.dataplane_factory
+        ? opts.dataplane_factory
+        : &dataplane::default_factory();
     auto source = factory->create(cfg_local);
     const std::string thread_name = "thread-queue-" + std::to_string(idx);
 
@@ -50,29 +89,6 @@ void run_queue_worker(unsigned idx,
         PassiveTestPipelineRunner runner(cfg_local, opts, matcher, std::move(source));
         results[idx] = runner.run();
     }
-}
-
-/**
- * @brief Check whether a flow's source address matches an IPv4 prefix.
- *
- * @param key         Flow tuple to inspect.
- * @param prefix_host IPv4 prefix in host byte order.
- * @param mask_host   Subnet mask in host byte order.
- * @param has_prefix  Whether prefix filtering is enabled.
- *
- * @return true if no prefix is configured, or if the source address matches
- *         the given prefix and mask; false otherwise.
- */
-bool flow_matches_prefix(const FlowKey& key,
-                         uint32_t prefix_host,
-                         uint32_t mask_host,
-                         bool has_prefix) {
-    if (!has_prefix || mask_host == 0) {
-        // No prefix filter configured, accept all flows.
-        return true;
-    }
-    // Apply mask in host byte order and compare the masked source address.
-    return (key.src & mask_host) == (prefix_host & mask_host);
 }
 
 } // namespace
@@ -87,12 +103,12 @@ bool flow_matches_prefix(const FlowKey& key,
  *   - Aggregates per-thread statistics into a single summary result.
  *
  * @param cfg   Base configuration (interface, starting queue index, etc.).
- * @param opts  Execution parameters (mode, queue count, prefix filter).
+ * @param opts  Execution parameters (mode, queue count, traffic match, forwarding).
  *
  * @return A PipelineSummary that includes an aggregated active-mode result
  *         if any worker produced data.
  */
-PipelineSummary drive_pipeline(const Config& cfg, const PipelineOptions& opts) {
+PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts) {
     PipelineOptions opts_local = opts;
     std::atomic<bool> stop_flag{false};
     const auto user_should_stop = opts.should_stop;
@@ -101,30 +117,189 @@ PipelineSummary drive_pipeline(const Config& cfg, const PipelineOptions& opts) {
         return user_should_stop ? user_should_stop() : false;
     };
 
+    // Resolve ingress semantics up front. IngressMode::Auto picks Copy
+    // (AF_PACKET mirror) for passive mode and Redirect (AF_XDP) for
+    // active mode. If the operator explicitly set backend=af_packet or
+    // backend=dpdk we leave that alone -- the explicit choice wins.
+    Config cfg = cfg_in;
+    const bool is_passive = opts_local.mode == PipelineOptions::Mode::Passive;
+    IngressMode resolved = cfg.input.mode;
+    if (resolved == IngressMode::Auto) {
+        resolved = is_passive ? IngressMode::Copy : IngressMode::Redirect;
+    }
+    cfg.input.mode = resolved;
+    if (resolved == IngressMode::Copy &&
+        cfg.input.backend == PacketInputBackend::XdpAfXdp) {
+        cfg.input.backend = PacketInputBackend::AfPacketMirror;
+        TCPLOG_INFO("[openpenny] passive copy mode selected: using AF_PACKET mirror "
+                    "on '%s' (kernel stack continues to deliver packets)",
+                    cfg.ifname.c_str());
+    } else if (resolved == IngressMode::Redirect &&
+               cfg.input.backend == PacketInputBackend::AfPacketMirror) {
+        cfg.input.backend = PacketInputBackend::XdpAfXdp;
+        TCPLOG_WARN("[openpenny] ingress mode 'redirect' requested but backend was "
+                    "af_packet_mirror; switching to af_xdp");
+    }
+
+    // AF_PACKET mirror has no PACKET_FANOUT fast path yet. Multiple workers
+    // each bind a fresh socket on the same ifindex and receive *duplicate*
+    // copies of every frame, which silently inflates counters. Collapse to a
+    // single worker and warn.
+    if (cfg.input.backend == PacketInputBackend::AfPacketMirror &&
+        cfg.queue_count > 1) {
+        TCPLOG_WARN("[openpenny] af_packet_mirror backend does not support "
+                    "queue_count=%u (no PACKET_FANOUT); collapsing to a single "
+                    "worker to avoid duplicate packet delivery",
+                    cfg.queue_count);
+        cfg.queue_count = 1;
+        opts_local.queue_count = 1;
+    }
+
+    if (opts_local.traffic_match.empty()) {
+        opts_local.traffic_match = cfg.traffic_match;
+    }
+
+    // Resolve the egress sink once, up front.
+    //
+    // Priority order:
+    //   1. Caller-provided opts.sink (tests, SDK users).
+    //   2. Declarative cfg.egress (YAML-driven path; the normal case).
+    //
+    // The historical legacy path (forward_to_tun / forward_raw_socket /
+    // tun_fd / forward_fd on PipelineOptions) was removed in Chunk 3:
+    // CLI / worker / gRPC callers now all populate cfg.egress instead.
+    if (!opts_local.sink && cfg.egress.enabled()) {
+        opts_local.sink = egress::make_packet_sink(cfg.egress);
+        if (!opts_local.sink) {
+            TCPLOG_ERROR("Egress sink configuration failed (kind=%s, device='%s'); "
+                         "forwarded packets will be dropped",
+                         egress::egress_kind_name(cfg.egress.kind),
+                         cfg.egress.device.c_str());
+        }
+    }
+    if (opts_local.sink) {
+        TCPLOG_INFO("[openpenny] egress sink: %s",
+                    opts_local.sink->describe().c_str());
+    }
+
+    // Traffic match policy applies process-wide (every worker uses the
+    // same compiled config), so print it once here at the driver level
+    // rather than once per worker's on_opened().
+    TCPLOG_INFO("[openpenny] traffic match: %s",
+                net::describe_traffic_match(opts_local.traffic_match).c_str());
+
     // Capture the runtime setup at worker start so observers can inspect it.
-    set_runtime_setup(cfg, opts_local, cfg.xdp_runtime.enable, cfg.dpdk.enable);
+    set_runtime_setup(cfg,
+                      opts_local,
+                      cfg.input.backend == PacketInputBackend::XdpAfXdp,
+                      cfg.input.backend == PacketInputBackend::Dpdk);
 
     // Collect the results. Supports both active and passive modes.
     PipelineSummary summary;
     summary.aggregates_enabled = cfg.active.aggregates_enabled;
 
-    // Build a reusable matcher for optional prefix-based flow filtering.
-    // TODO: Expose a more general matching API.
+    // Build a reusable matcher from the backend-neutral traffic-match config.
     auto matcher = [&](const FlowKey& key) {
-        return flow_matches_prefix(key, opts_local.prefix_host, opts_local.mask_host, opts_local.has_prefix);
+        return net::traffic_matches_flow(opts_local.traffic_match, key);
     };
     // Number of queues to process traffic.
     const unsigned qcount = std::max(1u, opts_local.queue_count);
 
+    // ------------------------------------------------------------------
+    // One-line startup summary at INFO. With many queues the per-worker
+    // chatter (pin info, attach traces, per-queue rx-batch lines) lives
+    // at DEBUG, so this single line is the authoritative "what did we
+    // actually start" record at the default log level.
+    // ------------------------------------------------------------------
+    auto backend_name = [](PacketInputBackend b) -> const char* {
+        switch (b) {
+            case PacketInputBackend::XdpAfXdp:       return "af_xdp";
+            case PacketInputBackend::Dpdk:           return "dpdk";
+            case PacketInputBackend::AfPacketMirror: return "af_packet_mirror";
+        }
+        return "unknown";
+    };
+    {
+        const unsigned q_first = cfg.queue;
+        const unsigned q_last  = cfg.queue + qcount - 1;
+        if (qcount > 1) {
+            TCPLOG_INFO("[openpenny] starting %s mode: %u workers on '%s' "
+                        "queues %u-%u, backend=%s, aggregates=%s",
+                        is_passive ? "passive" : "active",
+                        qcount,
+                        cfg.ifname.c_str(),
+                        q_first, q_last,
+                        backend_name(cfg.input.backend),
+                        cfg.active.aggregates_enabled ? "on" : "off");
+        } else {
+            TCPLOG_INFO("[openpenny] starting %s mode: 1 worker on '%s' "
+                        "queue %u, backend=%s, aggregates=%s",
+                        is_passive ? "passive" : "active",
+                        cfg.ifname.c_str(),
+                        q_first,
+                        backend_name(cfg.input.backend),
+                        cfg.active.aggregates_enabled ? "on" : "off");
+        }
+    }
+
     // One worker thread and one result slot per queue.
     std::vector<std::thread> threads;
     std::vector<std::optional<ModeResult>> results(qcount);
-    
+
     // Shared drop snapshot collector across worker threads.
     auto drop_collector = std::make_shared<DropCollector>();
     AggregatesController aggregates_controller(cfg, opts_local, drop_collector, stop_flag, user_should_stop);
     aggregates_controller.start();
     aggregates_controller.start_individual_limit();
+    aggregates_controller.start_min_closed_loop();
+
+    // ------------------------------------------------------------------
+    // No-packets watchdog. With many queues a silent zero-RX run is
+    // hard to diagnose: the user sees `processed=0` in the summary but
+    // gets no signal during the run. This thread polls the aggregate
+    // counters and emits exactly one of:
+    //   - INFO "first packet seen at +X.Xs" once any worker observes RX,
+    //   - WARN "no packets after Ns" with concrete next-step guidance.
+    // The watchdog stops as soon as either fires, or stop_flag is set.
+    // ------------------------------------------------------------------
+    std::thread watchdog([&, qcount]() {
+        const auto deadline = std::chrono::seconds(5);
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!stop_flag.load(std::memory_order_relaxed)) {
+            const auto agg = openpenny::app::aggregate_counters();
+            const auto now = std::chrono::steady_clock::now();
+            const double elapsed = std::chrono::duration<double>(now - t0).count();
+            if (agg.packets > 0) {
+                TCPLOG_INFO("[openpenny] first packet observed at +%.1fs "
+                            "(across %u queue worker%s)",
+                            elapsed, qcount, qcount == 1 ? "" : "s");
+                return;
+            }
+            if (now - t0 >= deadline) {
+                TCPLOG_WARN("[openpenny] no packets received after %.0fs across "
+                            "%u queue worker%s on '%s'. Common causes:",
+                            std::chrono::duration<double>(deadline).count(),
+                            qcount, qcount == 1 ? "" : "s",
+                            cfg.ifname.c_str());
+                TCPLOG_WARN("[openpenny]   1) RSS routes traffic to queues outside "
+                            "%u..%u — see [rss_check] above and `ethtool -x %s`",
+                            cfg.queue, cfg.queue + qcount - 1, cfg.ifname.c_str());
+                TCPLOG_WARN("[openpenny]   2) traffic_match rule does not match the "
+                            "live flow — try --log-level debug to inspect [xdp_counters]");
+                TCPLOG_WARN("[openpenny]   3) link is down or no traffic is flowing — "
+                            "check `ip -s link show %s` rx counters",
+                            cfg.ifname.c_str());
+                if (cfg.input.backend == PacketInputBackend::XdpAfXdp) {
+                    TCPLOG_WARN("[openpenny]   4) AF_XDP socket not attached to the "
+                                "queue receiving traffic — verify queue %u..%u "
+                                "match RSS targets",
+                                cfg.queue, cfg.queue + qcount - 1);
+                }
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    });
 
     // Launch a pipeline runner per queue.
     for (unsigned i = 0; i < qcount; ++i) {
@@ -140,6 +315,9 @@ PipelineSummary drive_pipeline(const Config& cfg, const PipelineOptions& opts) {
         }
     }
     stop_flag.store(true, std::memory_order_relaxed);
+    if (watchdog.joinable()) {
+        watchdog.join();
+    }
     aggregates_controller.join();
     const auto agg_counters_now = openpenny::app::aggregate_counters();
     bool individual_stop_hit = aggregates_controller.individual_stop_hit();

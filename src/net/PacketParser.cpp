@@ -22,6 +22,10 @@ inline uint32_t load_be32(const uint8_t* p) noexcept {
            static_cast<uint32_t>(p[3]);
 }
 
+inline bool is_vlan_ethertype(uint16_t eth_type) noexcept {
+    return eth_type == 0x8100 || eth_type == 0x88A8;
+}
+
 } // namespace
 
 bool PacketParser::decode(const uint8_t* frame, std::size_t length, PacketView& out) {
@@ -33,18 +37,17 @@ bool PacketParser::decode(const uint8_t* frame, std::size_t length, PacketView& 
     const uint8_t* const frame_end = frame + length;
 
     // ---------------------------------------------------------------------
-    // 1. Ethernet header (+ optional single 802.1Q VLAN tag).
+    // 1. Ethernet header (+ up to two VLAN tags to mirror the XDP parser).
     // ---------------------------------------------------------------------
     uint16_t eth_type = load_be16(frame + 12);
     std::size_t offset = 14; // start of L3 header
 
-    // Single 802.1Q VLAN tag.
-    if (eth_type == 0x8100) {
-        if (length < 18) {
+    for (int i = 0; i < 2 && is_vlan_ethertype(eth_type); ++i) {
+        if (length < offset + 4) {
             return false; // truncated VLAN header
         }
-        eth_type = load_be16(frame + 16);
-        offset = 18;
+        eth_type = load_be16(frame + offset + 2);
+        offset += 4;
     }
 
     // Only handle IPv4.
@@ -167,6 +170,8 @@ build_view:
     view.flow.dst   = dst;
     view.flow.sport = sport;
     view.flow.dport = dport;
+
+    view.ip_proto = proto;
 
     view.tcp.src_port = sport;
     view.tcp.dst_port = dport;

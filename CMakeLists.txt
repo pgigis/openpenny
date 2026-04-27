@@ -25,6 +25,10 @@ option(OPENPENNY_WITH_DPDK "Build DPDK reader" OFF)
 set(openpenny_sources
     src/agg/Stats.cpp
     src/config/Config.cpp
+    src/control/Planner.cpp
+    src/control/Policy.cpp
+    src/control/PolicyJson.cpp
+    src/dataplane/Factory.cpp
     src/log/Log.cpp
     src/app/cli/cli_helpers.cpp
     src/app/core/AggregatesController.cpp
@@ -32,10 +36,16 @@ set(openpenny_sources
     src/app/core/DropCollectorBinding.cpp
     src/app/core/OpenpennyPipelineDriver.cpp
     src/app/core/passive/PassiveTestPipeline.cpp
+    src/app/core/PipelineRunner.cpp
     src/app/core/utils/FlowDebug.cpp
     src/app/core/WorkerLauncher.cpp
     src/app/core/PerThreadStats.cpp
     src/app/core/RuntimeSetup.cpp
+    src/egress/PacketSink.cpp
+    src/egress/TunSink.cpp
+    src/egress/RawSocketSink.cpp
+    src/egress/RawNicSink.cpp
+    src/ingress/af_packet/AfPacketMirrorReader.cpp
     src/penny/flow/timer/ThreadFlowEventTimer.cpp
     src/penny/flow/state/PennyStats.cpp
     src/penny/flow/engine/FlowEvaluation.cpp
@@ -43,14 +53,16 @@ set(openpenny_sources
     src/penny/flow/manager/ThreadFlowManager.cpp
     src/net/PacketParser.cpp
     src/net/PacketSourceFactory.cpp
+    src/net/TrafficMatch.cpp
 )
 
 if(OPENPENNY_WITH_XDP)
-    list(APPEND openpenny_sources src/sources/xdp/XdpReader.cpp)
+    list(APPEND openpenny_sources src/ingress/af_xdp/XdpReader.cpp)
+    list(APPEND openpenny_sources src/ingress/af_xdp/XdpRuleController.cpp)
 endif()
 
 if(OPENPENNY_WITH_DPDK)
-    list(APPEND openpenny_sources src/sources/dpdk/DpdkReader.cpp)
+    list(APPEND openpenny_sources src/ingress/dpdk/DpdkReader.cpp)
 endif()
 
 add_library(openpenny ${openpenny_sources})
@@ -130,36 +142,48 @@ target_link_libraries(openpenny_cli PRIVATE openpenny)
 
 enable_testing()
 
-add_executable(test_initial_flow_monitoring tests/test_initial_flow_monitoring.cpp)
+add_executable(test_initial_flow_monitoring tests/unit/flow/test_initial_flow_monitoring.cpp)
 target_link_libraries(test_initial_flow_monitoring PRIVATE openpenny)
 add_test(NAME initial_flow_monitoring COMMAND test_initial_flow_monitoring)
 
-add_executable(test_gap_management tests/test_gap_management.cpp)
+add_executable(test_gap_management tests/unit/flow/test_gap_management.cpp)
 target_link_libraries(test_gap_management PRIVATE openpenny)
 add_test(NAME gap_management COMMAND test_gap_management)
 
-add_executable(test_sequence_ordering tests/test_sequence_ordering.cpp)
+add_executable(test_sequence_ordering tests/unit/flow/test_sequence_ordering.cpp)
 target_link_libraries(test_sequence_ordering PRIVATE openpenny)
 add_test(NAME sequence_ordering COMMAND test_sequence_ordering)
 
-add_executable(test_drop_timer tests/test_drop_timer.cpp)
+add_executable(test_drop_timer tests/unit/flow/test_drop_timer.cpp)
 target_link_libraries(test_drop_timer PRIVATE openpenny)
 add_test(NAME drop_timer COMMAND test_drop_timer)
 
-add_executable(test_flow_thresholds tests/test_flow_thresholds.cpp)
+add_executable(test_drop_snapshot_updates tests/unit/flow/test_drop_snapshot_updates.cpp)
+target_link_libraries(test_drop_snapshot_updates PRIVATE openpenny)
+add_test(NAME drop_snapshot_updates COMMAND test_drop_snapshot_updates)
+
+add_executable(test_flow_thresholds tests/unit/flow/test_flow_thresholds.cpp)
 target_link_libraries(test_flow_thresholds PRIVATE openpenny)
 add_test(NAME flow_thresholds COMMAND test_flow_thresholds)
 
-add_executable(test_cli_options tests/test_cli_options.cpp)
+add_executable(test_cli_options tests/unit/cli/test_cli_options.cpp)
 target_link_libraries(test_cli_options PRIVATE openpenny)
 add_test(NAME cli_options COMMAND test_cli_options)
+
+add_executable(test_traffic_match tests/unit/net/test_traffic_match.cpp)
+target_link_libraries(test_traffic_match PRIVATE openpenny)
+add_test(NAME traffic_match COMMAND test_traffic_match)
+
+add_executable(test_control_planner tests/unit/control/test_control_planner.cpp)
+target_link_libraries(test_control_planner PRIVATE openpenny)
+add_test(NAME control_planner COMMAND test_control_planner)
 
 # --- XDP build helper ----------------------------------------------------------
 
 add_custom_target(xdp_bpf
-    COMMAND ${CMAKE_COMMAND} -E env "PATH=$ENV{PATH}" make -C ${CMAKE_CURRENT_SOURCE_DIR}/xdp-fw xdp_redirect_dstprefix.o
-    BYPRODUCTS ${CMAKE_CURRENT_SOURCE_DIR}/xdp-fw/xdp_redirect_dstprefix.o
-    COMMENT "Building XDP program (xdp-fw/xdp_redirect_dstprefix.o)"
+    COMMAND ${CMAKE_COMMAND} -E env "PATH=$ENV{PATH}" make -C ${CMAKE_CURRENT_SOURCE_DIR}/ebpf/af_xdp xdp_redirect_openpenny.o
+    BYPRODUCTS ${CMAKE_CURRENT_SOURCE_DIR}/ebpf/af_xdp/xdp_redirect_openpenny.o
+    COMMENT "Building XDP program (ebpf/af_xdp/xdp_redirect_openpenny.o)"
 )
 
 # --- gRPC daemon / worker (only if Protobuf & gRPC really usable) --------------

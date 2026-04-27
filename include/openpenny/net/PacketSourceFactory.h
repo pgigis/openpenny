@@ -2,21 +2,17 @@
 
 #pragma once
 
-#include "openpenny/config/Config.h"
+#include "openpenny/dataplane/Factory.h"
 #include "openpenny/net/Packet.h"
+
+namespace openpenny {
+struct Config;
+}
 
 namespace openpenny::net {
 
-class IPacketSourceFactory {
-public:
-    virtual ~IPacketSourceFactory() = default;
-    virtual PacketSourcePtr create(const Config& cfg) const = 0;
-};
-
-class DefaultPacketSourceFactory : public IPacketSourceFactory {
-public:
-    PacketSourcePtr create(const Config& cfg) const override;
-};
+using IPacketSourceFactory = openpenny::dataplane::IFactory;
+using DefaultPacketSourceFactory = openpenny::dataplane::DefaultFactory;
 
 // Backward-compatible helper that uses the default factory (or an override, if set).
 PacketSourcePtr create_packet_source(const Config& cfg);

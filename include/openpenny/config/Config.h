@@ -5,17 +5,53 @@
  * @file Config.h
  * @brief Configuration holder parsed from YAML.
  */
+#include "openpenny/control/Policy.h"
+#include "openpenny/egress/PacketSink.h"
+#include "openpenny/net/TrafficMatch.h"
+
 #include <optional>
 #include <string>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace openpenny {
+
+enum class PacketInputBackend {
+    XdpAfXdp,
+    Dpdk,
+    AfPacketMirror, ///< Copy-only passive tap; stack continues to deliver packets.
+};
+
+/**
+ * @brief Ingress semantics decoupled from the chosen backend.
+ *
+ * - Redirect: the BPF/XDP path pulls matched packets out of the kernel
+ *   stack into userspace. Required for active mode (we must be able to
+ *   drop packets before they reach the app).
+ * - Copy: we tap the interface and observe; the stack still delivers
+ *   every packet to the app. This is safe for passive mode and avoids
+ *   the fragile reinject round-trip.
+ * - Auto: resolved at pipeline start as Copy for passive, Redirect for
+ *   active. This is the default and matches what most operators want.
+ */
+enum class IngressMode {
+    Auto,
+    Copy,
+    Redirect,
+};
 
 /**
  * @brief In-memory representation of the YAML configuration file.
  */
 struct Config {
+    struct InputConfig {
+        PacketInputBackend backend = PacketInputBackend::XdpAfXdp;
+        /// Ingress semantics; see IngressMode. Auto picks Copy for passive
+        /// mode and Redirect for active mode at pipeline start.
+        IngressMode mode = IngressMode::Auto;
+    };
+
     /**
      * @brief Parameters steering Penny-style active decision heuristics.
      */
@@ -33,6 +69,12 @@ struct Config {
         double flow_grace_period_seconds = 3.0; // pending->active wait threshold
         std::size_t max_tracked_flows = 0; // YAML: active.aggregates.max_monitored_flows; 0 means unlimited
         std::size_t stop_after_individual_flows = 0; // When >0, stop once this many individual flows finish.
+        // When >0, stop the active pipeline as soon as this many individual
+        // flows have terminated with a per-flow CLOSED_LOOP decision. Lets
+        // operators short-circuit a long run once they have collected enough
+        // closed-loop evidence; complements the existing aggregate-level
+        // CLOSED_LOOP early stop.
+        std::size_t min_closed_loop_flows = 0;
         double max_out_of_order_fraction = 0.8; // fraction of out-of-order packets allowed
         bool aggregates_enabled = false;   // YAML: active.aggregates.enabled
     };
@@ -65,19 +107,21 @@ struct Config {
         bool        allow_copy_fallback = false; // disallow copy-mode fallback to keep ZC
         unsigned    batch             = 256;     // max frames to pull per poll
         unsigned    poll_timeout_ms   = 0;       // busy-poll for lowest latency
-        std::string bpf_object        = "xdp_redirect_dstprefix.o";
-        std::string bpf_program       = "xdp_redirect_dstprefix";
+        std::string bpf_object        = "xdp_redirect_openpenny.o";
+        std::string bpf_program       = "xdp_redirect_openpenny";
         std::string map_conf_name     = "conf";
         std::string map_xsks_name     = "xsks_map";
         std::string map_stats_name    = "counters";
+        std::string map_settings_name = "settings";
         std::string pin_conf_path     = "/sys/fs/bpf/openpenny_conf";
         std::string pin_xsks_path     = "/sys/fs/bpf/openpenny_xsks";
         std::string pin_stats_path    = "/sys/fs/bpf/openpenny_stats";
+        std::string pin_settings_path = "/sys/fs/bpf/openpenny_settings";
         std::string prefix_text       = "0.0.0.0";
         std::string mask_text         = "0.0.0.0";
-        int         mask_bits         = 0;       // optional alternative mask representation
-        uint32_t    prefix_host       = 0;       // derived host-order prefix
-        uint32_t    mask_host         = 0;       // derived host-order mask
+        int         mask_bits         = 0;       // deprecated; traffic_match controls selection
+        uint32_t    prefix_host       = 0;       // deprecated; traffic_match controls selection
+        uint32_t    mask_host         = 0;       // deprecated; traffic_match controls selection
     };
 
     struct DpdkConfig {
@@ -87,9 +131,15 @@ struct Config {
 
     // Ingest
     std::string ifname = "lo";     // Interface to attach to.
-    unsigned    queue  = 0;        // AF_XDP queue index.
-    unsigned    queue_count = 1;   // Number of queues/threads to spawn (starting at queue).
+    unsigned    queue  = 0;        // AF_XDP queue index (NOTE: mutated per-worker by the driver).
+    unsigned    queue_base = 0;    // Invariant starting queue parsed from YAML; never rewritten per-worker.
+    unsigned    queue_count = 1;   // Number of queues/threads to spawn (starting at queue_base).
+    std::vector<unsigned> worker_cpus{}; // Optional CPU affinity map, one CPU id per queue worker.
     std::string mode   = "active"; // legacy field (active pipeline runs by default)
+    InputConfig input{};
+    net::TrafficMatchConfig traffic_match{};
+    control::DesiredConfig desired_config{};
+    control::EffectiveConfig effective_config{};
 
     // XDP reader tuning
     bool      xdp_drv_mode = true; // Prefer native driver when attaching XDP.
@@ -103,6 +153,15 @@ struct Config {
     // Active mode policy parameters
     ActiveConfig active{};
     PassiveConfig passive{};
+
+    /**
+     * @brief Declarative egress configuration.
+     *
+     * The pipeline opens a single PacketSink from this config at
+     * startup and shares it across all worker threads. kind=None
+     * disables egress entirely (matched packets are dropped).
+     */
+    egress::EgressConfig egress{};
 
     // Logging
     std::string log_mode     = "console"; // console|file|silent

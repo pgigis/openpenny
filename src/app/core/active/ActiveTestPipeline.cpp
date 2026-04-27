@@ -9,6 +9,7 @@
 #include <iostream>
 #include <string>
 #include <mutex>
+#include <thread>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -16,6 +17,7 @@
 
 #include "openpenny/app/core/utils/FlowDebug.h"
 #include "openpenny/app/core/ActiveTestPipeline.h"
+#include "openpenny/app/core/PipelineRunner.h"
 #include "openpenny/app/core/PerThreadStats.h"
 #include "openpenny/app/core/DropCollectorBinding.h"
 #include "openpenny/log/Log.h"
@@ -72,7 +74,9 @@ bool ActiveTestPipelineRunner::should_stop() const {
     return opts_.should_stop && opts_.should_stop();
 }
 
-// Main loop: open packet source, poll until Penny completes or stop requested, return run stats.
+// Public-facing entry point. Installs the thread-local runner guard,
+// hands ownership of the source to a PipelineRunner, and delegates the
+// loop.
 std::optional<ModeResult> ActiveTestPipelineRunner::run() {
     struct RunnerGuard {
         ActiveTestPipelineRunner*& slot;
@@ -83,114 +87,121 @@ std::optional<ModeResult> ActiveTestPipelineRunner::run() {
     tls_runner = this;
     RunnerGuard guard{tls_runner, prev_runner};
 
-    if (!source_) {
-        TCPLOG_ERROR("Packet source unavailable"); // Hardware or capture backend not configured or crashed.
-        return std::nullopt;
-    }
+    PipelineRunner runner(cfg_,
+                          opts_,
+                          matcher_,
+                          std::move(source_),
+                          *this,
+                          thread_name_);
+    return runner.run();
+}
 
-    // Open the configured interface and queue, similar to binding a monitoring box in an ISP rack.
-    if (!source_->open(cfg_.ifname, cfg_.queue)) {
-        TCPLOG_ERROR("Failed to open packet source on %s q%u",
-                    cfg_.ifname.c_str(),
-                    cfg_.queue); // Likely permission issue, absent NIC queue, or interface down.
-        return std::nullopt;
-    }
+// ---------------------------------------------------------------------------
+// IPipelineStrategy hooks
+// ---------------------------------------------------------------------------
 
-    // Print effective source filtering mode.
-    if (opts_.has_prefix) {
-        std::cout << "[openpenny] source prefix filter: " << opts_.prefix_cidr << '\n'; 
-        // Only packets whose source IP matches the given CIDR prefix will be processed.
-    } else {
-        std::cout << "[openpenny] no source prefix filter (accepting all sources)" << '\n';
-        // No upstream source restriction, pipeline sees the full access link aggregate.
-    }
-
-    // Print forwarding behaviour if TUN reinjection is enabled.
-    if (opts_.forward_to_tun) {
-        std::cout << "[openpenny] forwarding matched packets to TUN device: "
-                  << (opts_.tun_name.empty() ? "<default>" : opts_.tun_name)
-                  << '\n';
-    } else if (opts_.forward_fd >= 0) {
-        std::cout << "[openpenny] forwarding matched packets to fd "
-                  << opts_.forward_fd
-                  << (opts_.forward_device.empty() ? "" : (" (" + opts_.forward_device + ")"))
-                  << '\n';
-        // Realistic for an ISP scenario where sampled traffic slices are analysed off-box and reinjected.
-    }
-    
-    net::PacketHandler handler = [this](const net::PacketView& packet) {
-        handle_packet(packet, std::chrono::steady_clock::now());
-    };
-
+std::size_t ActiveTestPipelineRunner::poll_budget() const {
     // Derive a poll budget from source configuration when available.
-    std::size_t poll_budget = 0;
-    if (cfg_.dpdk.enable && cfg_.dpdk.burst > 0) {
-        poll_budget = cfg_.dpdk.burst;
-    } else if (cfg_.xdp_runtime.batch > 0) {
-        poll_budget = cfg_.xdp_runtime.batch;
+    if (cfg_.input.backend == PacketInputBackend::Dpdk && cfg_.dpdk.burst > 0) {
+        return cfg_.dpdk.burst;
     }
-    unsigned idle_polls = 0;
-    auto idle_start = std::chrono::steady_clock::now();
+    if (cfg_.xdp_runtime.batch > 0) {
+        return cfg_.xdp_runtime.batch;
+    }
+    return 0;
+}
 
-    while (true) {
-        // Apply timer-produced callbacks on this thread to keep FlowEngine single-threaded.
-        penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
-        if (penny_finished_) break;
-        if (should_stop()) break;
-        const auto before = total_pkts_processed_;
-        if (!source_->poll(handler, poll_budget)) {
-            TCPLOG_ERROR("Packet poll failed");
-            break;
-        }
-        if (total_pkts_processed_ == before) {
-            // No packets processed this poll; back off to avoid hot-spinning when sockets/maps are misconfigured.
-            ++idle_polls;
-            auto now = std::chrono::steady_clock::now();
-            auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - idle_start).count();
-            if (idle_ms >= 3000 && TCPLOG_ENABLED(WARN)) {
-                TCPLOG_WARN("No packets processed on %s q%u for %lld ms (polls=%u); backing off (check XDP/XSK binding)",
-                            cfg_.ifname.c_str(),
-                            cfg_.queue,
-                            static_cast<long long>(idle_ms),
-                            idle_polls);
-                idle_start = now;
-                idle_polls = 0;
+void ActiveTestPipelineRunner::on_opened() {
+    // Traffic match and egress sink lines used to print here, once per
+    // worker. With many workers that produced 63+ duplicate lines per
+    // run. They now print once at the driver level (see
+    // OpenpennyPipelineDriver::drive_pipeline). on_opened() now only
+    // resets the per-queue idle accumulator.
+    idle_polls_ = 0;
+    idle_start_ = std::chrono::steady_clock::now();
+}
+
+void ActiveTestPipelineRunner::before_poll(
+    const std::chrono::steady_clock::time_point& /*now*/) {
+    // Apply timer-produced callbacks on this thread to keep FlowEngine single-threaded.
+    penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
+}
+
+void ActiveTestPipelineRunner::on_packet(
+    const net::PacketView& packet,
+    const std::chrono::steady_clock::time_point& now,
+    ModeResult& /*result*/) {
+    handle_packet(packet, now);
+}
+
+void ActiveTestPipelineRunner::after_poll(
+    const std::chrono::steady_clock::time_point& now,
+    std::size_t processed_delta,
+    ModeResult& /*result*/) {
+    if (processed_delta == 0) {
+        // No packets processed this poll; back off to avoid hot-spinning
+        // when sockets/maps are misconfigured.
+        ++idle_polls_;
+        const auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - idle_start_).count();
+        if (idle_ms >= 3000) {
+            // Per-queue idle log is at DEBUG. With many workers this would
+            // be 21+ lines/s of identical "no packets" warnings; the
+            // process-level no-packets watchdog (in OpenpennyPipelineDriver)
+            // already prints a single actionable WARN at 5s.
+            if (TCPLOG_ENABLED(DEBUG)) {
+                TCPLOG_DEBUG("No packets processed on %s q%u for %lld ms "
+                             "(polls=%u); backing off (check XDP/XSK binding)",
+                             cfg_.ifname.c_str(),
+                             cfg_.queue,
+                             static_cast<long long>(idle_ms),
+                             idle_polls_);
             }
-            if (idle_ms >= 3000) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                // Drain timer callbacks so expirations still apply while idle.
-                penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
-            }
-        } else {
-            idle_polls = 0;
-            idle_start = std::chrono::steady_clock::now();
+            // Reset the accumulator regardless of log level. Without this,
+            // idle_polls_ counts forever once DEBUG is off and the next
+            // DEBUG message (if level changes mid-run) would print stale
+            // values.
+            idle_start_ = now;
+            idle_polls_ = 0;
         }
-        if (idle_timeout_.count() > 0) {
-            expire_idle_flows(std::chrono::steady_clock::now());
+        if (idle_ms >= 3000) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // Drain timer callbacks so expirations still apply while idle.
+            penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
         }
-        sweep_expired_snapshots(std::chrono::steady_clock::now());
-        if (penny_finished_) break;
-        penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
+    } else {
+        idle_polls_ = 0;
+        idle_start_ = now;
     }
 
+    if (idle_timeout_.count() > 0) {
+        expire_idle_flows(now);
+    }
+    sweep_expired_snapshots(now);
+    // Mirrors the post-loop drain in the legacy run() so deferred
+    // expirations aren't stranded between iterations.
+    penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
+}
+
+void ActiveTestPipelineRunner::on_closing() {
     // Flush any callbacks that arrived after the final poll iteration.
     penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
     sweep_expired_snapshots(std::chrono::steady_clock::now());
-    source_->close();
+}
 
+void ActiveTestPipelineRunner::finalize(ModeResult& result) {
     // Expire any pending snapshots on remaining flows to ensure expirations are logged/applied.
     flow_manager_.for_each_flow([](const FlowKey&, penny::FlowEngineEntry& entry) {
         entry.flow.expire_all_pending_snapshots();
     });
 
-    ModeResult result;
-    result.packets_processed = total_pkts_processed_;
     result.packets_forwarded = total_pkts_forwarded_;
     result.forward_errors = total_forward_errors_;
-    result.penny_completed = penny_finished_;
-    result.aggregates_penny_completed = penny_finished_;
-    return result;
 }
+
+// ---------------------------------------------------------------------------
+// Flow / timer helpers (unchanged from pre-Chunk-2 implementation)
+// ---------------------------------------------------------------------------
 
 // Entry point for each packet: log, admit flow, and dispatch to ACK/data handlers.
 void ActiveTestPipelineRunner::expire_idle_flows(const std::chrono::steady_clock::time_point& now) {
@@ -226,13 +237,6 @@ void ActiveTestPipelineRunner::sweep_expired_snapshots(const std::chrono::steady
 
 void ActiveTestPipelineRunner::handle_packet(const net::PacketView& packet,
                                              const std::chrono::steady_clock::time_point& now) {
-    // Increase the global number of processed packets in this thread pipeline.
-    ++total_pkts_processed_;
-    // Count every packet observed on this thread (monitored or not).
-    auto& counters = openpenny::app::current_thread_counters();
-    counters.packets += 1;
-    counters.bytes += static_cast<uint64_t>(packet.payload_bytes);
-
     // Check whether the packet belongs to one of the currently monitored flows.
     // If it does not, and parallel monitoring capacity is still available, start
     // tracking the new flow. A flow can be added to monitoring using a SYN packet
@@ -243,13 +247,13 @@ void ActiveTestPipelineRunner::handle_packet(const net::PacketView& packet,
     }
     flow_manager_.touch_flow(packet.flow, now);
 
-    // Check if packet is RST. 
+    // Check if packet is RST.
     handle_rst(*penny_entry, packet);
     if (penny_entry->state == penny::FlowTrackingState::INTERRUPTED_RST) {
         forward_packet(packet);
         return;
     }
-    
+
     handle_fin(*penny_entry, packet);
     if (penny_entry->state == penny::FlowTrackingState::CONNECTION_CLOSED_FIN) {
         forward_packet(packet);
@@ -308,7 +312,7 @@ penny::FlowEngineEntry* ActiveTestPipelineRunner::admit_or_forward_flow(
             // From Penny perspective the test for the flow is done.
 
 
-        }   
+        }
         const bool terminal_state =
         flow_entry->state == penny::FlowTrackingState::INTERRUPTED_RST ||
         flow_entry->state == penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED ||
@@ -481,17 +485,9 @@ void ActiveTestPipelineRunner::handle_data_packet(penny::FlowEngineEntry& entry,
 
     const uint32_t start_seq = packet.tcp.seq;
     const uint32_t end_seq = start_seq + static_cast<uint32_t>(packet.payload_bytes);
-    
+
     // Combined ordering + interval tracking.
     const auto interval_mark = entry.flow.mark_interval(start_seq, end_seq);
-    /*if (TCPLOG_ENABLED(DEBUG)) {
-        TCPLOG_DEBUG("Interval mark seq=%u-%u in_seq=%d duplicate=%d touches_gap=%d",
-                     start_seq,
-                     end_seq,
-                     interval_mark.in_sequence ? 1 : 0,
-                     interval_mark.duplicate ? 1 : 0,
-                     interval_mark.touches_gap ? 1 : 0);
-    }*/
 
     if (interval_mark.in_sequence) {
         // If its in-sequence it can not be a duplicate or a retransmission
@@ -514,7 +510,6 @@ void ActiveTestPipelineRunner::handle_data_packet(penny::FlowEngineEntry& entry,
 
     const bool raw_duplicate = interval_mark.duplicate;
     // If the packet has not been seen before, it is simply an out-of-order packet.
-    // TODO: Consider that for less than 4 packets may it does not make sense to do the comparison
     if (!raw_duplicate){
         if (TCPLOG_ENABLED(DEBUG)) {
             const auto flow_tag = flow_debug_details(packet.flow);
@@ -590,45 +585,21 @@ void ActiveTestPipelineRunner::handle_data_packet(penny::FlowEngineEntry& entry,
     forward_packet(packet);
 }
 
-// Attempt to forward a packet to the configured TUN device; collects stats and logs errors.
+// Emit a matched packet via the configured PacketSink. Per-worker
+// totals live on this runner and are merged into ModeResult in
+// finalize().
 void ActiveTestPipelineRunner::forward_packet(const net::PacketView& packet) {
-    const bool raw = opts_.forward_raw_socket;
-    int fd = raw ? opts_.forward_fd
-                 : (opts_.forward_fd >= 0 ? opts_.forward_fd : opts_.tun_fd);
-    if (fd < 0 || !packet.layer3_ptr || packet.layer3_length <= 0) {
+    TCPLOG_DEBUG("Forward Packet%s", "");
+    if (!opts_.sink) {
         return;
     }
-
-    ssize_t written = -1;
-    if (raw) {
-        if (packet.layer3_length < 20) {
-            return;
-        }
-        sockaddr_in dst{};
-        dst.sin_family = AF_INET;
-        std::memcpy(&dst.sin_addr.s_addr, packet.layer3_ptr + 16, sizeof(dst.sin_addr.s_addr));
-        written = ::sendto(fd,
-                           packet.layer3_ptr,
-                           static_cast<size_t>(packet.layer3_length),
-                           0,
-                           reinterpret_cast<sockaddr*>(&dst),
-                           sizeof(dst));
-    } else {
-        written = ::write(fd,
-                          packet.layer3_ptr,
-                          static_cast<size_t>(packet.layer3_length));
-    }
-    if (written >= 0) {
+    if (opts_.sink->write(packet)) {
         ++total_pkts_forwarded_;
+    } else if (!packet.layer3_ptr || packet.layer3_length == 0) {
+        // No payload to forward -- not a sink error.
     } else {
-        int err = errno;
-        if (err != EAGAIN && err != EWOULDBLOCK) {
-            TCPLOG_WARN("Failed to forward packet (%d bytes) via fd %d: %s",
-                        static_cast<int>(packet.layer3_length),
-                        fd,
-                        std::strerror(err));
-            ++total_forward_errors_;
-        }
+        // Sink logs the specific failure; we just count it.
+        ++total_forward_errors_;
     }
 }
 
@@ -672,15 +643,19 @@ bool ActiveTestPipelineRunner::flow_out_of_order_threshold_exceeded(const penny:
     return false;
 }
 
-// Emit a concise single-line trace for the current packet.
+// Emit a concise single-line trace for the current packet. Gated on the
+// global log level so it's a no-op outside DEBUG (the header comment
+// promises this).
 void ActiveTestPipelineRunner::log_packet_line(const net::PacketView& packet) const {
-    std::cout << "TCP src=" << to_ipv4_string(packet.flow.src) << ':' << packet.flow.sport
-              << " dst=" << to_ipv4_string(packet.flow.dst) << ':' << packet.flow.dport
-              << " seq=" << packet.tcp.seq
-              << " ack=" << packet.tcp.ack
-              << " flags=0x" << std::hex
-              << static_cast<unsigned>(packet.tcp.flags)
-              << std::dec << '\n';
+    if (!TCPLOG_ENABLED(DEBUG)) return;
+    TCPLOG_DEBUG("TCP src=%s:%u dst=%s:%u seq=%u ack=%u flags=0x%02x",
+                 to_ipv4_string(packet.flow.src).c_str(),
+                 static_cast<unsigned>(packet.flow.sport),
+                 to_ipv4_string(packet.flow.dst).c_str(),
+                 static_cast<unsigned>(packet.flow.dport),
+                 packet.tcp.seq,
+                 packet.tcp.ack,
+                 static_cast<unsigned>(packet.tcp.flags));
 }
 
 void ActiveTestPipelineRunner::maybe_log_flow_stats(penny::FlowEngineEntry& entry,

@@ -1,29 +1,24 @@
-# gRPC Usage Guide
+# gRPC Guide
 
-Penny exposes a blocking `StartTest` RPC (defined in `proto/penny.proto`).  
-The gRPC daemon (`pennyd`) launches `penny_worker` to run a full test pipeline and returns a structured summary once the run completes.
+OpenPenny ships a gRPC server (`pennyd`) and a worker process
+(`penny_worker`) that runs the actual pipeline. Use the gRPC API when you
+need to drive OpenPenny from another service or from a script.
 
-This guide describes how to start the daemon, how to trigger active or passive tests, and how to apply per-request configuration overrides.
+The full service is defined in [`proto/penny.proto`](../../proto/penny.proto).
 
-## Prerequisites
+## Before you start
 
-- Build the project with gRPC enabled (default in CMake).
-- Binaries produced after building from the repository root:
-  - **Server:** `./build/pennyd`
-  - **Worker:** `./build/penny_worker`
-  - **Sample clients:**  
-    - `examples/grpc_active_example.py`  
-    - `examples/grpc_passive_example.py`
-- Protocol definition file: `proto/penny.proto`  
-  Use it to generate client stubs in any supported language.
+Build with gRPC enabled (default if gRPC is installed). After building, you
+should have:
 
-## Starting the gRPC Server
+- `./build/pennyd` — the server.
+- `./build/penny_worker` — the worker the server runs.
+- Sample clients in `examples/`:
+  - `examples/grpc_active_example.py`
+  - `examples/grpc_passive_example.py`
 
-```bash
-./build/pennyd     --config examples/configs/config_default.yaml     --listen 0.0.0.0:50051     --worker-bin ./build/penny_worker
-```
+If `pennyd` is missing after a build, point CMake at your gRPC install:
 
-**Build note:** if `pennyd` is missing, reconfigure with explicit gRPC paths, e.g.:
 ```bash
 cmake -S . -B build \
   -DgRPC_DIR=/usr/lib64/cmake/grpc \
@@ -32,101 +27,153 @@ cmake -S . -B build \
 cmake --build build --target pennyd penny_worker
 ```
 
-### Flags
-
-- **`--config`**  
-  Path to the base YAML configuration; used unless the request provides overrides.
-
-- **`--listen`**  
-  Address on which the gRPC service should listen.
-
-- **`--worker-bin`**  
-  Path to the `penny_worker` binary that executes test pipelines.
-
-## Request Fields (`StartTestRequest`)
-
-- `prefix` / `mask_bits` — optional flow filter  
-- `mode` — `"active"` (default) or `"passive"`  
-- `test_id` — identifier attached to the run  
-- Forwarding controls:  
-  - `forward_to_tun`  
-  - `tun_name`  
-  - `forward_raw_socket`  
-  - `forward_device`  
-- `config_override_json` — inline JSON that **replaces** the worker configuration for this request
-
-### Overriding interface and queue settings
-
-If needed, override NIC or TUN settings directly in the JSON:
-
-```json
-{
-  "ifname": "ens5f0np0",
-  "queue": 0,
-  "queue_count": 4,
-  "tun_multi_queue": true,
-  "forward_to_tun": true,
-  "monitoring": {}
-}
-```
-
-## Passive Mode Example (grpcurl, with proto)
+## Start the server
 
 ```bash
-PROTO_DIR=$(pwd)/proto  # adjust if your working dir differs
+./build/pennyd \
+  --config examples/configs/config_default.yaml \
+  --listen 0.0.0.0:50051 \
+  --worker-bin ./build/penny_worker
+```
+
+| Flag            | Purpose                                                  |
+| --------------- | -------------------------------------------------------- |
+| `--config`      | YAML config used as the base for all requests.           |
+| `--listen`      | Address and port to serve on.                            |
+| `--worker-bin`  | Path to `penny_worker` (the server runs it per request). |
+
+## Main RPCs
+
+Use these for normal operation:
+
+- `SetTrafficPolicy` — pick which traffic to include or exclude (5-tuple rules).
+- `SetRuntimePolicy` — switch active/passive, set thresholds and safety flags.
+- `SetMode` — toggle active/passive without changing other policy.
+- `ApplyConfig` — set both policies in one call.
+- `GetDesiredConfig` — read back the policy you set.
+- `GetEffectiveConfig` — read the config the daemon actually uses.
+- `GetRuntimeStatus` — current daemon status.
+- `StartTest` — run one test and wait for the result.
+
+## Examples
+
+### Set a traffic policy
+
+```bash
 grpcurl -plaintext \
-  -import-path "$PROTO_DIR" \
-  -proto penny.proto \
+  -import-path proto -proto penny.proto \
   -d '{
-    "prefix": "192.168.41.1",
-    "mask_bits": 32,
-    "mode": "passive",
-    "test_id": "demo-passive",
-    "config_override_json": "{\"monitoring\":{\"active\":{\"enabled\":false},\"passive\":{\"enabled\":true,\"min_number_of_flows_to_finish\":10,\"max_parallel_flows\":10,\"max_execution_time\":150,\"timeouts\":{\"admission_grace_period_seconds\":3.0,\"monitored_flow_idle_expiry_seconds\":15.0}}}}"
+    "traffic_policy": {
+      "default_decision": "TRAFFIC_DECISION_EXCLUDE",
+      "rules": [{
+        "name": "https",
+        "priority": 10,
+        "enabled": true,
+        "dst_prefix": "203.0.113.0/24",
+        "protocol": "tcp",
+        "dst_port": 443,
+        "decision": "TRAFFIC_DECISION_INCLUDE"
+      }]
+    }
   }' \
-  localhost:50051 openpenny.api.PennyService/StartTest
+  localhost:50051 openpenny.api.PennyService/SetTrafficPolicy
 ```
 
-## Active Mode Example (grpcurl, with proto)
+### Set a runtime policy (active mode)
 
 ```bash
-PROTO_DIR=$(pwd)/proto  # adjust if your working dir differs
 grpcurl -plaintext \
-  -import-path "$PROTO_DIR" \
-  -proto penny.proto \
+  -import-path proto -proto penny.proto \
+  -d '{
+    "runtime_policy": {
+      "mode": "RUNTIME_MODE_ACTIVE",
+      "safety": { "allow_ssh_bypass": true },
+      "thresholds": {
+        "packet_drop_probability": 0.05,
+        "max_duplicate_ratio": 0.15,
+        "max_reordering_ratio": 0.8,
+        "retransmission_timeout_multiplier": 3.0,
+        "max_packet_drops_per_flow": 6,
+        "max_packet_drops_global_aggregate": 12
+      }
+    }
+  }' \
+  localhost:50051 openpenny.api.PennyService/SetRuntimePolicy
+```
+
+### Run an active test
+
+```bash
+grpcurl -plaintext \
+  -import-path proto -proto penny.proto \
   -d '{
     "prefix": "192.168.41.1",
     "mask_bits": 32,
     "mode": "active",
-    "test_id": "demo-active",
-    "config_override_json": "{\"monitoring\":{\"active\":{\"enabled\":true,\"aggregates\":{\"enabled\":true,\"max_packet_drops_global_aggregate\":12,\"fallback_to_individual\":true},\"drop_policy\":{\"packet_drop_probability\":0.05,\"max_duplicate_ratio\":0.15,\"max_reordering_ratio\":0.8},\"timeouts\":{\"retransmission_timeout_seconds\":3.0,\"admission_grace_period_seconds\":3.0,\"monitored_flow_idle_expiry_seconds\":30.0},\"execution\":{\"max_packet_drops_per_flow\":6,\"max_number_of_individual_flows\":10,\"stop_after_individual_flows\":10}},\"passive\":{\"enabled\":false}}}"
+    "test_id": "demo-active"
   }' \
   localhost:50051 openpenny.api.PennyService/StartTest
 ```
 
-## Response Shape
+### Run a passive test
 
-- status, `test_id`
-- packet counters (processed, forwarded, duplicate, in-order/out-of-order, retransmitted, etc.)
-- flow counters (tracked SYN/data flows)
-- completion flags:
-  - `penny_completed`
-  - `aggregates_completed`
-  - `aggregates_enabled`
-- aggregate evaluation (active mode):
-  - `aggregates_status`, `aggregates_decision_complete`, `aggregates_has_eval`, `aggregates_snapshots`
-  - `aggregates_eval_*` counters (data/duplicate/retransmitted/non_retransmitted)
-  - `aggregate_flows_*` snapshot counters (monitored/finished/closed_loop/not_closed_loop/rst/duplicates_exceeded)
-- `json_summary`: JSON string with CLI-like detail:
-  - `packets`: processed/forwarded/errors/pure_ack/data/duplicate/in_order/out_of_order/retransmitted/non_retransmitted
-  - `flows`: tracked_syn / tracked_data
-  - `penny_completed`, `aggregates_completed`, `aggregates_enabled`
-  - `aggregates_status`, `aggregates_decision_complete`, `aggregates_decision_state`
-  - `aggregates_eval` (object) and `aggregate_flows` (object)
-  - `passive` (when applicable): finished/open_gaps_flows/open_gaps/rst/syn_only/details[]
+```bash
+grpcurl -plaintext \
+  -import-path proto -proto penny.proto \
+  -d '{
+    "prefix": "192.168.41.1",
+    "mask_bits": 32,
+    "mode": "passive",
+    "test_id": "demo-passive"
+  }' \
+  localhost:50051 openpenny.api.PennyService/StartTest
+```
 
-## Notes
+`StartTest` blocks until the run finishes or fails.
 
-- `config_override_json` **fully replaces** the worker configuration for that call.
-- The RPC call is **blocking** until the pipeline completes or errors.
-- TUN forwarding is enabled by default; disable with `"forward_to_tun": false`.
+## Inline overrides
+
+`StartTestRequest.config_override_json` lets you tweak config for one run
+without changing the daemon's base YAML:
+
+```json
+{
+  "platform": {
+    "backend": "af_xdp",
+    "ingress_mode": "auto",
+    "interface": "ens5f0np0",
+    "queue": 0,
+    "queue_count": 1
+  },
+  "egress": {
+    "kind": "tun",
+    "device": "xdp-tun",
+    "tun": { "multi_queue": true, "mtu": 9000, "rp_filter_loose": true }
+  }
+}
+```
+
+Valid values:
+
+- `platform.backend`: `af_xdp`, `af_packet_mirror`, `dpdk`.
+- `platform.ingress_mode`: `auto` (default), `copy`, `redirect`.
+- `egress.kind`: `none`, `tun`, `raw_socket`, `raw_nic`.
+
+`auto` picks `copy` for passive runs and `redirect` for active runs.
+
+## What the response looks like
+
+`StartTest` returns:
+
+- A status string and the `test_id` you passed in.
+- Packet counters: processed, forwarded, errors, duplicate, in-order,
+  out-of-order, retransmitted, etc.
+- Flow counters: tracked SYN flows, tracked data flows.
+- Completion flags: `penny_completed`, `aggregates_completed`,
+  `aggregates_enabled`.
+- For active mode: aggregate evaluation fields (`aggregates_status`,
+  `aggregates_decision_complete`, `aggregate_flows_*`, etc.).
+- `json_summary`: the same detail in a JSON string, ready to log or store.
+
+For the full override schema, see
+[`docs/dev/grpc-override-format.md`](../dev/grpc-override-format.md).

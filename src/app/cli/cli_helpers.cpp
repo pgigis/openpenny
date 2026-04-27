@@ -84,6 +84,11 @@ CliOptions parse_args(int argc, char** argv) {
             opts.has_prefix = true;
         } else if ((arg == "--queue" || arg == "-q") && i + 1 < argc) {
             std::string value = argv[++i];
+            if (to_lower(value) == "auto") {
+                opts.queue_auto = true;
+                opts.queue_override = false;
+                continue;
+            }
             char* end = nullptr;
             errno = 0;
             long q = std::strtol(value.c_str(), &end, 10);
@@ -92,7 +97,18 @@ CliOptions parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             opts.queue_override = true;
+            opts.queue_auto = false;
             opts.queue_value = static_cast<unsigned>(q);
+        } else if (arg == "--queue-probe-ms" && i + 1 < argc) {
+            std::string value = argv[++i];
+            char* end = nullptr;
+            errno = 0;
+            long ms = std::strtol(value.c_str(), &end, 10);
+            if (errno != 0 || end == value.c_str() || *end != '\0' || ms <= 0) {
+                std::cerr << "Invalid queue probe duration: " << value << '\n';
+                std::exit(1);
+            }
+            opts.queue_probe_ms = static_cast<unsigned>(ms);
         } else if ((arg == "--queues" || arg == "-Q") && i + 1 < argc) {
             std::string value = argv[++i];
             char* end = nullptr;
@@ -130,11 +146,13 @@ CliOptions parse_args(int argc, char** argv) {
                       << "  --source <xdp|dpdk>     Packet source backend (default xdp)\n"
                       << "  --mode <active|passive> Pipeline mode (default active)\n"
                       << "  --stats-sock <path>     Unix datagram socket path for live stats (optional)\n"
-                      << "  -p, --prefix <CIDR>     Prefix to match source IPs (default: 0.0.0.0/0)\n"
+                      << "  -p, --prefix <CIDR>     Legacy runtime prefix metadata (traffic_match controls capture)\n"
                       << "  --iface <dev>           Ensure XDP program is attached to interface\n"
                       << "  --xdp-mode <auto|drv|generic>  Attachment mode (default auto)\n"
+                      << "  -q, --queue <id|auto>   AF_XDP queue id, or auto-probe the active RX queue\n"
+                      << "  --queue-probe-ms <ms>   Probe time per queue when using --queue auto\n"
                       << "  --tun <dev>             Forward matching packets to the named TUN device\n"
-                      << "  -Q, --queues <count>    Number of queues/threads to poll (default 1)\n"
+                      << "  -Q, --queues <count>    Number of AF_XDP or DPDK queues/threads to poll\n"
                       << "\nPolling continues until Penny heuristics finish or you press Ctrl+C.\n";
             std::exit(0);
         }
@@ -156,12 +174,13 @@ CliOptions normalize_options(CliOptions opts) {
         opts.mask_bits = 0;
     }
 
-    if (opts.has_prefix && !opts.iface.empty()) {
+    if (!opts.iface.empty()) {
         std::ostringstream base;
-        base << "/sys/fs/bpf/openpenny_" << opts.iface << "_" << opts.mask_bits;
+        base << "/sys/fs/bpf/openpenny_" << opts.iface;
         opts.pin_conf_path = base.str() + "/conf";
         opts.pin_xsks_path = base.str() + "/xsks";
         opts.pin_stats_path = base.str() + "/stats";
+        opts.pin_settings_path = base.str() + "/settings";
     }
     return opts;
 }

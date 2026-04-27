@@ -4,6 +4,7 @@
 
 #include "openpenny/agg/Stats.h" // for FlowKey
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -281,6 +282,20 @@ private:
      * during snapshot updates.
      */
     std::deque<Callback> callbacks_;
+
+    /**
+     * @brief Lock-free fast-path size of `callbacks_`.
+     *
+     * Every per-packet poll iteration on every worker calls
+     * `drain_callbacks()`. With many AF_XDP queue workers in busy-poll
+     * mode that adds up to millions of mutex acquires per second on
+     * `mutex_` even when no callbacks are pending. This counter lets
+     * `drain_callbacks()` skip the lock entirely on the common
+     * "nothing to drain" path. It is incremented under `mutex_` whenever
+     * we push to `callbacks_`, and reset to 0 inside `drain_callbacks()`
+     * after we swap the deque out.
+     */
+    std::atomic<std::size_t> pending_callbacks_{0};
 
     static std::function<void(FlowEngine*, const std::string&, SnapshotEventKind)> snapshot_hook_;
 };

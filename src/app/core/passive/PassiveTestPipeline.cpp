@@ -2,12 +2,14 @@
 
 #include "openpenny/app/core/PassiveTestPipeline.h"
 
+#include "openpenny/app/core/PipelineRunner.h"
 #include "openpenny/log/Log.h"
 #include "openpenny/app/core/utils/FlowDebug.h"
 #include "openpenny/app/core/PerThreadStats.h"
 
 #include <atomic>
 #include <cstring>
+#include <sstream>
 #include <unistd.h>
 #include <netinet/in.h>
 
@@ -20,184 +22,179 @@ uint32_t packet_end_seq(const net::PacketView& pkt) {
 
 // Global concurrent passive flow cap across threads.
 std::atomic<std::size_t> g_passive_active_flows{0};
-}
+} // namespace
 
 PassiveTestPipelineRunner::PassiveTestPipelineRunner(const Config& cfg,
-                                                               const PipelineOptions& opts,
-                                                               FlowMatcher matcher,
-                                                               net::PacketSourcePtr source)
+                                                     const PipelineOptions& opts,
+                                                     FlowMatcher matcher,
+                                                     net::PacketSourcePtr source)
     : cfg_(cfg),
       opts_(opts),
       matcher_(std::move(matcher)),
       source_(std::move(source)) {}
 
 std::optional<ModeResult> PassiveTestPipelineRunner::run() {
-    if (!source_) {
-        TCPLOG_ERROR("Packet source unavailable");
-        return std::nullopt;
-    }
-    if (!source_->open(cfg_.ifname, cfg_.queue)) {
-        TCPLOG_ERROR("Failed to open packet source on %s q%u", cfg_.ifname.c_str(), cfg_.queue);
-        return std::nullopt;
-    }
-
-    ModeResult result{};
-    const auto idle_timeout = std::chrono::duration<double>(
-        cfg_.passive.flow_idle_timeout_seconds);
-    const auto max_exec = std::chrono::duration<double>(
-        cfg_.passive.max_execution_time_seconds);
-    const auto grace = std::chrono::duration<double>(cfg_.passive.flow_grace_period_seconds);
-    net::PacketHandler handler = [this, &result, idle_timeout, grace](const net::PacketView& packet) {
-        if (opts_.should_stop && opts_.should_stop()) return;
-        if (matcher_ && !matcher_(packet.flow)) return;
-
-        ++result.packets_processed;
-        auto& counters = openpenny::app::current_thread_counters();
-        counters.packets++;
-        counters.bytes += static_cast<uint64_t>(packet.payload_bytes);
-
-        const auto now = std::chrono::steady_clock::now();
-        // If the flow already finished and we now observe FIN/RST, update the end reason.
-        if (auto it = finished_index_.find(packet.flow); it != finished_index_.end()) {
-            const auto flags = packet.tcp.flags_view();
-            if (flags.fin || flags.rst) {
-                auto idx = it->second;
-                if (idx < finished_flows_.size()) {
-                    finished_flows_[idx].end_reason = flags.rst ? "rst" : "fin";
-                }
-            }
-        }
-
-        // Admit or lookup flow and update passive stats.
-        auto* flow_state = [&]() -> PassiveFlowState* {
-            if (grace.count() > 0.0 &&
-                now - start_time_ < std::chrono::duration_cast<std::chrono::steady_clock::duration>(grace)) {
-                return nullptr;
-            }
-            return admit_flow(packet, now);
-        }();
-        if (flow_state) {
-            flow_state->last_seen = now;
-            if (packet.payload_bytes > 0) {
-                handle_data_packet(*flow_state, packet);
-            } else {
-                flow_state->pure_ack_packets++;
-                counters.pure_ack_packets++;
-            }
-            const auto flags = packet.tcp.flags_view();
-            if (flags.rst) {
-                flow_state->seen_rst = true;
-                if (TCPLOG_ENABLED(INFO)) {
-                    TCPLOG_INFO("[passive_flag] flow=%s RST observed",
-                                flow_debug_details(packet.flow).c_str());
-                }
-                finish_flow(packet.flow, "rst");
-            } else if (flags.fin) {
-                if (TCPLOG_ENABLED(INFO)) {
-                    TCPLOG_INFO("[passive_flag] flow=%s FIN observed",
-                                flow_debug_details(packet.flow).c_str());
-                }
-                finish_flow(packet.flow, "fin");
-            } else if (flags.syn) {
-                flow_state->seen_syn = true;
-            }
-
-            if (TCPLOG_ENABLED(DEBUG)) {
-                if (flags.fin || flags.syn || flags.rst || flags.ack || flags.psh || flags.urg) {
-                    TCPLOG_DEBUG(
-                        "[passive_flags] flow=%s flags=%s%s%s%s%s%s seq=%u ack=%u payload=%zu",
-                        flow_debug_details(packet.flow).c_str(),
-                        flags.syn ? "S" : "",
-                        flags.fin ? "F" : "",
-                        flags.rst ? "R" : "",
-                        flags.ack ? "A" : "",
-                        flags.psh ? "P" : "",
-                        flags.urg ? "U" : "",
-                        packet.tcp.seq,
-                        packet.tcp.ack,
-                        packet.payload_bytes);
-                }
-            }
-        }
-        if (TCPLOG_ENABLED(DEBUG) && flow_state) {
-            const auto flow_tag = flow_debug_details(flow_state->key);
-            TCPLOG_DEBUG("[passive_packet] flow=%s seq=%u-%u payload=%zu",
-                         flow_tag.c_str(),
-                         packet.tcp.seq,
-                         packet_end_seq(packet),
-                         packet.payload_bytes);
-        }
-
-        const bool raw = opts_.forward_raw_socket;
-        int fd = raw ? opts_.forward_fd : (opts_.forward_fd >= 0 ? opts_.forward_fd : opts_.tun_fd);
-        if (fd >= 0 && packet.layer3_ptr && packet.layer3_length > 0) {
-            ssize_t written = -1;
-            if (raw) {
-                if (packet.layer3_length >= 20) {
-                    sockaddr_in dst{};
-                    dst.sin_family = AF_INET;
-                    std::memcpy(&dst.sin_addr.s_addr, packet.layer3_ptr + 16, sizeof(dst.sin_addr.s_addr));
-                    written = ::sendto(fd,
-                                       packet.layer3_ptr,
-                                       static_cast<size_t>(packet.layer3_length),
-                                       0,
-                                       reinterpret_cast<sockaddr*>(&dst),
-                                       sizeof(dst));
-                }
-            } else {
-                written = ::write(fd,
-                                  packet.layer3_ptr,
-                                  static_cast<size_t>(packet.layer3_length));
-            }
-            if (written >= 0) {
-                ++result.packets_forwarded;
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                ++result.forward_errors;
-            }
-        }
-    };
-
-    bool poll_failed = false;
-    while (true) {
-        if (opts_.should_stop && opts_.should_stop()) break;
-        if (!source_->poll(handler)) {
-            TCPLOG_ERROR("Packet poll failed");
-            poll_failed = true;
-            break;
-        }
-        if (idle_timeout.count() > 0.0) {
-            expire_idle_flows(std::chrono::steady_clock::now(),
-                              std::chrono::duration_cast<std::chrono::steady_clock::duration>(idle_timeout));
-        }
-        const bool target_met = cfg_.passive.min_number_of_flows_to_finish > 0 &&
-            flows_finished_ >= cfg_.passive.min_number_of_flows_to_finish &&
-            flows_.empty();
-        if (target_met) {
-            if (!stop_grace_active_) {
-                stop_grace_active_ = true;
-                stop_grace_start_ = std::chrono::steady_clock::now();
-            } else {
-                // Allow a short grace to catch trailing FIN/RST packets for already-finished flows.
-                constexpr auto kStopGrace = std::chrono::seconds(1);
-                if (std::chrono::steady_clock::now() - stop_grace_start_ >= kStopGrace) {
-                    break;
-                }
-            }
-        }
-        if (max_exec.count() > 0.0 &&
-            std::chrono::steady_clock::now() - start_time_ >=
-                std::chrono::duration_cast<std::chrono::steady_clock::duration>(max_exec)) {
-            break;
-        }
-    }
-
-    source_->close();
-    // Treat any remaining flows as finished when shutting down.
-    result.penny_completed = !poll_failed;
-    result.aggregates_penny_completed = result.penny_completed;
-    summarize_gaps(result);
-    return result;
+    PipelineRunner runner(cfg_,
+                          opts_,
+                          matcher_,
+                          std::move(source_),
+                          *this,
+                          /*thread_name=*/std::string{});
+    return runner.run();
 }
+
+// ---------------------------------------------------------------------------
+// IPipelineStrategy hooks
+// ---------------------------------------------------------------------------
+
+void PassiveTestPipelineRunner::on_opened() {
+    // Cache the duration values so the hot path doesn't keep reconverting
+    // from the config's double-seconds representation.
+    idle_timeout_ = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(cfg_.passive.flow_idle_timeout_seconds));
+    max_execution_time_ = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(cfg_.passive.max_execution_time_seconds));
+    grace_period_ = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(cfg_.passive.flow_grace_period_seconds));
+    start_time_ = std::chrono::steady_clock::now();
+
+    // Single, clear "we are now observing" marker, mirroring active mode's
+    // READY banner. Passive mode collapses to one worker (no
+    // PACKET_FANOUT yet), so this fires exactly once.
+    TCPLOG_INFO("[openpenny] ====== READY ====== passive observation is now "
+                "ACTIVE on '%s' q%u",
+                cfg_.ifname.c_str(),
+                cfg_.queue);
+}
+
+void PassiveTestPipelineRunner::on_packet(
+    const net::PacketView& packet,
+    const std::chrono::steady_clock::time_point& now,
+    ModeResult& result) {
+    auto& counters = openpenny::app::current_thread_counters();
+
+    // If the flow already finished and we now observe FIN/RST, update the end reason.
+    if (auto it = finished_index_.find(packet.flow); it != finished_index_.end()) {
+        const auto flags = packet.tcp.flags_view();
+        if (flags.fin || flags.rst) {
+            auto idx = it->second;
+            if (idx < finished_flows_.size()) {
+                finished_flows_[idx].end_reason = flags.rst ? "rst" : "fin";
+            }
+        }
+    }
+
+    // Admit or lookup flow and update passive stats.
+    PassiveFlowState* flow_state = [&]() -> PassiveFlowState* {
+        if (grace_period_.count() > 0 && now - start_time_ < grace_period_) {
+            return nullptr;
+        }
+        return admit_flow(packet, now);
+    }();
+    if (flow_state) {
+        flow_state->last_seen = now;
+        if (packet.payload_bytes > 0) {
+            handle_data_packet(*flow_state, packet);
+        } else {
+            flow_state->pure_ack_packets++;
+            counters.pure_ack_packets++;
+        }
+        const auto flags = packet.tcp.flags_view();
+        if (flags.rst) {
+            flow_state->seen_rst = true;
+            if (TCPLOG_ENABLED(INFO)) {
+                TCPLOG_INFO("[passive_flag] flow=%s RST observed",
+                            flow_debug_details(packet.flow).c_str());
+            }
+            finish_flow(packet.flow, "rst");
+        } else if (flags.fin) {
+            if (TCPLOG_ENABLED(INFO)) {
+                TCPLOG_INFO("[passive_flag] flow=%s FIN observed",
+                            flow_debug_details(packet.flow).c_str());
+            }
+            finish_flow(packet.flow, "fin");
+        } else if (flags.syn) {
+            flow_state->seen_syn = true;
+        }
+
+        if (TCPLOG_ENABLED(DEBUG)) {
+            if (flags.fin || flags.syn || flags.rst || flags.ack || flags.psh || flags.urg) {
+                TCPLOG_DEBUG(
+                    "[passive_flags] flow=%s flags=%s%s%s%s%s%s seq=%u ack=%u payload=%zu",
+                    flow_debug_details(packet.flow).c_str(),
+                    flags.syn ? "S" : "",
+                    flags.fin ? "F" : "",
+                    flags.rst ? "R" : "",
+                    flags.ack ? "A" : "",
+                    flags.psh ? "P" : "",
+                    flags.urg ? "U" : "",
+                    packet.tcp.seq,
+                    packet.tcp.ack,
+                    packet.payload_bytes);
+            }
+        }
+    }
+    if (TCPLOG_ENABLED(DEBUG) && flow_state) {
+        const auto flow_tag = flow_debug_details(flow_state->key);
+        TCPLOG_DEBUG("[passive_packet] flow=%s seq=%u-%u payload=%zu",
+                     flow_tag.c_str(),
+                     packet.tcp.seq,
+                     packet_end_seq(packet),
+                     packet.payload_bytes);
+    }
+
+    // Mirror matched packets via the declarative PacketSink. The
+    // sink is shared across worker threads and tracks its own
+    // internal counters; we still bump the per-run result counters
+    // so the existing aggregation in drive_pipeline() keeps working.
+    if (opts_.sink && packet.layer3_ptr && packet.layer3_length > 0) {
+        if (opts_.sink->write(packet)) {
+            ++result.packets_forwarded;
+        } else {
+            // write() logs specifics and filters EAGAIN internally.
+            ++result.forward_errors;
+        }
+    }
+}
+
+void PassiveTestPipelineRunner::after_poll(
+    const std::chrono::steady_clock::time_point& now,
+    std::size_t /*processed_delta*/,
+    ModeResult& /*result*/) {
+    if (idle_timeout_.count() > 0) {
+        expire_idle_flows(now);
+    }
+
+    const bool target_met = cfg_.passive.min_number_of_flows_to_finish > 0 &&
+        flows_finished_ >= cfg_.passive.min_number_of_flows_to_finish &&
+        flows_.empty();
+    if (target_met) {
+        if (!stop_grace_active_) {
+            stop_grace_active_ = true;
+            stop_grace_start_ = now;
+        } else {
+            // Allow a short grace to catch trailing FIN/RST packets for
+            // already-finished flows.
+            constexpr auto kStopGrace = std::chrono::seconds(1);
+            if (now - stop_grace_start_ >= kStopGrace) {
+                stop_requested_ = true;
+            }
+        }
+    }
+
+    if (max_execution_time_.count() > 0 &&
+        now - start_time_ >= max_execution_time_) {
+        stop_requested_ = true;
+    }
+}
+
+void PassiveTestPipelineRunner::finalize(ModeResult& result) {
+    summarize_gaps(result);
+}
+
+// ---------------------------------------------------------------------------
+// Passive helpers
+// ---------------------------------------------------------------------------
 
 PassiveFlowState* PassiveTestPipelineRunner::admit_flow(const net::PacketView& packet,
                                                         const std::chrono::steady_clock::time_point& now) {
@@ -298,11 +295,10 @@ void PassiveTestPipelineRunner::handle_data_packet(PassiveFlowState& state, cons
         state.gaps.end());
 }
 
-void PassiveTestPipelineRunner::expire_idle_flows(const std::chrono::steady_clock::time_point& now,
-                                                  const std::chrono::steady_clock::duration& timeout) {
-    if (timeout <= std::chrono::steady_clock::duration::zero()) return;
+void PassiveTestPipelineRunner::expire_idle_flows(const std::chrono::steady_clock::time_point& now) {
+    if (idle_timeout_ <= std::chrono::steady_clock::duration::zero()) return;
     for (auto it = flows_.begin(); it != flows_.end(); ) {
-        if (now - it->second.last_seen > timeout) {
+        if (now - it->second.last_seen > idle_timeout_) {
             const auto key = it->first;
             ++it; // advance before erasing via finish_flow
             finish_flow(key, "idle");

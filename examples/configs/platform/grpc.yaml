@@ -1,0 +1,4 @@
+# gRPC server settings (used only by `pennyd`; the CLI ignores this).
+enable: true
+listen_ip: 0.0.0.0       # bind address (0.0.0.0 = all interfaces)
+listen_port: 50051

@@ -1,0 +1,22 @@
+# Traffic policy: which packets OpenPenny should touch.
+#
+# `default` controls what happens when no rule matches. Each rule is a
+# 5-tuple matcher; the first matching rule wins (lower `priority` first).
+# Note: AF_XDP currently compiles one runtime match rule per run. Stick
+# to a single include rule unless you know the planner will collapse the
+# rest into a passthrough.
+
+# Default action when no rule matches. Use `exclude` to opt-in only what
+# you list below; `include` to opt-out only what you list below.
+default: exclude
+
+rules:
+  - name: iperf3-server          # human-readable label
+    decision: include            # include | exclude
+    protocol: tcp                # tcp | udp | omit for any
+    dst_port: 5201               # destination port to match
+    # Optional fields (uncomment to use):
+    # priority: 10               # lower = checked first
+    # src_prefix: 10.0.0.0/16    # source CIDR
+    # dst_prefix: 203.0.113.0/24 # destination CIDR
+    # src_port: 443              # source port

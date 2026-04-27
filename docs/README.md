@@ -1,33 +1,39 @@
-# Documentation Hub
+# OpenPenny Documentation
 
-Use this page as the entry point to the project docs.
+Start here. Each link below is a short, focused page.
 
-## Table of Contents
-- **Run**
-  - [CLI guide](run/cli-guide.md)
-  - [CLI quick reference](run/cli-readme.md)
-  - [gRPC guide](run/grpc-guide.md)
-  - [gRPC client example](run/grpc-client-example.md)
-- **Ops**
-  - [Install & build](ops/install-and-build.md)
-- **Dev**
-  - [Active vs passive pipeline overview](dev/active-passive-overview.md)
-  - [Drop snapshot data flow](dev/drop-snapshot-flow.md)
-  - [gRPC override format](dev/grpc-override-format.md)
-  - [gRPC example payloads](dev/grpc-config-example.json), [summary example](dev/grpc-summary-example.json)
+## Run it
 
-## Quick Troubleshooting (XDP path)
-- Ensure the XDP object is built: `cmake --build build --target xdp_bpf` or let the CLI auto-build.
-- Clean stale pins if attachment looks wrong:
+- [Install and build](ops/install-and-build.md) — install dependencies and build the binaries.
+- [CLI guide](run/cli-guide.md) — run active or passive mode from the command line.
+- [gRPC guide](run/grpc-guide.md) — run the daemon and call it from a client.
+- [Configuration examples](run/configuration-examples.md) — copy-paste YAML for common setups.
+- [Sample gRPC client](run/grpc-client-example.md) — Python script that talks to the daemon.
+
+## Understand it
+
+- [Active vs passive](dev/active-passive-overview.md) — what each mode does and when to use which.
+- [AF_XDP startup path](dev/af-xdp-startup-path.md) — how the XDP backend brings itself up.
+- [Control-plane architecture](dev/control-plane-architecture.md) — daemon, planner, compiler, and configs.
+- [Drop snapshot flow](dev/drop-snapshot-flow.md) — how active mode records drop outcomes.
+- [Penny API](dev/penny-api.md) — flow engine internals.
+- [gRPC override format](dev/grpc-override-format.md) — request override schema.
+
+## Project
+
+- [Changelog](project/CHANGELOG.md)
+- [Contributing](project/CONTRIBUTING.md)
+- [Security](project/SECURITY.md)
+- [Code of conduct](project/CODE_OF_CONDUCT.md)
+- [Dependency licenses](project/DEPENDENCIES-LICENSES.md)
+
+## Something not working?
+
+- XDP path issues: [install-and-build.md › Troubleshooting](ops/install-and-build.md#troubleshooting)
+- Multi-queue (`--queues > 1`) returning `processed=0`:
+  [multi-queue-troubleshooting.md](ops/multi-queue-troubleshooting.md)
+- Common cleanup before a fresh run:
   ```bash
   sudo python3 scripts/xdp_attach.py --iface <if> --mode drv --detach
   sudo rm -rf /sys/fs/bpf/openpenny*
-  sudo ./build/openpenny_cli --config examples/configs/config_default.yaml --mode active --iface <if> --queue 0 --tun xdp-tun
   ```
-- Verify attachment and xsks map:
-  ```bash
-  ip -details link show dev <if> | grep -i xdp
-  bpftool map dump pinned /sys/fs/bpf/openpenny_<if>_<mask>/xsks
-  ```
-- Allow fallbacks if the NIC/driver doesn’t support zero-copy:
-  set `require_zerocopy: false`, `allow_skb_fallback: true`, `allow_copy_fallback: true` in `examples/configs/config_default.yaml`.

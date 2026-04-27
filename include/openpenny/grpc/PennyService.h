@@ -3,9 +3,11 @@
 #pragma once
 
 #include "openpenny/app/core/OpenpennyPipelineDriver.h"
+#include "openpenny/control/Policy.h"
 #include "penny.grpc.pb.h"
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace openpenny::grpc_service {
@@ -65,6 +67,42 @@ public:
                              const openpenny::api::StartTestRequest* request,
                              openpenny::api::StartTestResponse* response) override;
 
+    ::grpc::Status ApplyConfig(::grpc::ServerContext* context,
+                               const openpenny::api::ApplyConfigRequest* request,
+                               openpenny::api::ConfigResponse* response) override;
+
+    ::grpc::Status SetTrafficPolicy(::grpc::ServerContext* context,
+                                    const openpenny::api::SetTrafficPolicyRequest* request,
+                                    openpenny::api::ConfigResponse* response) override;
+
+    ::grpc::Status SetRuntimePolicy(::grpc::ServerContext* context,
+                                    const openpenny::api::SetRuntimePolicyRequest* request,
+                                    openpenny::api::ConfigResponse* response) override;
+
+    ::grpc::Status SetMode(::grpc::ServerContext* context,
+                           const openpenny::api::SetModeRequest* request,
+                           openpenny::api::ConfigResponse* response) override;
+
+    ::grpc::Status GetDesiredConfig(::grpc::ServerContext* context,
+                                    const openpenny::api::GetConfigRequest* request,
+                                    openpenny::api::ConfigResponse* response) override;
+
+    ::grpc::Status GetEffectiveConfig(::grpc::ServerContext* context,
+                                      const openpenny::api::GetConfigRequest* request,
+                                      openpenny::api::ConfigResponse* response) override;
+
+    ::grpc::Status ReloadConfig(::grpc::ServerContext* context,
+                                const openpenny::api::ReloadConfigRequest* request,
+                                openpenny::api::ConfigResponse* response) override;
+
+    ::grpc::Status Stop(::grpc::ServerContext* context,
+                        const openpenny::api::StopRequest* request,
+                        openpenny::api::ConfigResponse* response) override;
+
+    ::grpc::Status GetRuntimeStatus(::grpc::ServerContext* context,
+                                    const openpenny::api::RuntimeStatusRequest* request,
+                                    openpenny::api::RuntimeStatusResponse* response) override;
+
 private:
     // -------------------------------------------------------------------------
     // Helpers for default merging and option construction
@@ -98,6 +136,10 @@ private:
 
     Config defaults_{};         ///< Default test configuration used for missing request fields.
     std::string config_path_{}; ///< Location of configuration file for test worker bootstrap.
+    mutable std::mutex config_mutex_{};
+    control::DesiredConfig desired_config_{};
+    control::EffectiveConfig effective_config_{};
+    bool desired_config_override_active_{false};
     
     /// Default binary path/name for test workers (may be overridden later).
     std::string worker_bin_{"penny_worker"};

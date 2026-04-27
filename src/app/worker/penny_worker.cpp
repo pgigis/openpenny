@@ -3,21 +3,18 @@
 #include "openpenny/config/Config.h"
 #include "openpenny/app/core/OpenpennyPipelineDriver.h"
 #include "openpenny/app/core/PerThreadStats.h"
+#include "openpenny/egress/PacketSink.h"
 #include "openpenny/log/Log.h"
 
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <vector>
 #include <arpa/inet.h>
-#include <fcntl.h>
-#include <linux/if_tun.h>
-#include <net/if.h>
 #include <netinet/in.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <nlohmann/json.hpp>
 
 namespace {
@@ -29,14 +26,16 @@ struct Args {
     std::string test_id{"worker"};
     openpenny::LogLevel log_level{openpenny::LogLevel::WARN};
     bool log_override{false};
-    bool forward_to_tun{true};
-    bool forward_raw_socket{false};
-    std::string tun_name{};
-    std::string forward_device;
+    // Egress selection. `egress_kind` defaults to "tun" to preserve the
+    // historical worker behaviour (forward matched packets into a TUN
+    // device unless explicitly told not to). Any of the four EgressKind
+    // values supported by make_packet_sink() is accepted.
+    std::string egress_kind{"tun"};
+    std::string egress_device;
     bool tun_multi_queue{true};
     int tun_mtu{9000};
     openpenny::PipelineOptions::Mode mode{openpenny::PipelineOptions::Mode::Active};
-    std::string stats_socket;
+    std::string stats_socket{};
     unsigned queue_count{1};
 };
 
@@ -52,15 +51,52 @@ std::string resolve_bpf_object(const std::string& path,
         fs::current_path() / p,
         cfg_dir / p,
         cfg_dir.parent_path() / p,
-        cfg_dir.parent_path() / "xdp-fw" / p.filename(),
-        cfg_dir.parent_path().parent_path() / "xdp-fw" / p.filename()
+        cfg_dir.parent_path() / "ebpf" / "af_xdp" / p.filename(),
+        cfg_dir.parent_path().parent_path() / "ebpf" / "af_xdp" / p.filename()
     };
     for (const auto& c : candidates) {
         if (!c.empty() && fs::exists(c)) {
             return c.string();
         }
     }
+    for (const auto& c : candidates) {
+        fs::path dir = c.parent_path();
+        if (!dir.empty() &&
+            fs::exists(dir / "Makefile") &&
+            fs::exists(dir / "xdp_redirect_openpenny.c")) {
+            return c.string();
+        }
+    }
     return path;
+}
+
+bool ensure_xdp_object(const std::string& object_path) {
+    namespace fs = std::filesystem;
+    fs::path obj(object_path);
+    fs::path xdp_dir = obj.parent_path();
+    fs::path source = xdp_dir / "xdp_redirect_openpenny.c";
+    fs::path makefile = xdp_dir / "Makefile";
+
+    std::error_code ec;
+    const bool object_exists = fs::exists(obj, ec);
+    bool needs_build = !object_exists;
+    if (object_exists) {
+        const auto obj_time = fs::last_write_time(obj, ec);
+        if (!ec && fs::exists(source, ec)) {
+            const auto source_time = fs::last_write_time(source, ec);
+            needs_build = !ec && source_time > obj_time;
+        }
+        if (!needs_build && !ec && fs::exists(makefile, ec)) {
+            const auto makefile_time = fs::last_write_time(makefile, ec);
+            needs_build = !ec && makefile_time > obj_time;
+        }
+    }
+
+    if (!needs_build) return true;
+    if (!fs::exists(makefile, ec)) return false;
+
+    std::string cmd = "make -C " + xdp_dir.string() + " xdp_redirect_openpenny.o";
+    return std::system(cmd.c_str()) == 0 && fs::exists(obj, ec);
 }
 
 } // namespace
@@ -85,17 +121,11 @@ Args parse_args(int argc, char** argv) {
             else if (lvl == "warn") a.log_level = openpenny::LogLevel::WARN;
             else if (lvl == "error") a.log_level = openpenny::LogLevel::ERROR;
             a.log_override = true;
-        } else if (arg == "--forward-to-tun") {
-            a.forward_to_tun = true;
-        } else if (arg == "--no-forward-to-tun") {
-            a.forward_to_tun = false;
-        } else if (arg == "--forward-raw-socket") {
-            a.forward_raw_socket = true;
-            a.forward_to_tun = false;
-        } else if (arg == "--tun-name" && i + 1 < argc) {
-            a.tun_name = argv[++i];
-        } else if (arg == "--forward-device" && i + 1 < argc) {
-            a.forward_device = argv[++i];
+        } else if (arg == "--egress" && i + 1 < argc) {
+            // New unified selector: --egress <none|tun|raw_socket|raw_nic>
+            a.egress_kind = argv[++i];
+        } else if (arg == "--egress-device" && i + 1 < argc) {
+            a.egress_device = argv[++i];
         } else if (arg == "--stats-sock" && i + 1 < argc) {
             a.stats_socket = argv[++i];
         } else if (arg == "--mode" && i + 1 < argc) {
@@ -123,73 +153,20 @@ Args parse_args(int argc, char** argv) {
     return a;
 }
 
-int open_tun_device(const std::string& device, bool multi_queue, int tun_mtu) {
-    auto tune_link = [&](const std::string& name) {
-        int s = ::socket(AF_INET, SOCK_DGRAM, 0);
-        if (s < 0) return;
-        ifreq ifr{};
-        std::strncpy(ifr.ifr_name, name.c_str(), IFNAMSIZ - 1);
-        ifr.ifr_qlen = 10000;
-        (void)ioctl(s, SIOCSIFTXQLEN, &ifr);
-        std::memset(&ifr, 0, sizeof(ifr));
-        std::strncpy(ifr.ifr_name, name.c_str(), IFNAMSIZ - 1);
-        ifr.ifr_mtu = tun_mtu > 0 ? tun_mtu : 9000;
-        (void)ioctl(s, SIOCSIFMTU, &ifr);
-        ::close(s);
-    };
-
-    int fd = ::open("/dev/net/tun", O_RDWR | O_NONBLOCK);
-    if (fd < 0) return -1;
-
-    auto try_attach = [&](short flags) -> bool {
-        ifreq ifr{};
-        ifr.ifr_flags = flags;
-        std::strncpy(ifr.ifr_name, device.c_str(), IFNAMSIZ - 1);
-        return ioctl(fd, TUNSETIFF, &ifr) == 0;
-    };
-
-    short base_flags = IFF_TUN | IFF_NO_PI;
-    if (multi_queue) {
-        if (!try_attach(base_flags | IFF_MULTI_QUEUE)) {
-            if (!try_attach(base_flags)) {
-                int saved = errno;
-                ::close(fd);
-                errno = saved;
-                return -1;
-            }
-        }
-    } else {
-        if (!try_attach(base_flags)) {
-            int saved = errno;
-            ::close(fd);
-            errno = saved;
-            return -1;
-        }
-    }
-
-    tune_link(device);
-    return fd;
+// Promote CLI args into the declarative EgressConfig consumed by the
+// pipeline. We keep the TUN-oriented knobs (mtu, multi-queue) on the CLI
+// because historically the worker expected them; they only apply when
+// `kind == Tun` and are otherwise ignored by the factory.
+openpenny::egress::EgressConfig egress_from_args(const Args& args) {
+    openpenny::egress::EgressConfig egress{};
+    egress.kind = openpenny::egress::parse_egress_kind(args.egress_kind);
+    egress.device = args.egress_device;
+    egress.tun_multi_queue = args.tun_multi_queue;
+    egress.tun_mtu = args.tun_mtu;
+    return egress;
 }
 
-int open_raw_socket(const std::string& device) {
-    int fd = ::socket(AF_INET, SOCK_RAW | SOCK_NONBLOCK, IPPROTO_RAW);
-    if (fd < 0) return -1;
-
-    if (!device.empty()) {
-        if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, device.c_str(), device.size()) != 0) {
-            int saved = errno;
-            ::close(fd);
-            errno = saved;
-            return -1;
-        }
-    }
-
-    int one = 1;
-    (void)setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
-    return fd;
-}
-
-bool apply_prefix_to_opts(const Args& args, openpenny::PipelineOptions& opts) {
+bool apply_prefix_to_runtime(const Args& args, openpenny::Config& cfg) {
     if (args.prefix.empty() || args.mask_bits <= 0 || args.mask_bits > 32) {
         return false;
     }
@@ -205,12 +182,13 @@ bool apply_prefix_to_opts(const Args& args, openpenny::PipelineOptions& opts) {
         mask_host = 0xFFFFFFFFu << (32 - args.mask_bits);
     }
 
-    opts.prefix_ip = args.prefix;
-    opts.prefix_host = ntohl(addr.s_addr);
-    opts.mask_bits = args.mask_bits;
-    opts.mask_host = mask_host;
-    opts.has_prefix = true;
-    opts.prefix_cidr = opts.prefix_ip + "/" + std::to_string(opts.mask_bits);
+    // Propagate the runtime override into the XDP/BPF filter config. The
+    // legacy PipelineOptions prefix_* fields are gone now; the pipeline
+    // looks at cfg.xdp_runtime for the kernel filter parameters.
+    cfg.xdp_runtime.prefix_host = ntohl(addr.s_addr);
+    cfg.xdp_runtime.mask_host = mask_host;
+    cfg.xdp_runtime.prefix_text = args.prefix;
+    cfg.xdp_runtime.mask_bits = args.mask_bits;
     return true;
 }
 
@@ -225,6 +203,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     cfg->xdp_runtime.bpf_object = resolve_bpf_object(cfg->xdp_runtime.bpf_object, args.config);
+    if (cfg->input.backend == openpenny::PacketInputBackend::XdpAfXdp &&
+        !ensure_xdp_object(cfg->xdp_runtime.bpf_object)) {
+        std::cerr << "status=error\nerror=xdp_bpf_object_build_failed\n";
+        return 1;
+    }
     cfg->queue_count = std::max(1u, args.queue_count);
 
     if (!args.log_override) {
@@ -239,36 +222,30 @@ int main(int argc, char** argv) {
 
     openpenny::Logger::init({.level = args.log_level});
 
-    int forward_fd = -1;
-    const std::string forward_name = !args.forward_device.empty() ? args.forward_device : args.tun_name;
-
-    if (args.forward_raw_socket) {
-        forward_fd = open_raw_socket(forward_name);
-        if (forward_fd < 0) {
-            std::cerr << "status=error\nerror=raw_socket_open_failed\n";
-            return 1;
-        }
-    } else if (args.forward_to_tun) {
-        forward_fd = open_tun_device(forward_name, args.tun_multi_queue, args.tun_mtu);
-        if (forward_fd < 0) {
-            std::cerr << "status=error\nerror=tun_open_failed\n";
-            return 1;
+    // Install the declarative egress on the config. CLI args override any
+    // egress block already present in the YAML so worker subprocesses can
+    // be steered by the orchestrator without having to rewrite the file.
+    if (!args.egress_kind.empty()) {
+        auto egress = egress_from_args(args);
+        if (egress.kind != openpenny::egress::EgressKind::None || !cfg->egress.enabled()) {
+            cfg->egress = egress;
         }
     }
+    // If the caller didn't specify a device but the YAML already has one,
+    // leave the YAML value alone. If the caller did specify one, it wins
+    // (already applied in egress_from_args above).
 
-    openpenny::PipelineOptions opts{};
     openpenny::app::init_thread_counters(cfg->queue_count);
     openpenny::app::set_thread_counter_index(0);
-    (void)apply_prefix_to_opts(args, opts);
-    opts.forward_raw_socket = args.forward_raw_socket && forward_fd >= 0;
-    opts.forward_to_tun = args.forward_to_tun && !opts.forward_raw_socket && forward_fd >= 0;
-    opts.tun_fd = opts.forward_to_tun ? forward_fd : -1;
-    opts.tun_name = args.tun_name;
-    opts.forward_fd = forward_fd;
-    opts.forward_device = forward_name;
+    (void)apply_prefix_to_runtime(args, *cfg);
+
+    openpenny::PipelineOptions opts{};
     opts.mode = args.mode;
     opts.stats_socket_path = args.stats_socket;
     opts.queue_count = cfg->queue_count;
+    if (opts.traffic_match.empty()) {
+        opts.traffic_match = cfg->traffic_match;
+    }
 
     auto summary = drive_pipeline_threaded(*cfg, opts);
     if (!summary.active) {
@@ -396,6 +373,7 @@ int main(int argc, char** argv) {
         j["passive"] = passive;
     }
     std::cout << "json=" << j.dump() << "\n";
-    if (forward_fd >= 0) ::close(forward_fd);
+    // No explicit fd cleanup needed: the PacketSink owns its fd internally
+    // and closes it on destruction when drive_pipeline_threaded returns.
     return 0;
 }

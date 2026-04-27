@@ -1,0 +1,26 @@
+# Example egress configuration: re-inject matched packets into a TUN
+# device that upstream tools can read from.
+#
+# kind:   one of {none, tun, raw_socket, raw_nic}
+#   - none:       drop matched packets (pipeline still counts them).
+#   - tun:        write L3 bytes into /dev/net/tun with the given name.
+#   - raw_socket: IPPROTO_RAW socket; kernel routing decides egress iface.
+#   - raw_nic:    AF_PACKET socket bound to `device`; bypasses routing.
+# device: interface name (TUN name or NIC name depending on `kind`).
+#
+# tun.* options only apply when kind == tun.
+# raw_nic.* options only apply when kind == raw_nic.
+egress:
+  kind: tun
+  device: openpenny-tun
+  tun:
+    multi_queue: true
+    mtu: 9000
+    txqlen: 10000
+    bring_up: true
+    # Set /proc/sys/net/ipv4/conf/<tun>/rp_filter=2 (loose) on open.
+    # Required for reinjection: packets we write to the TUN still carry
+    # the original remote source IP, but the return route lives on the
+    # physical NIC, so strict rp_filter silently drops them before local
+    # delivery. Set to false only if you manage rp_filter externally.
+    rp_filter_loose: true

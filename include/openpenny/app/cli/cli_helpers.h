@@ -25,11 +25,18 @@ struct CliOptions {
     std::string pin_conf_path;
     std::string pin_xsks_path;
     std::string pin_stats_path;
+    std::string pin_settings_path;
+    // CLI shorthand for TUN egress. When set via `--tun <device>`, the
+    // driver populates `cfg->egress` with `{kind=Tun, device=tun_name}`
+    // before launching the pipeline. Raw-socket or raw-nic egress are
+    // selected declaratively through the YAML `egress:` block instead.
     std::string tun_name;
     bool forward_to_tun = false;
     bool queue_override = false;
+    bool queue_auto = false;
     unsigned queue_value = 0;
     unsigned queue_count = 1;
+    unsigned queue_probe_ms = 250;
 };
 
 std::string to_lower(std::string value);

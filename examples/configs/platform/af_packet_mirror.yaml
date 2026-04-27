@@ -1,0 +1,22 @@
+# Copy-mode platform profile: passive observation via AF_PACKET/SOCK_RAW.
+#
+# This backend taps the interface without pulling packets out of the kernel
+# stack: the final application keeps receiving every packet normally and
+# OpenPenny receives an observation copy alongside it. No XDP program is
+# loaded and no reinject round-trip is needed.
+#
+# Recommended pairing:
+#   runtime_policy.mode: passive
+#   egress.kind:         none
+#
+# Use this profile (or just leave the default af_xdp + ingress_mode: auto)
+# for any passive workload where the host is both the monitor and the
+# final destination of the traffic.
+backend: af_packet_mirror
+ingress_mode: copy
+interface: CHANGE_ME
+queue_count: 1
+worker_cpus: [0]
+# AF_PACKET has no UMEM/BPF knobs; frame_size is the top-level Config
+# field and bounds the per-poll recv buffer.
+frame_size: 9216

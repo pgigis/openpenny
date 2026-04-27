@@ -1,0 +1,64 @@
+# Platform profile: host-specific dataplane settings.
+#
+# Edit this once per host. Day-to-day policy changes (traffic / runtime)
+# don't need to touch this file.
+
+# Ingress backend: how packets reach OpenPenny.
+#   af_xdp            - XDP program redirects matched packets to AF_XDP.
+#   af_packet_mirror  - tap the interface via AF_PACKET (no XDP loaded).
+#   dpdk              - DPDK PMD (built only when -DOPENPENNY_WITH_DPDK).
+backend: af_xdp
+
+# Where matched packets are removed from / observed in:
+#   auto      - passive mode -> copy; active mode -> redirect (default).
+#   copy      - tap the interface; the kernel keeps delivering packets to
+#               the real application. Use this for non-perturbing
+#               observation (passive mode).
+#   redirect  - the XDP program pulls matched packets out of the kernel
+#               into AF_XDP. Required for active mode.
+ingress_mode: auto
+
+# Capture interface and queue. Replace `CHANGE_ME` with your NIC name
+# (e.g. ens5f0np0, eth0). For multi-queue (queue_count > 1), match the
+# count to the number of TCP flows you expect; see
+# docs/ops/multi-queue-troubleshooting.md for tuning guidance.
+interface: CHANGE_ME
+queue: 0
+queue_count: 1
+worker_cpus: [0]      # one CPU per worker; len(worker_cpus) == queue_count
+
+# AF_XDP-specific tuning. Defaults are fine for most NICs.
+xdp:
+  # --- Attach mode ------------------------------------------------------
+  drv_mode: true                 # native XDP if the driver supports it
+  zerocopy: true                 # request XDP_ZEROCOPY from the driver
+  require_zerocopy: true         # fail if zerocopy can't be granted
+  allow_skb_fallback: false      # drop to skb (generic) if drv attach fails
+  allow_copy_fallback: false     # drop to copy mode if zerocopy fails
+  force_copy_mode: false         # force XDP_COPY even when zerocopy works
+  attach_program: true           # attach our XDP program at startup
+  detach_on_close: true          # detach cleanly on shutdown
+
+  # --- BPF map pinning --------------------------------------------------
+  pin_maps: true                 # pin maps under /sys/fs/bpf/openpenny_*
+  reuse_pins: false              # reuse pins from a prior run (off by default)
+  update_dataplane_rules: true   # publish compiled match rules to the maps
+
+  # --- UMEM and rings ---------------------------------------------------
+  frame_size: 2048               # bytes per UMEM frame
+  num_frames: 131072             # total frames in UMEM
+  rx_ring: 2048                  # AF_XDP RX ring entries
+  batch: 64                      # max packets per poll() drain
+
+  # --- Polling ---------------------------------------------------------
+  # 0 = busy-poll (the default; lowest latency). >0 = blocking poll() with
+  # timeout in milliseconds (more CPU-friendly).
+  poll_timeout_ms: 0
+
+  # --- BPF object ------------------------------------------------------
+  bpf_object: xdp_redirect_openpenny.o
+  bpf_program: xdp_redirect_openpenny
+
+# DPDK-specific tuning (used only when `backend: dpdk`).
+dpdk:
+  burst: 64

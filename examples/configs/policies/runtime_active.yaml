@@ -1,0 +1,73 @@
+# Runtime policy: what OpenPenny does with selected traffic.
+#
+# `mode` picks the pipeline. In `active`, OpenPenny drops a small number
+# of packets and watches which senders retransmit. In `passive`, no
+# packets are dropped and OpenPenny only observes (use `runtime_passive.yaml`
+# for that mode).
+
+mode: active
+
+# Safety controls applied before any traffic policy rule.
+safety:
+  allow_ssh_bypass: true   # never touch SSH (port 22) regardless of rules
+
+# Aggregate evaluation across all flows.
+#
+# When enabled, every worker contributes drop snapshots to a shared
+# collector. Once `max_packet_drops_global_aggregate` drops have outcomes,
+# the collector emits a single closed-loop / not-closed-loop verdict and
+# the run can stop early.
+#
+# When the aggregate verdict is "not closed-loop", the run keeps going
+# until `min_closed_loop_flows` individual flows have terminated with a
+# CLOSED_LOOP decision (a fallback so we don't give up on borderline
+# traffic too early).
+aggregates:
+  enabled: true
+
+thresholds:
+  # --- Drop policy -------------------------------------------------------
+
+  # Probability of dropping a given data packet (0.05 = 5%).
+  packet_drop_probability: 0.05
+
+  # If a flow exceeds these ratios, OpenPenny stops dropping in it.
+  max_duplicate_ratio: 0.15      # duplicates / total
+  max_reordering_ratio: 0.80     # out-of-order / total
+
+  # Below this fraction of expected retransmissions, treat the flow as
+  # "no retransmissions observed" rather than waiting forever.
+  retransmission_observation_miss_rate: 0.05
+
+  # How long to wait for a retransmission, as a multiple of the flow's
+  # estimated RTT.
+  retransmission_timeout_multiplier: 3.0
+
+  # --- Flow lifecycle ---------------------------------------------------
+
+  # Wait this long after admitting a flow before dropping packets in it.
+  admission_grace_period_seconds: 3.0
+
+  # Drop a tracked flow if it goes silent for this long.
+  monitored_flow_idle_expiry_seconds: 30.0
+
+  # --- Drop budgets -----------------------------------------------------
+
+  # Max drops in a single flow.
+  max_packet_drops_per_flow: 6
+
+  # Global drop budget across all flows. Once this many drops have been
+  # observed, the aggregate verdict is evaluated.
+  max_packet_drops_global_aggregate: 12
+
+  # --- Stop conditions --------------------------------------------------
+
+  max_monitored_flows: 100        # cap on flows tracked at any time
+  stop_after_individual_flows: 10 # stop once N flows have terminated
+  min_closed_loop_flows: 5        # see comment on `aggregates` above
+
+  # --- Passive-mode thresholds (used if you switch mode to passive) ----
+
+  passive_min_flows_to_finish: 10
+  passive_max_parallel_flows: 10
+  passive_max_execution_time_seconds: 150

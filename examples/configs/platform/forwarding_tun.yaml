@@ -1,0 +1,15 @@
+# Forwarding profile: where matched packets go after Penny is done.
+#
+# This file is loaded under `traffic_forwarding:` in the root config.
+# For other forwarding kinds (`raw_socket`, `raw_nic`, `none`) see the
+# other `egress_*.yaml` and `forwarding_disabled.yaml` files in this
+# directory, or write the `egress:` block inline in your config.
+
+tun:
+  enable: true             # set false to disable TUN forwarding entirely
+  name: xdp-tun            # name of the TUN device to create / use
+  multi_queue: true        # enable multi-queue TUN (one queue per worker)
+  mtu: 9000                # TUN MTU; raise for jumbo frames
+  # rp_filter_loose: true (default in code) sets rp_filter=2 on the TUN
+  # at open time. This is required when reinjecting redirected packets so
+  # the kernel doesn't drop them via reverse-path filtering.

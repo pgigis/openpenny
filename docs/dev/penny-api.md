@@ -70,9 +70,18 @@ Thread-local timer thread (one per packet thread/queue) handling drop expiration
 
 ### Integrating With a Packet Source
 ```cpp
-openpenny::PipelineOptions opts = {/* prefix/tun/stop config */};
-auto source = openpenny::net::create_packet_source(cfg); // see PacketSourceFactory
-openpenny::ActiveTestPipelineRunner runner(cfg, opts, /* FlowMatcher */ [](const FlowKey&) { return true; }, std::move(source));
+// All platform selection (NIC, queues, XDP tuning) lives on Config;
+// egress is configured once via cfg.egress (see docs/run/egress.md).
+openpenny::PipelineOptions opts;
+opts.mode        = openpenny::PipelineOptions::Mode::Active;
+opts.queue_count = cfg.input.queue_count;
+opts.should_stop = [] { return false; };
+
+auto source = openpenny::dataplane::create_session(cfg); // see dataplane/Factory
+openpenny::ActiveTestPipelineRunner runner(
+    cfg, opts,
+    /* FlowMatcher */ [](const FlowKey&) { return true; },
+    std::move(source));
 
 auto result = runner.run();
 if (result && result->penny_completed) {

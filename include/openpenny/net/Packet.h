@@ -3,17 +3,18 @@
 #pragma once
 
 #include "openpenny/agg/Stats.h" // for FlowKey
+#include "openpenny/dataplane/Session.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
-#include <functional>
 
 namespace openpenny::net {
+
+struct TrafficMatchConfig;
 
 /**
  * @brief Minimal non-owning TCP header view with helpers for decoding control flags.
@@ -104,6 +105,7 @@ struct TcpHeaderView {
 struct PacketView {
     FlowKey    flow{};            ///< Flow identifier (5-tuple or 4-tuple depending on source).
     TcpHeaderView tcp{};          ///< Minimal parsed TCP header subset.
+    uint8_t    ip_proto{0};        ///< IPv4 protocol number (TCP=6, UDP=17, etc.).
     uint64_t   payload_bytes{0};  ///< L4 payload length (0 for pure ACKs or empty payloads).
     uint64_t   timestamp_ns{0};   ///< Packet capture timestamp in nanoseconds.
     
@@ -120,40 +122,9 @@ struct PacketView {
     }
 };
 
-/**
- * @brief Handler invoked for each packet decoded by any PacketSource backend.
- *
- * C++ lambda or std::function compatible: `void(const PacketView&)`.
- */
-using PacketHandler = std::function<void(const PacketView&)>;
-
-/**
- * @brief Abstract packet source interface for Penny's packet ingestion layer.
- *
- * Contract:
- *  - open() should initialise the backend and prepare for polling.
- *  - close() should release backend resources safely.
- *  - poll() should fetch up to @p budget packets and deliver them to @p handler.
- *
- * This interface deliberately hides backend details (AF_XDP, DPDK, PCAP, etc.).
- */
-class PacketSource {
-public:
-    virtual ~PacketSource() = default;
-    
-    virtual bool open(const std::string& ifname, unsigned queue) = 0;
-    virtual void close() = 0;
-    virtual bool poll(const PacketHandler& handler, std::size_t budget = 32) = 0;
-};
-
-/**
- * @brief Owning pointer to a concrete PacketSource implementation.
- *
- * Use of unique_ptr ensures:
- *  1. Ownership is unambiguous,
- *  2. Backend implementations remain hidden,
- *  3. And closing/cleanup happens automatically when erased or on destruction.
- */
-using PacketSourcePtr = std::unique_ptr<PacketSource>;
+// Backward-compatible aliases while the codebase migrates from net::PacketSource
+// to the clearer dataplane::Session boundary.
+using PacketSource = openpenny::dataplane::Session;
+using PacketSourcePtr = openpenny::dataplane::SessionPtr;
 
 } // namespace openpenny::net

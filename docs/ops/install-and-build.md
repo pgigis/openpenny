@@ -151,7 +151,7 @@ XDP, TUN, and RAW socket forwarding require root privileges or `CAP_NET_ADMIN`.
 Ensure hugepages are allocated and the NIC is correctly bound to the DPDK driver.
 
 ### XDP: no packets or attach failures  
-- Rebuild the BPF object: `cmake --build build --target xdp_bpf` (or `make -C xdp-fw xdp_redirect_dstprefix.o`).  
+- Rebuild the BPF object: `cmake --build build --target xdp_bpf` (or `make -C ebpf/af_xdp xdp_redirect_openpenny.o`).  
 - Detach and clean pins, then retry:  
   ```bash
   sudo python3 scripts/xdp_attach.py --iface <if> --mode drv --detach
@@ -163,6 +163,6 @@ Ensure hugepages are allocated and the NIC is correctly bound to the DPDK driver
   ip -details link show dev <if> | grep -i xdp
   bpftool map dump pinned /sys/fs/bpf/openpenny_<if>_<mask>/xsks
   ```  
-- If the NIC/driver lacks zero-copy support, set `require_zerocopy: false`, `allow_skb_fallback: true`, and `allow_copy_fallback: true` in `examples/configs/config_default.yaml`.
+- If the NIC/driver lacks zero-copy support, set `require_zerocopy: false`, `allow_skb_fallback: true`, and `allow_copy_fallback: true` in `examples/configs/platform/af_xdp.yaml`.
 
 ---

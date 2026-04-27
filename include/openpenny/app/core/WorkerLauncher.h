@@ -3,6 +3,7 @@
 #pragma once
 
 #include "openpenny/app/core/OpenpennyPipelineDriver.h"
+#include "openpenny/egress/PacketSink.h"
 
 #include <string>
 
@@ -25,23 +26,27 @@ struct WorkerLaunchConfig {
     /// Identifier for the test instance, passed to the worker for logging or tagging.
     std::string test_id{"default"};
 
-    /// Whether matched packets should be forwarded to a TUN interface.
-    bool forward_to_tun{true};
+    /**
+     * @brief Declarative egress block handed to the worker subprocess.
+     *
+     * Maps 1:1 onto Config::egress in the spawned worker via CLI flags.
+     * When kind == None, the launcher asks the worker to run without an
+     * egress sink (drop matched packets). When kind == Tun the launcher
+     * passes --egress tun with the device name and the tun-specific
+     * knobs; similar for RawSocket / RawNic.
+     */
+    egress::EgressConfig egress{};
 
-    /// Whether raw-socket forwarding is enabled instead of (or in addition to) TUN.
-    bool forward_raw_socket{false};
-
-    /// Name of the TUN interface used for forwarding when enabled.
-    std::string tun_name{"xdp-tu"};
-
-    /// Name of the device to which packets should be forwarded via raw-socket mode.
-    std::string forward_device{};
-
-    /// Enable multi-queue mode for the TUN interface, if supported.
-    bool tun_multi_queue{true};
-
-    /// MTU to configure on the TUN interface.
-    int tun_mtu{9000};
+    /**
+     * @brief Optional prefix override forwarded as --prefix / --mask-bits.
+     *
+     * These live on the launch config (not on PipelineOptions) because
+     * they're a CLI-shaped shorthand for "overlay this prefix onto the
+     * worker's xdp_runtime filter config". The pipeline runtime itself
+     * reads the prefix from Config::xdp_runtime, not from PipelineOptions.
+     */
+    std::string prefix_ip{};
+    int mask_bits{0};
 };
 
 /**

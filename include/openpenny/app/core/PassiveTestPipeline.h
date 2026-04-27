@@ -2,18 +2,20 @@
 
 #pragma once
 
+#include "openpenny/agg/Stats.h"
+#include "openpenny/app/core/OpenpennyPipelineDriver.h"
+#include "openpenny/app/core/PipelineRunner.h"
 #include "openpenny/config/Config.h"
 #include "openpenny/net/Packet.h"
-#include "openpenny/app/core/OpenpennyPipelineDriver.h"
-#include "openpenny/app/core/ActiveTestPipeline.h"
-#include "openpenny/agg/Stats.h"
 
-#include <functional>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace openpenny {
 
@@ -39,14 +41,38 @@ struct PassiveFlowState {
     std::vector<Gap> gaps;
 };
 
-class PassiveTestPipelineRunner {
+/**
+ * Passive pipeline strategy.
+ *
+ * Implemented as an IPipelineStrategy: the shared PipelineRunner drives
+ * the source and the poll loop; this class supplies passive-mode
+ * packet handling (flow admission, gap tracking, grace periods) and
+ * final gap summarization.
+ */
+class PassiveTestPipelineRunner : public IPipelineStrategy {
 public:
     PassiveTestPipelineRunner(const Config& cfg,
-                                   const PipelineOptions& opts,
-                                   FlowMatcher matcher,
-                                   net::PacketSourcePtr source);
+                              const PipelineOptions& opts,
+                              FlowMatcher matcher,
+                              net::PacketSourcePtr source);
 
+    /// Public entry point. Delegates to a PipelineRunner wrapping *this.
     std::optional<ModeResult> run();
+
+    // ---------------------------------------------------------------------
+    // IPipelineStrategy hooks
+    // ---------------------------------------------------------------------
+
+    void on_opened() override;
+    void on_packet(const net::PacketView& packet,
+                   const std::chrono::steady_clock::time_point& now,
+                   ModeResult& result) override;
+    void after_poll(const std::chrono::steady_clock::time_point& now,
+                    std::size_t processed_delta,
+                    ModeResult& result) override;
+    bool should_terminate() const override { return stop_requested_; }
+    bool penny_completed() const override { return true; }
+    void finalize(ModeResult& result) override;
 
 private:
     const Config& cfg_;
@@ -62,13 +88,19 @@ private:
     std::unordered_set<FlowKey, FlowKeyHash> finished_keys_;
     bool stop_grace_active_{false};
     std::chrono::steady_clock::time_point stop_grace_start_{};
+    bool stop_requested_{false};
+
+    // Cached timing derived from cfg_ at on_opened() so we don't convert
+    // from double-seconds on every poll iteration.
+    std::chrono::steady_clock::duration idle_timeout_{};
+    std::chrono::steady_clock::duration max_execution_time_{};
+    std::chrono::steady_clock::duration grace_period_{};
 
     PassiveFlowState* admit_flow(const net::PacketView& packet,
                                  const std::chrono::steady_clock::time_point& now);
     void handle_data_packet(PassiveFlowState& state, const net::PacketView& packet);
     void finish_flow(const FlowKey& key, const char* reason = nullptr);
-    void expire_idle_flows(const std::chrono::steady_clock::time_point& now,
-                           const std::chrono::steady_clock::duration& timeout);
+    void expire_idle_flows(const std::chrono::steady_clock::time_point& now);
     void summarize_gaps(ModeResult& result);
 };
 

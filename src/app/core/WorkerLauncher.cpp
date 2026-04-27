@@ -2,6 +2,8 @@
 
 #include "openpenny/app/core/WorkerLauncher.h"
 
+#include "openpenny/egress/PacketSink.h"
+
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -22,11 +24,11 @@ std::vector<std::string> build_worker_argv(const WorkerLaunchConfig& cfg,
     add("--config");
     add(cfg.config_path);
 
-    if (!opts.prefix_ip.empty() && opts.mask_bits > 0) {
+    if (!cfg.prefix_ip.empty() && cfg.mask_bits > 0) {
         add("--prefix");
-        add(opts.prefix_ip);
+        add(cfg.prefix_ip);
         add("--mask-bits");
-        add(std::to_string(opts.mask_bits));
+        add(std::to_string(cfg.mask_bits));
     }
 
     add("--test-id");
@@ -40,31 +42,24 @@ std::vector<std::string> build_worker_argv(const WorkerLaunchConfig& cfg,
         add(std::to_string(opts.queue_count));
     }
 
-    if (opts.forward_raw_socket) {
-        add("--forward-raw-socket");
+    // Egress translation: the worker accepts a declarative --egress
+    // <kind> plus --egress-device and TUN-specific knobs. This keeps
+    // the launcher in sync with the EgressConfig contract without
+    // having to hand-roll a parallel tri-state for each new sink kind.
+    add("--egress");
+    add(openpenny::egress::egress_kind_name(cfg.egress.kind));
+    if (!cfg.egress.device.empty()) {
+        add("--egress-device");
+        add(cfg.egress.device);
     }
-
-    if (opts.forward_to_tun && !opts.forward_raw_socket) {
-        add("--forward-to-tun");
-    } else {
-        add("--no-forward-to-tun");
-    }
-
-    add("--tun-name");
-    add(cfg.tun_name);
-
-    if (!cfg.forward_device.empty()) {
-        add("--forward-device");
-        add(cfg.forward_device);
-    }
-
-    if (!cfg.tun_multi_queue) {
-        add("--no-tun-multi-queue");
-    }
-
-    if (cfg.tun_mtu > 0) {
-        add("--tun-mtu");
-        add(std::to_string(cfg.tun_mtu));
+    if (cfg.egress.kind == openpenny::egress::EgressKind::Tun) {
+        if (!cfg.egress.tun_multi_queue) {
+            add("--no-tun-multi-queue");
+        }
+        if (cfg.egress.tun_mtu > 0) {
+            add("--tun-mtu");
+            add(std::to_string(cfg.egress.tun_mtu));
+        }
     }
 
     if (!opts.stats_socket_path.empty()) {

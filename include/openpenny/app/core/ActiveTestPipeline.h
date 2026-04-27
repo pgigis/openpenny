@@ -3,24 +3,19 @@
 #pragma once
 
 #include "openpenny/app/core/OpenpennyPipelineDriver.h"
+#include "openpenny/app/core/PipelineRunner.h"
 #include "openpenny/net/Packet.h"
 #include "openpenny/penny/flow/manager/ThreadFlowManager.h"
 
-#include <functional>
-#include <memory>
-#include <optional>
 #include <chrono>
+#include <cstddef>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace openpenny {
-
-/** 
- * Function that checks if an incoming flow matches the one we are testing.
- * Return true to log/track the flow, false to ignore it.
- */
-using FlowMatcher = std::function<bool(const FlowKey&)>;
 
 /**
  * Runs the active packet processing loop.
@@ -29,37 +24,65 @@ using FlowMatcher = std::function<bool(const FlowKey&)>;
  * Sends matching traffic into Penny for classification.
  * Tracks open TCP flows while dropping packets stochastically.
  * Periodically logs per-flow metrics.
+ *
+ * Implemented as an IPipelineStrategy: the shared PipelineRunner drives
+ * the source and the poll loop; this class supplies the active-mode
+ * packet handling, timer draining, idle back-off, and result
+ * finalization via the strategy hooks.
  */
-class ActiveTestPipelineRunner {
+class ActiveTestPipelineRunner : public IPipelineStrategy {
 public:
     /**
      * Construct the pipeline runner.
      *
      * @param cfg     Shared config values (interface, queue, thresholds, drop probs).
-     * @param opts    Pipeline options (prefix filter, TUN forwarding, etc).
+     * @param opts    Pipeline options (traffic matching, egress sink, etc).
      * @param matcher User predicate to filter/log specific flows.
      * @param source  Packet reader source (AF_PACKET, AF_XDP, pcap, etc).
      * @param drop_collector Shared drop snapshot collector across threads.
      * @param thread_name Friendly identifier for this worker thread.
      */
     ActiveTestPipelineRunner(const Config& cfg,
-                                  const PipelineOptions& opts,
-                                  FlowMatcher matcher,
-                                  net::PacketSourcePtr source,
-                                  DropCollectorPtr drop_collector,
-                                  std::string thread_name);
+                             const PipelineOptions& opts,
+                             FlowMatcher matcher,
+                             net::PacketSourcePtr source,
+                             DropCollectorPtr drop_collector,
+                             std::string thread_name);
 
     /**
      * Start the pipeline.
      *
-     * Runs until:
-     *  - the Penny test completes, or
-     *  - a stop signal is triggered, or
-     *  - the packet reader fails to return packets.
+     * Delegates the loop skeleton to a PipelineRunner configured with
+     * this object as the strategy. Runs until:
+     *   - the Penny test completes, or
+     *   - a stop signal is triggered, or
+     *   - the packet reader fails to return packets.
      *
-     * @return ModeResult if Penny finishes cleanly, or std::nullopt otherwise.
+     * @return ModeResult on any clean exit, or std::nullopt when the
+     *         packet source failed to open.
      */
     std::optional<ModeResult> run();
+
+    // ---------------------------------------------------------------------
+    // IPipelineStrategy hooks. Marked public because the PipelineRunner
+    // calls them via the IPipelineStrategy vtable; declared as overrides
+    // so the compiler catches signature drift.
+    // ---------------------------------------------------------------------
+
+    void on_opened() override;
+    void on_closing() override;
+    std::size_t poll_budget() const override;
+    bool filter_at_input() const override { return false; } // XDP/BPF filters.
+    void before_poll(const std::chrono::steady_clock::time_point& now) override;
+    void on_packet(const net::PacketView& packet,
+                   const std::chrono::steady_clock::time_point& now,
+                   ModeResult& result) override;
+    void after_poll(const std::chrono::steady_clock::time_point& now,
+                    std::size_t processed_delta,
+                    ModeResult& result) override;
+    bool should_terminate() const override { return penny_finished_; }
+    bool penny_completed() const override { return penny_finished_; }
+    void finalize(ModeResult& result) override;
 
 private:
     // -------------------------------------------------------------------------
@@ -70,10 +93,10 @@ private:
     void handle_packet(const net::PacketView& packet,
                        const std::chrono::steady_clock::time_point& now);
 
-    /** Check early-exit condition (stop flag or Penny finished). */
+    /** Check user-provided cooperative stop callback. */
     bool should_stop() const;
 
-    /** Push a packet to TUN interface or next hop if forwarding is enabled. */
+    /** Push a packet to the configured egress sink. */
     void forward_packet(const net::PacketView& packet);
 
     /** Print a single short debug line for a packet (if DEBUG is enabled). */
@@ -154,18 +177,18 @@ private:
 
     /**
      * Immutable shared configuration reference.
-     * Avoids copying config into multiple places.
      */
     const Config& cfg_;
 
     /**
-     * Pipeline options.
-     * Not mutated during runtime, only read in hot paths.
+     * Pipeline options. Read-only in hot paths.
      */
     const PipelineOptions& opts_;
 
     /**
-     * User matcher to decide if a flow is of interest.
+     * User matcher. Retained for observability / per-flow logging; the
+     * PipelineRunner is told not to apply it at ingress because active
+     * mode filters in XDP/BPF instead.
      */
     FlowMatcher matcher_;
 
@@ -185,33 +208,41 @@ private:
     std::string thread_name_;
 
     /**
-     * Packet source handle.
-     * Must be opened via source_->open(if, queue) before pipeline starts.
+     * Packet source handle. Ownership is handed to the PipelineRunner
+     * when run() is called; kept here until then so the strategy can
+     * be constructed before the runner.
      */
     net::PacketSourcePtr source_;
 
     /**
-     * Flag to track when Penny finishes the test.
-     * Once true, the loop exits early.
+     * Flag flipped to true when Penny classifies enough traffic to end
+     * the test. Read via should_terminate() so the shared loop exits
+     * at the next iteration boundary.
      */
     bool penny_finished_{false};
 
     /**
-     * Total number of packets processed by the pipeline.
-     * Used for rate-based stats logging.
+     * Per-worker forward accounting. Runner owns packets_processed in
+     * the ModeResult; these totals are merged in during finalize().
      */
-    std::size_t total_pkts_processed_{0};
     std::size_t total_pkts_forwarded_{0};
     std::size_t total_forward_errors_{0};
 
     /**
-     * Last time we logged global stats.
-     * Prevents log flooding.
+     * Last time we logged global stats (prevents log flooding).
      */
     std::chrono::steady_clock::time_point last_stats_log_{std::chrono::steady_clock::now()};
 
     /** Idle timeout to expire flows when traffic stops (0 disables). */
     std::chrono::steady_clock::duration idle_timeout_{};
+
+    /**
+     * Idle back-off state. Tracked across after_poll() invocations so
+     * the shared runner can re-enter before_poll() without resetting
+     * the warning cadence.
+     */
+    unsigned idle_polls_{0};
+    std::chrono::steady_clock::time_point idle_start_{std::chrono::steady_clock::now()};
 };
 
 } // namespace openpenny

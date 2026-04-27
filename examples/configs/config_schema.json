@@ -2,8 +2,24 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "OpenPenny Configuration",
   "type": "object",
-  "required": ["log", "input_sources", "traffic_forwarding", "monitoring", "grpc"],
+  "required": ["log"],
   "additionalProperties": false,
+  "definitions": {
+    "include_file": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "required": ["path"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string" },
+            "section": { "type": "string" }
+          }
+        }
+      ]
+    }
+  },
   "properties": {
     "log": {
       "type": "object",
@@ -15,11 +31,210 @@
       }
     },
 
+    "includes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "log": { "$ref": "#/definitions/include_file" },
+        "traffic_policy": { "$ref": "#/definitions/include_file" },
+        "runtime_policy": { "$ref": "#/definitions/include_file" },
+        "platform": { "$ref": "#/definitions/include_file" },
+        "traffic_forwarding": { "$ref": "#/definitions/include_file" },
+        "grpc": { "$ref": "#/definitions/include_file" },
+        "input_sources": { "$ref": "#/definitions/include_file" },
+        "monitoring": { "$ref": "#/definitions/include_file" },
+        "egress": { "$ref": "#/definitions/include_file" }
+      }
+    },
+
+    "traffic_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": { "type": "string", "enum": ["include", "exclude"] },
+        "default_policy": { "type": "string", "enum": ["include", "exclude"] },
+        "default_action": { "type": "string", "enum": ["include", "exclude"] },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "name": { "type": "string" },
+              "label": { "type": "string" },
+              "priority": { "type": "integer" },
+              "decision": { "type": "string", "enum": ["include", "exclude"] },
+              "action": { "type": "string", "enum": ["include", "exclude"] },
+              "src_prefix": { "type": "string", "description": "Source IPv4 CIDR prefix; bare IP means /32." },
+              "dst_prefix": { "type": "string", "description": "Destination IPv4 CIDR prefix; bare IP means /32." },
+              "src_ip": { "type": "string", "description": "Source IPv4 CIDR prefix; bare IP means /32." },
+              "dst_ip": { "type": "string", "description": "Destination IPv4 CIDR prefix; bare IP means /32." },
+              "protocol": {
+                "oneOf": [
+                  { "type": "integer", "minimum": 0, "maximum": 255 },
+                  { "type": "string", "enum": ["tcp", "udp", "icmp"] }
+                ]
+              },
+              "src_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "dst_port": { "type": "integer", "minimum": 0, "maximum": 65535 }
+            }
+          }
+        }
+      }
+    },
+
+    "runtime_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "type": "string", "enum": ["active", "passive"] },
+        "allow_ssh_bypass": { "type": "boolean" },
+        "aggregates_enabled": { "type": "boolean" },
+        "aggregates": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        },
+        "safety": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allow_ssh_bypass": { "type": "boolean" }
+          }
+        },
+        "thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "packet_drop_probability": { "type": "number", "minimum": 0, "maximum": 1 },
+            "max_duplicate_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+            "max_reordering_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+            "retransmission_observation_miss_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+            "retransmission_timeout_multiplier": { "type": "number", "exclusiveMinimum": 0 },
+            "admission_grace_period_seconds": { "type": "number", "minimum": 0 },
+            "monitored_flow_idle_expiry_seconds": { "type": "number", "minimum": 0 },
+            "drop_state_seconds": { "type": "number", "minimum": 0 },
+            "min_packet_drops_per_flow": { "type": "integer", "minimum": 0 },
+            "max_packet_drops_per_flow": { "type": "integer", "minimum": 0 },
+            "max_packet_drops_global_aggregate": { "type": "integer", "minimum": 0 },
+            "max_monitored_flows": { "type": "integer", "minimum": 0 },
+            "stop_after_individual_flows": { "type": "integer", "minimum": 0 },
+            "min_closed_loop_flows": { "type": "integer", "minimum": 0 },
+            "passive_min_flows_to_finish": { "type": "integer", "minimum": 0 },
+            "passive_max_parallel_flows": { "type": "integer", "minimum": 0 },
+            "passive_max_execution_time_seconds": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    },
+
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": { "type": "string", "enum": ["xdp", "af_xdp", "xdp_af_xdp", "dpdk", "af_packet", "af_packet_mirror", "mirror", "tap", "pcap"] },
+        "ingress_mode": { "type": "string", "enum": ["auto", "copy", "redirect", "mirror", "observe", "tap", "xdp", "af_xdp", "steal"] },
+        "mode": { "type": "string", "enum": ["auto", "copy", "redirect", "mirror", "observe", "tap", "xdp", "af_xdp", "steal"] },
+        "interface": { "type": "string" },
+        "ifname": { "type": "string" },
+        "queue": { "type": "integer", "minimum": 0 },
+        "queue_count": { "type": "integer", "minimum": 1 },
+        "worker_count": { "type": "integer", "minimum": 1 },
+        "worker_cpus": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "batch": { "type": "integer", "minimum": 1 },
+        "poll_timeout_ms": { "type": "integer", "minimum": 0 },
+        "af_xdp": { "$ref": "#/properties/platform/properties/xdp" },
+        "xdp": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "interface": { "type": "string" },
+            "ifname": { "type": "string" },
+            "queue": { "type": "integer", "minimum": 0 },
+            "rx_queue": { "type": "integer", "minimum": 0 },
+            "queue_count": { "type": "integer", "minimum": 1 },
+            "worker_cpus": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 }
+            },
+            "drv_mode": { "type": "boolean" },
+            "zerocopy": { "type": "boolean" },
+            "require_zerocopy": { "type": "boolean" },
+            "allow_skb_fallback": { "type": "boolean" },
+            "allow_copy_fallback": { "type": "boolean" },
+            "force_copy_mode": { "type": "boolean" },
+            "attach_program": { "type": "boolean" },
+            "detach_on_close": { "type": "boolean" },
+            "pin_maps": { "type": "boolean" },
+            "reuse_pins": { "type": "boolean" },
+            "update_dataplane_rules": { "type": "boolean" },
+            "frame_size": { "type": "integer", "minimum": 512 },
+            "num_frames": { "type": "integer", "minimum": 1024 },
+            "rx_ring": { "type": "integer", "minimum": 64 },
+            "batch": { "type": "integer", "minimum": 1 },
+            "poll_timeout_ms": { "type": "integer", "minimum": 0 },
+            "bpf_object": { "type": "string" },
+            "bpf_program": { "type": "string" }
+          }
+        },
+        "dpdk": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "interface": { "type": "string" },
+            "ifname": { "type": "string" },
+            "device": { "type": "string" },
+            "queue": { "type": "integer", "minimum": 0 },
+            "burst": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+
     "input_sources": {
       "type": "object",
       "required": ["xdp", "dpdk"],
       "additionalProperties": false,
       "properties": {
+        "backend": { "type": "string", "enum": ["xdp", "af_xdp", "xdp_af_xdp", "dpdk", "af_packet", "af_packet_mirror", "mirror", "tap", "pcap"] },
+        "ingress_mode": { "type": "string", "enum": ["auto", "copy", "redirect", "mirror", "observe", "tap", "xdp", "af_xdp", "steal"] },
+        "mode": { "type": "string", "enum": ["auto", "copy", "redirect", "mirror", "observe", "tap", "xdp", "af_xdp", "steal"] },
+        "traffic_match": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "default_action": { "type": "string", "enum": ["pass", "redirect", "redirect_xsk", "redirect_to_userspace", "drop"] },
+            "rules": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "enabled": { "type": "boolean" },
+                  "label": { "type": "string" },
+                  "src_ip": { "type": "string", "description": "Source IPv4 CIDR prefix; bare IP means /32." },
+                  "dst_ip": { "type": "string", "description": "Destination IPv4 CIDR prefix; bare IP means /32." },
+                  "protocol": {
+                    "oneOf": [
+                      { "type": "integer", "minimum": 0, "maximum": 255 },
+                      { "type": "string", "enum": ["tcp", "udp", "icmp"] }
+                    ]
+                  },
+                  "src_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+                  "dst_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+                  "action": { "type": "string", "enum": ["pass", "redirect", "redirect_xsk", "redirect_to_userspace", "drop"] },
+                  "target_queue": { "type": "integer", "minimum": 0 }
+                }
+              }
+            }
+          }
+        },
         "xdp": {
           "type": "object",
           "required": ["interface", "rx_queue", "drv_mode", "zerocopy", "frame_size", "num_frames", "rx_ring", "runtime"],
@@ -42,8 +257,7 @@
                 "allow_skb_fallback", "force_copy_mode", "allow_copy_fallback",
                 "batch", "poll_timeout_ms", "bpf_object", "bpf_program",
                 "map_conf_name", "map_xsks_name", "map_stats_name",
-                "pin_conf_path", "pin_xsks_path", "pin_stats_path",
-                "prefix", "mask_bits"
+                "pin_conf_path", "pin_xsks_path", "pin_stats_path"
               ],
               "additionalProperties": false,
               "properties": {
@@ -67,11 +281,11 @@
                 "map_conf_name": { "type": "string" },
                 "map_xsks_name": { "type": "string" },
                 "map_stats_name": { "type": "string" },
+                "map_settings_name": { "type": "string" },
                 "pin_conf_path": { "type": "string" },
                 "pin_xsks_path": { "type": "string" },
                 "pin_stats_path": { "type": "string" },
-                "prefix": { "type": "string", "format": "ipv4" },
-                "mask_bits": { "type": "integer", "minimum": 0, "maximum": 32 }
+                "pin_settings_path": { "type": "string" }
               }
             }
           }
@@ -180,7 +394,8 @@
                 "max_packet_drops_per_flow": { "type": "integer", "minimum": 0 },
                 "max_packet_drops_global_aggregate": { "type": "integer", "minimum": 0 },
                 "max_number_of_individual_flows": { "type": "integer", "minimum": 0 },
-                "stop_after_individual_flows": { "type": "integer", "minimum": 0 }
+                "stop_after_individual_flows": { "type": "integer", "minimum": 0 },
+                "min_closed_loop_flows": { "type": "integer", "minimum": 0 }
               }
             }
           }
@@ -223,6 +438,38 @@
             "enable": { "type": "boolean" },
             "cert_file": { "type": "string" },
             "key_file": { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "egress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["none", "tun", "xdp-tun", "raw_socket", "raw-socket", "ipproto_raw",
+                    "raw_nic", "raw-nic", "af_packet", "nic"]
+        },
+        "device":    { "type": "string" },
+        "interface": { "type": "string" },
+        "ifname":    { "type": "string" },
+        "tun": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "multi_queue": { "type": "boolean" },
+            "mtu":         { "type": "integer", "minimum": 0 },
+            "txqlen":      { "type": "integer", "minimum": 0 },
+            "bring_up":    { "type": "boolean" }
+          }
+        },
+        "raw_nic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "bind_device": { "type": "boolean" }
           }
         }
       }

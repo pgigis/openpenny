@@ -1,0 +1,8 @@
+# Egress profile: matched packets are not forwarded anywhere.
+#
+# This is the right choice for passive observation: packets are counted
+# and analysed but the pipeline does not re-emit them. Using `kind: none`
+# also avoids opening any TUN/raw-socket egress device, which is what
+# you want when something else on the host owns the data path.
+egress:
+  kind: none

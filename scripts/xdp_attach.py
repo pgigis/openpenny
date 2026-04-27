@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 """
-Helpers for building and attaching the lab XDP program.
+Helpers for building and attaching the OpenPenny AF_XDP eBPF program.
 
-This module mirrors the helper logic used by `traffic_generator/server.py`
-so other tooling in the repo can ensure the `xdp-fw/xdp_redirect_dstprefix.c`
+This module mirrors the helper logic used by `tools/traffic_generator/server.py`
+so other tooling in the repo can ensure the `ebpf/af_xdp/xdp_redirect_openpenny.c`
 program is present and attached.
 
 It can also be executed directly:
@@ -43,10 +43,10 @@ def run_cmd(
 
 def build_xdp_program(xdp_dir: Path) -> Path:
     """Ensure the XDP object is built and return its path."""
-    obj = xdp_dir / "xdp_redirect_dstprefix.o"
+    obj = xdp_dir / "xdp_redirect_openpenny.o"
     if obj.exists():
         return obj
-    run_cmd(["make", "-C", str(xdp_dir), "xdp_redirect_dstprefix.o"])
+    run_cmd(["make", "-C", str(xdp_dir), "xdp_redirect_openpenny.o"])
     if not obj.exists():
         raise FileNotFoundError(f"Failed to build {obj}")
     return obj
@@ -105,14 +105,14 @@ def attach_xdp_program(iface: str, mode: str, obj_path: Path) -> bool:
 
 def ensure_xdp_attached(iface: str, mode: str = "auto") -> bool:
     """
-    Ensure the lab XDP program is attached to *iface*.
+    Ensure the OpenPenny AF_XDP eBPF program is attached to *iface*.
 
     Returns True if the program is present/attached, False on failure.
     """
-    project_root = Path(__file__).resolve().parent
-    xdp_dir = project_root / "xdp-fw"
+    project_root = Path(__file__).resolve().parent.parent
+    xdp_dir = project_root / "ebpf" / "af_xdp"
     if not xdp_dir.is_dir():
-        print("[xdp] could not locate xdp-fw; ensure it exists", file=sys.stderr)
+        print("[xdp] could not locate ebpf/af_xdp; ensure it exists", file=sys.stderr)
         return False
 
     try:
@@ -141,7 +141,7 @@ def detach_xdp_program(iface: str) -> bool:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Manage the lab XDP attachment",
+        description="Manage the OpenPenny AF_XDP eBPF attachment",
     )
     parser.add_argument("--iface", required=True, help="Interface to target")
     parser.add_argument(

@@ -27,15 +27,16 @@ int main() {
         openpenny::penny::FlowEngine flow(cfg.active);
         openpenny::FlowKey key{};
         const auto now = std::chrono::steady_clock::now();
+        const auto packet_id = openpenny::penny::make_packet_drop_id(1000, 100);
 
         flow.record_data(1000, now);
-        bool dropped = flow.drop_packet(1000, 1100, "expire-me", key, now);
+        bool dropped = flow.drop_packet(1000, 1100, packet_id, key, now);
         assert(dropped);
         assert(flow.pending_retransmissions() == 1);
 
         // Wait past the expiration deadline, then enqueue a retransmit event.
         sleep_for_ms(80);
-        openpenny::penny::ThreadFlowEventTimerManager::instance().enqueue_retransmitted("expire-me", &flow);
+        openpenny::penny::ThreadFlowEventTimerManager::instance().enqueue_retransmitted(packet_id, &flow);
 
         sleep_for_ms(80);
         openpenny::penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
@@ -61,15 +62,16 @@ int main() {
         openpenny::penny::FlowEngine flow(cfg.active);
         openpenny::FlowKey key{};
         const auto now = std::chrono::steady_clock::now();
+        const auto packet_id = openpenny::penny::make_packet_drop_id(2000, 100);
 
         flow.record_data(2000, now);
-        bool dropped = flow.drop_packet(2000, 2100, "retransmit-me", key, now);
+        bool dropped = flow.drop_packet(2000, 2100, packet_id, key, now);
         assert(dropped);
         assert(flow.pending_retransmissions() == 1);
 
         // Enqueue retransmit well before deadline so event path runs first.
         sleep_for_ms(20);
-        openpenny::penny::ThreadFlowEventTimerManager::instance().enqueue_retransmitted("retransmit-me", &flow);
+        openpenny::penny::ThreadFlowEventTimerManager::instance().enqueue_retransmitted(packet_id, &flow);
         sleep_for_ms(150);
         openpenny::penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
 

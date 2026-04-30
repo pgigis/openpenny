@@ -180,6 +180,23 @@ PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts
     if (opts_local.sink) {
         TCPLOG_INFO("[openpenny] egress sink: %s",
                     opts_local.sink->describe().c_str());
+        if (cfg.egress.kind == egress::EgressKind::RawNic) {
+            TCPLOG_WARN("[openpenny] raw_nic replays the original Ethernet "
+                        "frame out '%s'. It does not reinject packets into "
+                        "the local host stack, and it does not resolve or "
+                        "rewrite L2 next-hop MAC addresses. Use egress.kind=tun "
+                        "for local application delivery, or raw_socket if the "
+                        "kernel routing table should choose the egress hop.",
+                        cfg.egress.device.c_str());
+            if (!cfg.ifname.empty() && cfg.egress.device == cfg.ifname) {
+                TCPLOG_WARN("[openpenny] raw_nic egress matches the ingress "
+                            "interface '%s'. Redirected packets destined for "
+                            "this host will not be delivered locally on this "
+                            "path; they are transmitted back out the NIC with "
+                            "their original Ethernet header.",
+                            cfg.ifname.c_str());
+            }
+        }
     }
 
     // Traffic match policy applies process-wide (every worker uses the
@@ -247,7 +264,7 @@ PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts
     std::vector<std::optional<ModeResult>> results(qcount);
 
     // Shared drop snapshot collector across worker threads.
-    auto drop_collector = std::make_shared<DropCollector>();
+    auto drop_collector = std::make_shared<DropCollector>(qcount);
     AggregatesController aggregates_controller(cfg, opts_local, drop_collector, stop_flag, user_should_stop);
     aggregates_controller.start();
     aggregates_controller.start_individual_limit();

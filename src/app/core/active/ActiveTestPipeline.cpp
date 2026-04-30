@@ -45,6 +45,7 @@ ActiveTestPipelineRunner::ActiveTestPipelineRunner(
     matcher_{std::move(matcher)},      // Take ownership of the FlowMatcher used to classify relevant packets/flows.
     flow_manager_{cfg.active},         // Manage active monitored flows and aggregate per-flow stats.
     drop_collector_{std::move(drop_collector)}, // Shared drop snapshot collector across threads.
+    drop_collector_shard_index_{app::current_thread_counter_index()}, // Bind collector writes to the current worker shard.
     thread_name_{std::move(thread_name)},       // Friendly identifier for this worker thread.
     source_{std::move(source)},        // Take ownership of the packet source interface used to receive network packets.
     last_stats_log_{std::chrono::steady_clock::now()},  // Record current time to pace the first periodic stats log.
@@ -54,18 +55,18 @@ ActiveTestPipelineRunner::ActiveTestPipelineRunner(
     if (drop_collector_) {
         app::DropCollectorBinding::instance().ensure_snapshot_hook();
         flow_manager_.set_drop_sink(
-            [collector = drop_collector_, name = thread_name_](const FlowKey& key,
-                                                               const std::string& packet_id,
-                                                               penny::PacketDropSnapshot snapshot) {
-            const auto agg = openpenny::app::aggregate_counters();
-            snapshot.stats.overwrite_from_aggregates(agg);
+            [collector = drop_collector_,
+             name = thread_name_,
+             shard_index = drop_collector_shard_index_](const FlowKey& key,
+                                                        penny::PacketDropId packet_id,
+                                                        penny::PacketDropSnapshot snapshot) {
             app::DropCollectorBinding::instance().upsert(
                 collector,
                 name,
+                shard_index,
                 key,
                 packet_id,
-                snapshot,
-                agg);
+                snapshot);
         });
     }
 }
@@ -225,9 +226,10 @@ void ActiveTestPipelineRunner::sweep_expired_snapshots(const std::chrono::steady
             if (pair.second.state != penny::SnapshotState::Pending) continue;
             if (now - pair.second.timestamp >= retransmission_timeout) {
                 if (TCPLOG_ENABLED(INFO)) {
+                    const auto packet_id_text = penny::format_packet_drop_id(pair.first);
                     TCPLOG_INFO("[packet_expired] flow=%s packet_id=%s",
                                 flow_debug_details(entry.flow.flow_key()).c_str(),
-                                pair.first.c_str());
+                                packet_id_text.c_str());
                 }
                 entry.flow.mark_snapshot_expired(pair.first);
             }
@@ -341,7 +343,11 @@ penny::FlowEngineEntry* ActiveTestPipelineRunner::admit_or_forward_flow(
             if (inserted) {
                 if (drop_collector_) {
                     if (auto* entry = flow_manager_.find(packet.flow)) {
-                        app::DropCollectorBinding::instance().bind(&entry->flow, drop_collector_, thread_name_);
+                        app::DropCollectorBinding::instance().bind(
+                            &entry->flow,
+                            drop_collector_,
+                            thread_name_,
+                            drop_collector_shard_index_);
                     }
                 }
                 if (TCPLOG_ENABLED(INFO)) {
@@ -493,9 +499,9 @@ void ActiveTestPipelineRunner::handle_data_packet(penny::FlowEngineEntry& entry,
         // If its in-sequence it can not be a duplicate or a retransmission
         entry.flow.record_droppable_packet();
 
-        const bool dropped = entry.flow.drop_packet(start_seq, end_seq, packet.packet_id(), packet.flow, now);
+        const auto packet_id = packet.packet_id();
+        const bool dropped = entry.flow.drop_packet(start_seq, end_seq, packet_id, packet.flow, now);
         if (dropped) {
-            entry.flow.register_gap(start_seq, end_seq, packet.packet_id());
             return;
         }
         // We forward the packet.
@@ -539,7 +545,7 @@ void ActiveTestPipelineRunner::handle_data_packet(penny::FlowEngineEntry& entry,
 
     const bool touches_gap = interval_mark.touches_gap;
     bool gap_partially_filled = false;
-    std::vector<std::string> filled_gaps;
+    std::vector<penny::PacketDropId> filled_gaps;
     bool fills_only_gap_space = false;
      // First, we check whether the packet touches the byte ranges affected by our packet drops.
         if (!touches_gap){

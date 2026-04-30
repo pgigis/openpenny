@@ -132,7 +132,7 @@ void FlowEngine::update_highest_sequence(uint32_t seq) {
 // When we deliberately drop a packet range we record both the interval and the originating packet id,
 // using the packet id as the unique drop identifier so filled gaps can find the matching drop snapshot
 // and adjust counters once that specific drop is observed repaired.
-void FlowEngine::register_gap(uint32_t start, uint32_t end, const std::string& packet_id) {
+void FlowEngine::register_gap(uint32_t start, uint32_t end, PacketDropId packet_id) {
     if (end <= start) end = start + 1;
     auto seg = icl::interval<uint32_t>::right_open(start, end);
     flow_gaps_.add(seg);
@@ -150,8 +150,8 @@ bool FlowEngine::fills_only_gap_space(uint32_t start, uint32_t end) const {
 //   output: vector of packet ids whose entire dropped range has been recovered by this retransmission.
 //   purpose: remove repaired regions from flow_gaps_ while pinpointing which previously dropped packets
 //            have now been fully observed on the wire.
-std::vector<std::string> FlowEngine::fill_gaps(uint32_t start, uint32_t end, bool* partially_filled) {
-    std::vector<std::string> filled_ids;
+std::vector<PacketDropId> FlowEngine::fill_gaps(uint32_t start, uint32_t end, bool* partially_filled) {
+    std::vector<PacketDropId> filled_ids;
     bool partial = false;
     if (end <= start) end = start + 1;
     auto seg = icl::interval<uint32_t>::right_open(start, end);
@@ -204,7 +204,7 @@ std::vector<std::string> FlowEngine::fill_gaps(uint32_t start, uint32_t end, boo
     return filled_ids;
 }
 
-void FlowEngine::register_filled_gaps(const std::vector<std::string>& packet_ids) {
+void FlowEngine::register_filled_gaps(const std::vector<PacketDropId>& packet_ids) {
     if (packet_ids.empty()) return;
     for (const auto& id : packet_ids) {
         ThreadFlowEventTimerManager::instance().enqueue_retransmitted(id, this);
@@ -245,7 +245,7 @@ void FlowEngine::evaluate_snapshot_duplicate_threshold() {
 
 bool FlowEngine::drop_packet(uint32_t start,
                             uint32_t end,
-                            const std::string& packet_id,
+                            PacketDropId packet_id,
                             const FlowKey& key,
                             const std::chrono::steady_clock::time_point& now) {
 
@@ -264,23 +264,23 @@ bool FlowEngine::drop_packet(uint32_t start,
         std::max(0, flow_cfg_.max_drops_aggregates)
     );
 
-    if (max_drops_in_aggregates > 0) {
-        const auto& runtime = openpenny::current_runtime_setup();
-        if (runtime.aggregates_active) {
-            auto agg = openpenny::app::aggregate_counters();
-            if (agg.dropped_packets >= max_drops_in_aggregates) {
-                // Global drop budget has been exhausted.
-                return false;
-            }
-        }
-    }
-    
     // Decide whether to drop the packet, using the configured drop probability.
     double r = flow_random_dist_(flow_random_engine_); // Draw a uniform random number in [0, 1).
     bool should_drop = (r < flow_cfg_.drop_probability); // Check if it falls within the drop probability range.
     if (!should_drop) {
         // Do not drop this packet.
         return false;
+    }
+
+    if (max_drops_in_aggregates > 0) {
+        const auto& runtime = openpenny::current_runtime_setup();
+        if (runtime.aggregates_active &&
+            !openpenny::app::try_reserve_aggregate_drop(max_drops_in_aggregates)) {
+            // Best-effort global drop budget has been exhausted. The atomic
+            // per-worker counters may still allow a small overshoot under
+            // heavy concurrency, which is acceptable for this path.
+            return false;
+        }
     }
 
     // Record that this flow has one more retransmission outstanding and one more packet dropped.
@@ -349,7 +349,7 @@ bool FlowEngine::drop_packet(uint32_t start,
  *    consistent, and
  *  - remove the packet → snapshot index mapping.
  */
-void FlowEngine::mark_snapshot_retransmitted(const std::string& packet_id) {
+void FlowEngine::mark_snapshot_retransmitted(PacketDropId packet_id) {
     // Look up the snapshot index by the packet ID.
     auto index_it = flow_snapshot_index_by_id_.find(packet_id);
     if (index_it == flow_snapshot_index_by_id_.end()) {
@@ -417,7 +417,7 @@ void FlowEngine::mark_snapshot_retransmitted(const std::string& packet_id) {
  *  - update flow-wide and snapshot-local statistics, and
  *  - propagate the outcome to any snapshots recorded after this one.
  */
-void FlowEngine::mark_snapshot_expired(const std::string& packet_id) {
+void FlowEngine::mark_snapshot_expired(PacketDropId packet_id) {
     // Look up the index of the snapshot associated with this packet ID.
     auto index_it = flow_snapshot_index_by_id_.find(packet_id);
 
@@ -497,7 +497,7 @@ void FlowEngine::mark_snapshot_expired(const std::string& packet_id) {
  *  - remove the packet → snapshot index mapping, and
  *  - ensure later snapshots no longer consider this packet as pending.
  */
-void FlowEngine::mark_snapshot_invalid(const std::string& packet_id) {
+void FlowEngine::mark_snapshot_invalid(PacketDropId packet_id) {
     // Look up the index of the snapshot tracked for this packet.
     auto index_it = flow_snapshot_index_by_id_.find(packet_id);
     if (index_it == flow_snapshot_index_by_id_.end()) {
@@ -548,7 +548,7 @@ void FlowEngine::mark_snapshot_invalid(const std::string& packet_id) {
 }
 
 void FlowEngine::expire_all_pending_snapshots() {
-    std::vector<std::string> pending_ids;
+    std::vector<PacketDropId> pending_ids;
     pending_ids.reserve(flow_drop_snapshots_.size());
     for (const auto& pair : flow_drop_snapshots_) {
         if (pair.second.state == SnapshotState::Pending) {

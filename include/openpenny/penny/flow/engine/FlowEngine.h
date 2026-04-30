@@ -6,6 +6,7 @@
 #include "openpenny/config/Config.h"
 #include "openpenny/penny/flow/timer/ThreadFlowEventTimer.h"
 #include "openpenny/penny/flow/state/PennyStats.h"
+#include "openpenny/penny/flow/state/PacketDropId.h"
 #include "openpenny/penny/flow/state/PennySnapshot.h"
 
 #include <functional>
@@ -41,7 +42,7 @@ namespace openpenny::penny {
 class FlowEngine {
 public:
     using DropSnapshotSink = std::function<void(const FlowKey&,
-                                                const std::string&,
+                                                PacketDropId,
                                                 const PacketDropSnapshot&)>;
 
     /// High-level decision / outcome for this flow.
@@ -178,7 +179,7 @@ public:
     }
 
     /// All recorded packet-drop snapshots, in observation order.
-    const std::vector<std::pair<std::string, PacketDropSnapshot>>&
+    const std::vector<std::pair<PacketDropId, PacketDropSnapshot>>&
     drop_snapshots() const noexcept {
         return flow_drop_snapshots_;
     }
@@ -231,7 +232,7 @@ public:
      * The drop is associated with @p packet_id so that future retransmissions
      * filling this interval can be matched back to the original decision.
      */
-    void register_gap(uint32_t start, uint32_t end, const std::string& packet_id);
+    void register_gap(uint32_t start, uint32_t end, PacketDropId packet_id);
 
     /**
      * @brief True if [start, end) lies strictly within gap space (no new coverage).
@@ -252,9 +253,9 @@ public:
      * @param partially_filled Optional out-parameter set to true if at least one
      *                         gap is only partially repaired.
      */
-    std::vector<std::string> fill_gaps(uint32_t start,
-                                       uint32_t end,
-                                       bool* partially_filled = nullptr);
+    std::vector<PacketDropId> fill_gaps(uint32_t start,
+                                        uint32_t end,
+                                        bool* partially_filled = nullptr);
 
     /**
      * @brief Mark the given gap packet_ids as fully repaired.
@@ -262,7 +263,7 @@ public:
      * Typically called after fill_gaps() when a gap is confirmed to be
      * completely covered by retransmissions.
      */
-    void register_filled_gaps(const std::vector<std::string>& packet_ids);
+    void register_filled_gaps(const std::vector<PacketDropId>& packet_ids);
 
     /**
      * @brief Track that we observed a duplicate packet at @p seq for snapshot
@@ -318,18 +319,18 @@ public:
      */
     bool drop_packet(uint32_t start,
                      uint32_t end,
-                     const std::string& packet_id,
+                     PacketDropId packet_id,
                      const FlowKey& key,
                      const std::chrono::steady_clock::time_point& now);
 
     /// Mark the snapshot associated with @p packet_id as retransmitted.
-    void mark_snapshot_retransmitted(const std::string& packet_id);
+    void mark_snapshot_retransmitted(PacketDropId packet_id);
 
     /// Mark the snapshot associated with @p packet_id as expired (no repair observed in time).
-    void mark_snapshot_expired(const std::string& packet_id);
+    void mark_snapshot_expired(PacketDropId packet_id);
 
     /// Mark the snapshot associated with @p packet_id as invalid (e.g., misclassified or cancelled).
-    void mark_snapshot_invalid(const std::string& packet_id);
+    void mark_snapshot_invalid(PacketDropId packet_id);
 
     /// Mark all pending snapshots as expired (used on shutdown/cleanup).
     void expire_all_pending_snapshots();
@@ -354,7 +355,7 @@ private:
      */
     struct GapRecord {
         icl::interval<uint32_t>::type range;  ///< Dropped byte range.
-        std::string packet_id;               ///< Snapshot identifier.
+        PacketDropId packet_id{0};           ///< Snapshot identifier.
         bool completed{false};               ///< True if the gap is fully repaired.
     };
 
@@ -380,7 +381,7 @@ private:
     std::optional<std::chrono::steady_clock::time_point> flow_first_data_time_{};
 
     /// Mapping from snapshot packet_id to its index in flow_drop_snapshots_.
-    std::unordered_map<std::string, size_t> flow_snapshot_index_by_id_;
+    std::unordered_map<PacketDropId, size_t> flow_snapshot_index_by_id_;
     DropSnapshotSink drop_sink_{};
 
     /**
@@ -396,10 +397,10 @@ private:
     // ---------------------------------------------------------------------
 
     /// Tracks whether a given packet_id was actually dropped.
-    std::unordered_map<std::string, bool> flow_dropped_packets_;
+    std::unordered_map<PacketDropId, bool> flow_dropped_packets_;
 
     /// All packet-drop snapshots along with their logical packet_id.
-    std::vector<std::pair<std::string, PacketDropSnapshot>> flow_drop_snapshots_;
+    std::vector<std::pair<PacketDropId, PacketDropSnapshot>> flow_drop_snapshots_;
 
     /// Bytes we have observed as covered in the sequence space.
     icl::interval_set<uint32_t> flow_covered_;

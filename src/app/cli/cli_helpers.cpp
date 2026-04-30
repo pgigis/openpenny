@@ -75,6 +75,7 @@ CliOptions parse_args(int argc, char** argv) {
                 std::cerr << "Invalid --source value: " << opts.source << " (use xdp or dpdk)\n";
                 std::exit(1);
             }
+            opts.source_set = true;
         } else if ((arg == "--prefix" || arg == "-p") && i + 1 < argc) {
             std::string spec = argv[++i];
             if (!parse_cidr(spec, opts.prefix_ip, opts.prefix_cidr, opts.prefix_host, opts.mask_host, opts.mask_bits)) {
@@ -119,6 +120,7 @@ CliOptions parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             opts.queue_count = static_cast<unsigned>(n);
+            opts.queue_count_set = true;
         } else if (arg == "--iface" && i + 1 < argc) {
             opts.iface = argv[++i];
         } else if (arg == "--xdp-mode" && i + 1 < argc) {
@@ -135,6 +137,7 @@ CliOptions parse_args(int argc, char** argv) {
                 std::cerr << "Invalid --mode value: " << m << " (use active|passive)\n";
                 std::exit(1);
             }
+            opts.mode_set = true;
         } else if (arg == "--stats-sock" && i + 1 < argc) {
             opts.stats_socket_path = argv[++i];
         } else if ((arg == "--tun" || arg == "--tun-name") && i + 1 < argc) {
@@ -143,16 +146,18 @@ CliOptions parse_args(int argc, char** argv) {
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: openpenny_cli [options]\n"
                       << "  -c, --config <path>     Configuration file (default examples/configs/config_default.yaml)\n"
-                      << "  --source <xdp|dpdk>     Packet source backend (default xdp)\n"
-                      << "  --mode <active|passive> Pipeline mode (default active)\n"
+                      << "  --source <xdp|dpdk>     Packet source backend; falls back to the YAML platform if omitted\n"
+                      << "  --mode <active|passive> Pipeline mode; falls back to runtime_policy.mode in the YAML if omitted\n"
                       << "  --stats-sock <path>     Unix datagram socket path for live stats (optional)\n"
                       << "  -p, --prefix <CIDR>     Legacy runtime prefix metadata (traffic_match controls capture)\n"
-                      << "  --iface <dev>           Ensure XDP program is attached to interface\n"
+                      << "  --iface <dev>           Override the YAML interface (otherwise platform.interface wins)\n"
                       << "  --xdp-mode <auto|drv|generic>  Attachment mode (default auto)\n"
                       << "  -q, --queue <id|auto>   AF_XDP queue id, or auto-probe the active RX queue\n"
                       << "  --queue-probe-ms <ms>   Probe time per queue when using --queue auto\n"
                       << "  --tun <dev>             Forward matching packets to the named TUN device\n"
-                      << "  -Q, --queues <count>    Number of AF_XDP or DPDK queues/threads to poll\n"
+                      << "  -Q, --queues <count>    Override platform.queue_count from the YAML (otherwise YAML wins)\n"
+                      << "\nWhen a flag is omitted, the corresponding value from --config wins; the\n"
+                      << "CLI is for ad-hoc overrides on top of the YAML, not for replacing it.\n"
                       << "\nPolling continues until Penny heuristics finish or you press Ctrl+C.\n";
             std::exit(0);
         }

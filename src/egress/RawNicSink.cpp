@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: BSD-2-Clause
 /**
  * @file RawNicSink.cpp
- * @brief PacketSink that emits IP datagrams out a specific NIC using
- *        an AF_PACKET/SOCK_DGRAM socket with a SOCK_DGRAM layer-3 view.
+ * @brief PacketSink that replays original Ethernet frames out a specific
+ *        NIC using AF_PACKET/SOCK_RAW.
  *
- * AF_PACKET + SOCK_DGRAM lets us address the egress interface by
- * ifindex via sendto(2), bypassing the local routing table. That
- * matches operator intent when a named NIC is the desired egress
- * point -- IPPROTO_RAW (RawSocketSink) cannot make that guarantee
- * because routing still decides the output interface there.
- *
- * We write starting from the layer-3 header (IP); the kernel builds
- * the appropriate layer-2 encap from the socket's bind / sockaddr_ll.
+ * Unlike RawSocketSink (IPPROTO_RAW), this sink does not ask the kernel
+ * to route or ARP-resolve the packet. It transmits the captured layer-2
+ * frame as-is on the selected NIC, so it is only correct when the
+ * original Ethernet header is still valid on that egress segment.
  */
 
 #include "openpenny/egress/RawNicSink.h"
@@ -43,9 +39,17 @@ bool RawNicSink::open() {
         return false;
     }
 
-    fd_ = ::socket(AF_PACKET, SOCK_DGRAM | SOCK_NONBLOCK, htons(ETH_P_IP));
+    // SOCK_RAW (not SOCK_DGRAM): we want to forward the original frame
+    // including its Ethernet header. SOCK_DGRAM strips L2 on RX and
+    // synthesises one on TX from sockaddr_ll, but with no destination
+    // MAC available the kernel sends the frame with an all-zero dst
+    // MAC — which the next hop drops, so traffic never reaches its
+    // destination. SOCK_RAW preserves the original L2 verbatim.
+    //
+    // ETH_P_ALL on the protocol so we can write any frame type.
+    fd_ = ::socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_ALL));
     if (fd_ < 0) {
-        TCPLOG_ERROR("RawNicSink: socket(AF_PACKET, SOCK_DGRAM) failed: %s (need CAP_NET_RAW)",
+        TCPLOG_ERROR("RawNicSink: socket(AF_PACKET, SOCK_RAW) failed: %s (need CAP_NET_RAW)",
                      std::strerror(errno));
         return false;
     }
@@ -68,7 +72,7 @@ bool RawNicSink::open() {
     // so the kernel drops incoming frames targeted at other ifaces.
     sockaddr_ll addr{};
     addr.sll_family = AF_PACKET;
-    addr.sll_protocol = htons(ETH_P_IP);
+    addr.sll_protocol = htons(ETH_P_ALL);
     addr.sll_ifindex = if_index_;
     if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         const int saved = errno;
@@ -105,22 +109,47 @@ void RawNicSink::close() noexcept {
 }
 
 bool RawNicSink::write(const net::PacketView& packet) {
-    if (fd_ < 0 || !packet.layer3_ptr || packet.layer3_length == 0) {
+    if (fd_ < 0) {
+        return false;
+    }
+
+    // Preferred path: the source surfaced the original L2 frame, so we
+    // can replay it verbatim through SOCK_RAW. The kernel doesn't add
+    // any header — what we write goes on the wire as-is. This preserves
+    // the original Ethernet src/dst MAC addresses, which is what makes
+    // the next-hop switch / NIC accept the frame.
+    const std::uint8_t* buf = nullptr;
+    std::uint32_t       len = 0;
+    if (packet.layer2_ptr && packet.layer2_length > 0) {
+        buf = packet.layer2_ptr;
+        len = packet.layer2_length;
+    } else if (packet.layer3_ptr && packet.layer3_length > 0) {
+        // Fallback: source has no L2 view (older readers, gRPC paths).
+        // Sending bare L3 via SOCK_RAW would require us to fabricate an
+        // Ethernet header, and we don't know the destination MAC. Warn
+        // and drop to make this fail loudly rather than silently.
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            TCPLOG_WARN("RawNicSink: source did not surface a layer-2 "
+                        "frame; cannot forward via raw_nic without the "
+                        "original Ethernet header. Use a different "
+                        "egress kind (tun, raw_socket) or use a source "
+                        "that populates packet.layer2_ptr.%s", "");
+        }
+        stats_.errors.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    } else {
         return false;
     }
 
     sockaddr_ll dst{};
     dst.sll_family = AF_PACKET;
-    dst.sll_protocol = htons(ETH_P_IP);
+    dst.sll_protocol = htons(ETH_P_ALL);
     dst.sll_ifindex = if_index_;
-    dst.sll_halen = ETH_ALEN; // Kernel will use interface default if unknown.
-    // No sll_addr means "use the device's configured destination"; for
-    // point-to-point NICs that's always correct. Operators wanting to
-    // explicitly set a next-hop MAC should prefer a router upstream.
 
     const ssize_t written = ::sendto(fd_,
-                                     packet.layer3_ptr,
-                                     static_cast<size_t>(packet.layer3_length),
+                                     buf,
+                                     static_cast<size_t>(len),
                                      0,
                                      reinterpret_cast<sockaddr*>(&dst),
                                      sizeof(dst));
@@ -131,7 +160,7 @@ bool RawNicSink::write(const net::PacketView& packet) {
     const int err = errno;
     if (err != EAGAIN && err != EWOULDBLOCK) {
         TCPLOG_WARN("RawNicSink::write (%u bytes) failed on fd=%d (device='%s'): %s",
-                    static_cast<unsigned>(packet.layer3_length), fd_,
+                    static_cast<unsigned>(len), fd_,
                     cfg_.device.c_str(), std::strerror(err));
         stats_.errors.fetch_add(1, std::memory_order_relaxed);
     }

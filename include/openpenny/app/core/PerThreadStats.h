@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "openpenny/agg/Stats.h" // for FlowKey
+#include "openpenny/penny/flow/state/PacketDropId.h"
 
 namespace openpenny::app {
 
@@ -35,7 +36,7 @@ struct alignas(64) PerThreadStats {
 
     struct DropSnapshotInfo {
         FlowKey key{};
-        std::string packet_id;
+        penny::PacketDropId packet_id{0};
         std::uint64_t timestamp_ns{0};
         std::uint64_t duplicates{0};
         std::uint64_t data_packets{0};
@@ -71,9 +72,22 @@ struct AggregatedCounters {
 
 void init_thread_counters(std::size_t count);
 void set_thread_counter_index(std::size_t idx);
+std::size_t current_thread_counter_index() noexcept;
 PerThreadStats& current_thread_counters();
 const std::vector<PerThreadStats>& thread_counters();
 AggregatedCounters aggregate_counters();
 std::uint64_t aggregate_active_flows();
+
+/**
+ * Best-effort aggregate drop-budget reservation across worker slots.
+ *
+ * Sums the per-worker atomic drop counters and, if the total is still below
+ * @p max_total_drops, increments the current worker's slot and returns true.
+ * This path is intentionally lock-free and may overshoot slightly under races.
+ */
+bool try_reserve_aggregate_drop(std::uint64_t max_total_drops) noexcept;
+
+/// Return the current summed value of the per-worker aggregate drop budget.
+std::uint64_t aggregate_drop_budget_drops() noexcept;
 
 } // namespace openpenny::app

@@ -6,15 +6,21 @@
 #include "openpenny/agg/Stats.h"
 #include "openpenny/egress/PacketSink.h"
 #include "openpenny/penny/flow/state/PennySnapshot.h"
+#include "openpenny/penny/flow/state/PacketDropId.h"
 #include "openpenny/app/core/PerThreadStats.h"
 #include "openpenny/net/TrafficMatch.h"
 
 #include <cstddef>
+#include <chrono>
 #include <functional>
 #include <optional>
 #include <string>
 #include <memory>
+#include <algorithm>
+#include <array>
+#include <limits>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <atomic>
 
@@ -68,21 +74,69 @@ struct PipelineOptions {
 
 struct DropSnapshotRecord {
     FlowKey key{};
-    std::string packet_id;
+    penny::PacketDropId packet_id{0};
     penny::PacketDropSnapshot snapshot{};
-    openpenny::app::AggregatedCounters counters{};
+    openpenny::app::AggregatedCounters counters{}; // Decorated when exporting/evaluating aggregates.
     std::string thread_name;
 };
 
 /**
  * @brief Shared drop snapshot collector across all active pipeline threads.
  *
- * Threads append/update records here; ordering/sorting happens in the driver.
+ * Threads append/update records in their own shard; ordering/sorting happens
+ * in the driver.
  */
 struct DropCollector {
-    std::mutex mtx;
+    static constexpr std::size_t kMaxShards = 128;
+    using TimestampRep = std::chrono::steady_clock::duration::rep;
+    static constexpr TimestampRep kNoSnapshotTimestamp =
+        std::numeric_limits<TimestampRep>::min();
+
+    struct SnapshotKey {
+        FlowKey key{};
+        penny::PacketDropId packet_id{0};
+
+        bool operator==(const SnapshotKey& other) const noexcept {
+            return key == other.key && packet_id == other.packet_id;
+        }
+    };
+
+    struct SnapshotKeyHash {
+        std::size_t operator()(const SnapshotKey& value) const noexcept {
+            std::size_t h = FlowKeyHash{}(value.key);
+            const auto hs = std::hash<penny::PacketDropId>{}(value.packet_id);
+            return h ^ (hs + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2));
+        }
+    };
+
+    struct alignas(64) Shard {
+        mutable std::mutex mtx;
+        std::vector<DropSnapshotRecord> snapshots;
+        std::unordered_map<SnapshotKey, std::size_t, SnapshotKeyHash> snapshot_index;
+        std::atomic<std::size_t> snapshot_count{0};
+        std::atomic<std::size_t> pending_snapshot_count{0};
+        std::atomic<std::size_t> latest_snapshot_index{0};
+        std::atomic<TimestampRep> latest_snapshot_timestamp{kNoSnapshotTimestamp};
+    };
+
+    explicit DropCollector(std::size_t requested_shards = 1)
+        : shard_count(std::max<std::size_t>(1, std::min(requested_shards, kMaxShards))) {}
+
     std::atomic<bool> accepting{true};
-    std::vector<DropSnapshotRecord> snapshots;
+    std::size_t shard_count{1};
+    std::array<Shard, kMaxShards> shards{};
+
+    std::size_t clamp_shard_index(std::size_t idx) const noexcept {
+        return idx < shard_count ? idx : shard_count - 1;
+    }
+
+    Shard& shard_for(std::size_t idx) noexcept {
+        return shards[clamp_shard_index(idx)];
+    }
+
+    const Shard& shard_for(std::size_t idx) const noexcept {
+        return shards[clamp_shard_index(idx)];
+    }
 };
 
 using DropCollectorPtr = std::shared_ptr<DropCollector>;

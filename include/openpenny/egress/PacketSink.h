@@ -46,7 +46,7 @@ enum class EgressKind {
     None,       ///< Drop matched packets; only increment counters.
     Tun,        ///< Write layer-3 bytes into a TUN device (IFF_TUN, IFF_NO_PI).
     RawSocket,  ///< Write layer-3 bytes into an IPPROTO_RAW socket.
-    RawNic,     ///< Write layer-3 bytes out an AF_PACKET raw socket on a NIC.
+    RawNic,     ///< Replay the original layer-2 frame out an AF_PACKET raw socket on a NIC.
 };
 
 /**
@@ -81,8 +81,9 @@ struct EgressConfig {
     /// interface. Set false only if you manage rp_filter externally.
     bool tun_rp_filter_loose = true;
 
-    /// RawNic-only: if true, the socket is bound to `device` via SO_BINDTODEVICE
-    /// and the caller is responsible for ensuring the NIC can TX layer-3 frames.
+    /// RawNic-only: if true, the socket is bound to `device` via SO_BINDTODEVICE.
+    /// RawNic replays the original Ethernet frame and therefore bypasses
+    /// route / ARP / neighbour resolution.
     bool raw_nic_bind_device = true;
 
     /**

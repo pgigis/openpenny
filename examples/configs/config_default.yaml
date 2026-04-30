@@ -30,7 +30,7 @@ includes:
   platform:           platform/af_xdp.yaml
 
   # Where matched packets go after Penny is done with them.
-  traffic_forwarding: platform/forwarding_tun.yaml
+  egress:             platform/egress_raw_socket.yaml
 
   # gRPC daemon listen address (only used by `pennyd`, ignored by the CLI).
   grpc:               platform/grpc.yaml

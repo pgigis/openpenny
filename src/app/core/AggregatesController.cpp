@@ -9,6 +9,139 @@
 #include <algorithm>
 
 namespace openpenny {
+namespace {
+
+DropCollector::TimestampRep snapshot_timestamp(
+    const penny::PacketDropSnapshot& snap) noexcept {
+    return snap.timestamp.time_since_epoch().count();
+}
+
+void decorate_snapshot_record(DropSnapshotRecord& record,
+                              const openpenny::app::AggregatedCounters& agg) {
+    record.counters = agg;
+    record.snapshot.stats.overwrite_from_aggregates(agg);
+}
+
+void set_runtime_eval_counters(RuntimeStatus& runtime,
+                               const penny::PennyStats& stats) {
+    runtime.aggregate_eval_counters.data_packets = stats.droppable_packets();
+    runtime.aggregate_eval_counters.duplicate_packets = stats.duplicate_packets();
+    runtime.aggregate_eval_counters.retransmitted_packets = stats.retransmitted_packets();
+    runtime.aggregate_eval_counters.non_retransmitted_packets = stats.non_retransmitted_packets();
+}
+
+void set_runtime_eval_counters(RuntimeStatus& runtime,
+                               const openpenny::app::AggregatedCounters& agg) {
+    runtime.aggregate_eval_counters.data_packets = agg.droppable_packets;
+    runtime.aggregate_eval_counters.duplicate_packets = agg.duplicate_packets;
+    runtime.aggregate_eval_counters.retransmitted_packets = agg.retransmitted_packets;
+    runtime.aggregate_eval_counters.non_retransmitted_packets = agg.non_retransmitted_packets;
+}
+
+void store_aggregate_snapshot_once(
+    std::optional<openpenny::app::AggregatedCounters>& snapshot_slot,
+    std::mutex& snapshot_mtx,
+    const openpenny::app::AggregatedCounters& agg) {
+    std::lock_guard<std::mutex> lk(snapshot_mtx);
+    if (!snapshot_slot) snapshot_slot = agg;
+}
+
+std::vector<DropSnapshotRecord> collect_all_drop_snapshots(
+    const DropCollector& collector,
+    const openpenny::app::AggregatedCounters& agg) {
+    std::vector<DropSnapshotRecord> out;
+    std::size_t total = 0;
+    for (std::size_t shard_index = 0; shard_index < collector.shard_count; ++shard_index) {
+        const auto& shard = collector.shard_for(shard_index);
+        total += shard.snapshot_count.load(std::memory_order_relaxed);
+    }
+    out.reserve(total);
+    for (std::size_t shard_index = 0; shard_index < collector.shard_count; ++shard_index) {
+        const auto& shard = collector.shard_for(shard_index);
+        std::lock_guard<std::mutex> lock(shard.mtx);
+        out.insert(out.end(), shard.snapshots.begin(), shard.snapshots.end());
+    }
+    for (auto& record : out) {
+        decorate_snapshot_record(record, agg);
+    }
+    return out;
+}
+
+std::optional<DropSnapshotRecord> collect_latest_drop_snapshot(
+    const DropCollector& collector,
+    const openpenny::app::AggregatedCounters& agg) {
+    std::size_t best_shard_index = 0;
+    auto best_timestamp = DropCollector::kNoSnapshotTimestamp;
+    for (std::size_t shard_index = 0; shard_index < collector.shard_count; ++shard_index) {
+        const auto& shard = collector.shard_for(shard_index);
+        if (shard.snapshot_count.load(std::memory_order_relaxed) == 0) {
+            continue;
+        }
+        const auto latest_timestamp =
+            shard.latest_snapshot_timestamp.load(std::memory_order_relaxed);
+        if (latest_timestamp >= best_timestamp) {
+            best_timestamp = latest_timestamp;
+            best_shard_index = shard_index;
+        }
+    }
+    if (best_timestamp == DropCollector::kNoSnapshotTimestamp) {
+        return std::nullopt;
+    }
+
+    const auto& best_shard = collector.shard_for(best_shard_index);
+    {
+        std::lock_guard<std::mutex> lock(best_shard.mtx);
+        const auto latest_index =
+            best_shard.latest_snapshot_index.load(std::memory_order_relaxed);
+        if (latest_index < best_shard.snapshots.size()) {
+            auto record = best_shard.snapshots[latest_index];
+            if (snapshot_timestamp(record.snapshot) == best_timestamp) {
+                decorate_snapshot_record(record, agg);
+                return record;
+            }
+        }
+    }
+
+    std::optional<DropSnapshotRecord> latest;
+    for (std::size_t shard_index = 0; shard_index < collector.shard_count; ++shard_index) {
+        const auto& shard = collector.shard_for(shard_index);
+        std::lock_guard<std::mutex> lock(shard.mtx);
+        auto it = std::max_element(
+            shard.snapshots.begin(),
+            shard.snapshots.end(),
+            [](const DropSnapshotRecord& a, const DropSnapshotRecord& b) {
+                return a.snapshot.timestamp < b.snapshot.timestamp;
+            });
+        if (it == shard.snapshots.end()) {
+            continue;
+        }
+        if (!latest || latest->snapshot.timestamp < it->snapshot.timestamp) {
+            latest = *it;
+        }
+    }
+    if (latest) {
+        decorate_snapshot_record(*latest, agg);
+    }
+    return latest;
+}
+
+struct CollectorSnapshotSummary {
+    std::size_t snapshot_count{0};
+    std::size_t pending_snapshot_count{0};
+};
+
+CollectorSnapshotSummary summarize_collector_snapshots(const DropCollector& collector) {
+    CollectorSnapshotSummary summary;
+    for (std::size_t shard_index = 0; shard_index < collector.shard_count; ++shard_index) {
+        const auto& shard = collector.shard_for(shard_index);
+        summary.snapshot_count += shard.snapshot_count.load(std::memory_order_relaxed);
+        summary.pending_snapshot_count +=
+            shard.pending_snapshot_count.load(std::memory_order_relaxed);
+    }
+    return summary;
+}
+
+} // namespace
 
 AggregatesController::AggregatesController(const Config& cfg,
                                            const PipelineOptions& opts,
@@ -81,8 +214,8 @@ std::optional<openpenny::app::AggregatedCounters> AggregatesController::aggregat
 
 void AggregatesController::populate_drop_snapshots(PipelineSummary& summary) const {
     if (!collector_) return;
-    std::lock_guard<std::mutex> lock(collector_->mtx);
-    auto snaps = collector_->snapshots;
+    const auto agg = openpenny::app::aggregate_counters();
+    auto snaps = collect_all_drop_snapshots(*collector_, agg);
     std::sort(
         snaps.begin(),
         snaps.end(),
@@ -119,10 +252,7 @@ void AggregatesController::evaluate_pending_if_needed(const Config& cfg,
         runtime.aggregates_status = RuntimeStatus::AggregatesStatus::DUPLICATES_EXCEEDED;
     }
     runtime.has_aggregate_eval = true;
-    runtime.aggregate_eval_counters.data_packets = stats.droppable_packets();
-    runtime.aggregate_eval_counters.duplicate_packets = stats.duplicate_packets();
-    runtime.aggregate_eval_counters.retransmitted_packets = stats.retransmitted_packets();
-    runtime.aggregate_eval_counters.non_retransmitted_packets = stats.non_retransmitted_packets();
+    set_runtime_eval_counters(runtime, stats);
     collector_completed_.store(true, std::memory_order_relaxed);
 }
 
@@ -170,15 +300,9 @@ void AggregatesController::collector_loop() {
                     static_cast<unsigned long long>(agg.flows_finished));
                 runtime.aggregates_status = RuntimeStatus::AggregatesStatus::CLOSED_LOOP;
                 runtime.has_aggregate_eval = true;
-                runtime.aggregate_eval_counters.data_packets = agg.droppable_packets;
-                runtime.aggregate_eval_counters.duplicate_packets = agg.duplicate_packets;
-                runtime.aggregate_eval_counters.retransmitted_packets = agg.retransmitted_packets;
-                runtime.aggregate_eval_counters.non_retransmitted_packets = agg.non_retransmitted_packets;
+                set_runtime_eval_counters(runtime, agg);
                 collector_completed_.store(true, std::memory_order_relaxed);
-                {
-                    std::lock_guard<std::mutex> lk(aggregates_snapshot_mtx_);
-                    if (!aggregates_snapshot_) aggregates_snapshot_ = openpenny::app::aggregate_counters();
-                }
+                store_aggregate_snapshot_once(aggregates_snapshot_, aggregates_snapshot_mtx_, agg);
                 stop_flag_.store(true, std::memory_order_relaxed);
                 break;
             }
@@ -190,14 +314,10 @@ void AggregatesController::collector_loop() {
         std::size_t pending_snapshot_count = 0;
         std::uint64_t pending_rtx_count = 0;
         {
-            std::lock_guard<std::mutex> lock(collector_->mtx);
-            snapshot_count = collector_->snapshots.size();
-            for (const auto& rec : collector_->snapshots) {
-                if (rec.snapshot.state == penny::SnapshotState::Pending) {
-                    pending = true;
-                    ++pending_snapshot_count;
-                }
-            }
+            const auto collector_summary = summarize_collector_snapshots(*collector_);
+            snapshot_count = collector_summary.snapshot_count;
+            pending_snapshot_count = collector_summary.pending_snapshot_count;
+            pending = pending_snapshot_count > 0;
             pending_rtx_count = openpenny::app::aggregate_counters().pending_retransmissions;
             pending_rtx = pending_rtx_count > 0;
             ready = snapshot_count >= required_drops_ && !pending && !pending_rtx;
@@ -235,8 +355,8 @@ void AggregatesController::collector_loop() {
                 ready_logged = true;
             }
             collector_->accepting.store(false, std::memory_order_relaxed);
+            const auto agg_now = openpenny::app::aggregate_counters();
             if (cfg_.active.max_duplicate_fraction > 0.0) {
-                auto agg_now = openpenny::app::aggregate_counters();
                 if (agg_now.data_packets > 0) {
                     const double agg_dup_ratio = static_cast<double>(agg_now.duplicate_packets) /
                                                  static_cast<double>(agg_now.data_packets);
@@ -244,15 +364,12 @@ void AggregatesController::collector_loop() {
                         runtime.aggregates_status = RuntimeStatus::AggregatesStatus::DUPLICATES_EXCEEDED;
                         runtime.aggregates_active = false;
                         runtime.has_aggregate_eval = true;
-                        runtime.aggregate_eval_counters.data_packets = agg_now.droppable_packets;
-                        runtime.aggregate_eval_counters.duplicate_packets = agg_now.duplicate_packets;
-                        runtime.aggregate_eval_counters.retransmitted_packets = agg_now.retransmitted_packets;
-                        runtime.aggregate_eval_counters.non_retransmitted_packets = agg_now.non_retransmitted_packets;
+                        set_runtime_eval_counters(runtime, agg_now);
                         collector_completed_.store(true, std::memory_order_relaxed);
-                        {
-                            std::lock_guard<std::mutex> lk(aggregates_snapshot_mtx_);
-                            if (!aggregates_snapshot_) aggregates_snapshot_ = agg_now;
-                        }
+                        store_aggregate_snapshot_once(
+                            aggregates_snapshot_,
+                            aggregates_snapshot_mtx_,
+                            agg_now);
                         stop_flag_.store(true, std::memory_order_relaxed);
                         break;
                     }
@@ -260,26 +377,13 @@ void AggregatesController::collector_loop() {
             }
             if (!aggregate_eval_done) {
                 aggregate_eval_done = true;
-                std::optional<DropSnapshotRecord> latest_snapshot;
-                {
-                    std::lock_guard<std::mutex> lock(collector_->mtx);
-                    auto it = std::max_element(
-                        collector_->snapshots.begin(),
-                        collector_->snapshots.end(),
-                        [](const DropSnapshotRecord& a, const DropSnapshotRecord& b) {
-                            return a.snapshot.timestamp < b.snapshot.timestamp;
-                        });
-                    if (it != collector_->snapshots.end()) {
-                        latest_snapshot = *it;
-                    }
-                }
+                auto latest_snapshot = collect_latest_drop_snapshot(*collector_, agg_now);
 
                 if (latest_snapshot) {
-                    if (openpenny::app::aggregate_counters().pending_retransmissions > 0) {
+                    if (agg_now.pending_retransmissions > 0) {
                         continue;
                     }
                     auto stats = latest_snapshot->snapshot.stats;
-                    stats.overwrite_from_aggregates(openpenny::app::aggregate_counters());
                     const auto miss_prob = std::clamp(
                         cfg_.active.retransmission_miss_probability,
                         0.0,
@@ -294,6 +398,7 @@ void AggregatesController::collector_loop() {
                         stats,
                         miss_prob,
                         cfg_.active.max_duplicate_fraction);
+                    const auto packet_id_text = penny::format_packet_drop_id(latest_snapshot->packet_id);
 
                     const auto denom = eval.p_closed + eval.p_not_closed;
                     TCPLOG_INFO(
@@ -311,36 +416,30 @@ void AggregatesController::collector_loop() {
                         denom,
                         eval.closed_weight,
                         penny::flow_decision_to_string(eval.decision),
-                        latest_snapshot->packet_id.c_str(),
+                        packet_id_text.c_str(),
                         latest_snapshot->thread_name.c_str());
 
                     if (dup_threshold_hit) {
                         runtime.aggregates_status = RuntimeStatus::AggregatesStatus::DUPLICATES_EXCEEDED;
                         runtime.aggregates_active = false;
                         runtime.has_aggregate_eval = true;
-                        runtime.aggregate_eval_counters.data_packets = stats.droppable_packets();
-                        runtime.aggregate_eval_counters.duplicate_packets = stats.duplicate_packets();
-                        runtime.aggregate_eval_counters.retransmitted_packets = stats.retransmitted_packets();
-                        runtime.aggregate_eval_counters.non_retransmitted_packets = stats.non_retransmitted_packets();
+                        set_runtime_eval_counters(runtime, stats);
                         collector_completed_.store(true, std::memory_order_relaxed);
-                        {
-                            std::lock_guard<std::mutex> lk(aggregates_snapshot_mtx_);
-                            if (!aggregates_snapshot_) aggregates_snapshot_ = openpenny::app::aggregate_counters();
-                        }
+                        store_aggregate_snapshot_once(
+                            aggregates_snapshot_,
+                            aggregates_snapshot_mtx_,
+                            agg_now);
                         break;
                     }
 
                     if (eval.decision == penny::FlowEngine::FlowDecision::FINISHED_CLOSED_LOOP) {
                         runtime.aggregates_status = RuntimeStatus::AggregatesStatus::CLOSED_LOOP;
-                        {
-                            std::lock_guard<std::mutex> lk(aggregates_snapshot_mtx_);
-                            if (!aggregates_snapshot_) aggregates_snapshot_ = openpenny::app::aggregate_counters();
-                        }
+                        store_aggregate_snapshot_once(
+                            aggregates_snapshot_,
+                            aggregates_snapshot_mtx_,
+                            agg_now);
                         runtime.has_aggregate_eval = true;
-                        runtime.aggregate_eval_counters.data_packets = stats.droppable_packets();
-                        runtime.aggregate_eval_counters.duplicate_packets = stats.duplicate_packets();
-                        runtime.aggregate_eval_counters.retransmitted_packets = stats.retransmitted_packets();
-                        runtime.aggregate_eval_counters.non_retransmitted_packets = stats.non_retransmitted_packets();
+                        set_runtime_eval_counters(runtime, stats);
                         collector_completed_.store(true, std::memory_order_relaxed);
                         stop_flag_.store(true, std::memory_order_relaxed);
                         break;
@@ -348,10 +447,7 @@ void AggregatesController::collector_loop() {
                         runtime.aggregates_status = RuntimeStatus::AggregatesStatus::NON_CLOSED_LOOP;
                     }
 
-                    runtime.aggregate_eval_counters.data_packets = stats.droppable_packets();
-                    runtime.aggregate_eval_counters.duplicate_packets = stats.duplicate_packets();
-                    runtime.aggregate_eval_counters.retransmitted_packets = stats.retransmitted_packets();
-                    runtime.aggregate_eval_counters.non_retransmitted_packets = stats.non_retransmitted_packets();
+                    set_runtime_eval_counters(runtime, stats);
                     runtime.has_aggregate_eval = true;
 
                     if (cfg_.active.aggregates_enabled &&
@@ -371,10 +467,10 @@ void AggregatesController::collector_loop() {
                             static_cast<unsigned long long>(closed_loop_required),
                             closed_loop_required == 1 ? "" : "s");
                     } else {
-                        {
-                            std::lock_guard<std::mutex> lk(aggregates_snapshot_mtx_);
-                            if (!aggregates_snapshot_) aggregates_snapshot_ = openpenny::app::aggregate_counters();
-                        }
+                        store_aggregate_snapshot_once(
+                            aggregates_snapshot_,
+                            aggregates_snapshot_mtx_,
+                            agg_now);
                         collector_completed_.store(true, std::memory_order_relaxed);
                         stop_flag_.store(true, std::memory_order_relaxed);
                         break;
@@ -405,10 +501,7 @@ void AggregatesController::individual_limit_loop() {
                 static_cast<unsigned long long>(agg.flows_not_closed_loop),
                 static_cast<unsigned long long>(agg.flows_rst),
                 static_cast<unsigned long long>(agg.flows_duplicates_exceeded));
-            {
-                std::lock_guard<std::mutex> lk(aggregates_snapshot_mtx_);
-                if (!aggregates_snapshot_) aggregates_snapshot_ = agg;
-            }
+            store_aggregate_snapshot_once(aggregates_snapshot_, aggregates_snapshot_mtx_, agg);
             stop_flag_.store(true, std::memory_order_relaxed);
             individual_stop_hit_.store(true, std::memory_order_relaxed);
             break;
@@ -440,10 +533,7 @@ void AggregatesController::min_closed_loop_loop() {
                 static_cast<unsigned long long>(agg.flows_not_closed_loop),
                 static_cast<unsigned long long>(agg.flows_rst),
                 static_cast<unsigned long long>(agg.flows_duplicates_exceeded));
-            {
-                std::lock_guard<std::mutex> lk(aggregates_snapshot_mtx_);
-                if (!aggregates_snapshot_) aggregates_snapshot_ = agg;
-            }
+            store_aggregate_snapshot_once(aggregates_snapshot_, aggregates_snapshot_mtx_, agg);
             // If the aggregate eval has not produced a verdict yet, mark
             // it CLOSED_LOOP since we have collected enough closed-loop
             // evidence on its own.
@@ -451,10 +541,7 @@ void AggregatesController::min_closed_loop_loop() {
             if (runtime.aggregates_status == RuntimeStatus::AggregatesStatus::PENDING) {
                 runtime.aggregates_status = RuntimeStatus::AggregatesStatus::CLOSED_LOOP;
                 runtime.has_aggregate_eval = true;
-                runtime.aggregate_eval_counters.data_packets = agg.droppable_packets;
-                runtime.aggregate_eval_counters.duplicate_packets = agg.duplicate_packets;
-                runtime.aggregate_eval_counters.retransmitted_packets = agg.retransmitted_packets;
-                runtime.aggregate_eval_counters.non_retransmitted_packets = agg.non_retransmitted_packets;
+                set_runtime_eval_counters(runtime, agg);
             }
             collector_completed_.store(true, std::memory_order_relaxed);
             closed_loop_stop_hit_.store(true, std::memory_order_relaxed);

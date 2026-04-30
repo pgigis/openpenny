@@ -118,8 +118,8 @@ egress:
 | ------------ | ------------------------------------------------------------------------------------- |
 | `none`       | Drop matched packets after counting them. Good for measurement-only runs.             |
 | `tun`        | Reinject packets into a TUN device (`device:`). The `tun.*` block applies here only.  |
-| `raw_socket` | Send via `IPPROTO_RAW`. The kernel routes the packet.                                 |
-| `raw_nic`    | Send via `AF_PACKET` bound to `device`, bypassing routing.                            |
+| `raw_socket` | Send via `IPPROTO_RAW`. The kernel routes the packet and resolves the next-hop MAC.   |
+| `raw_nic`    | Replay the original Ethernet frame via `AF_PACKET` bound to `device`, bypassing routing and neighbour resolution. |
 
 `tun.rp_filter_loose: true` is usually needed: redirected packets keep
 their original source IP, and the return route lives on the physical NIC,

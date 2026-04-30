@@ -4,6 +4,7 @@
 
 #include "openpenny/agg/Stats.h" // for FlowKey
 #include "openpenny/dataplane/Session.h"
+#include "openpenny/penny/flow/state/PacketDropId.h"
 
 #include <array>
 #include <cstddef>
@@ -112,13 +113,25 @@ struct PacketView {
     const uint8_t* layer3_ptr{nullptr}; ///< Pointer into the source buffer (non-owning).
     uint32_t   layer3_length{0};        ///< Length of the Layer 3 (IP) packet parsed.
 
+    /// Pointer to the start of the Layer 2 (Ethernet) header in the source
+    /// buffer, when the source surfaces it. Non-owning; valid only for the
+    /// lifetime of the packet handler call. Set by the AF_XDP and AF_PACKET
+    /// readers; egress sinks that need to forward the original frame
+    /// (e.g. RawNicSink) read it from here.
+    const uint8_t* layer2_ptr{nullptr};
+    uint32_t       layer2_length{0};   ///< Bytes from layer2_ptr to end of frame.
+
     /**
      * @brief Build a logical identifier for snapshot bookkeeping.
      *
-     * Format: "<seq>-<payload_bytes>". No timestamp is included to ensure determinism.
+     * Encodes the packet's sequence number and payload length into a compact
+     * fixed-size identifier. No timestamp is included to ensure determinism.
      */
-    std::string packet_id() const noexcept {
-        return std::to_string(tcp.seq) + "-" + std::to_string(payload_bytes);
+    penny::PacketDropId packet_id() const noexcept {
+        return penny::make_packet_drop_id(
+            tcp.seq,
+            static_cast<std::uint32_t>(payload_bytes)
+        );
     }
 };
 

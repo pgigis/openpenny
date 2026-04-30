@@ -1,7 +1,12 @@
-# Example egress configuration: send matched packets out a specific NIC
-# via AF_PACKET, bypassing the local routing table. Use this when you
-# want forwarded traffic to leave a named physical port regardless of
-# what /proc/net/route says.
+# Example egress configuration: replay matched packets out a specific NIC
+# via AF_PACKET, bypassing the local routing table.
+#
+# Important: raw_nic sends the ORIGINAL Ethernet frame. It does not
+# reinject packets into the local host stack, and it does not rewrite
+# destination/source MAC addresses for a different next hop. Use this only
+# when the captured L2 header is still valid on the target egress segment.
+# For redirected traffic that must still reach a local application, prefer
+# `egress.kind: tun`.
 egress:
   kind: raw_nic
   device: ens5f0np0

@@ -37,6 +37,22 @@ struct CliOptions {
     unsigned queue_value = 0;
     unsigned queue_count = 1;
     unsigned queue_probe_ms = 250;
+
+    // ------------------------------------------------------------------
+    // "Was this set on the command line?" flags.
+    //
+    // Several of the fields above carry a sensible default (e.g. mode =
+    // Active, queue_count = 1, source = "xdp"). Without these flags we
+    // cannot distinguish "operator typed --mode active" from "operator
+    // typed nothing and we left the default", which means a YAML file
+    // saying `mode: passive` would be silently overwritten by the
+    // baked-in CLI default. Any code path that copies a CLI value into
+    // the loaded Config should branch on the matching `*_set` flag and
+    // leave the YAML value alone when it is false.
+    // ------------------------------------------------------------------
+    bool mode_set = false;          ///< true if --mode was supplied.
+    bool source_set = false;        ///< true if --source was supplied.
+    bool queue_count_set = false;   ///< true if --queues was supplied.
 };
 
 std::string to_lower(std::string value);

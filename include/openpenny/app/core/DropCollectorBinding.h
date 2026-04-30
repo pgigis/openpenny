@@ -28,30 +28,31 @@ public:
 
     void bind(penny::FlowEngine* flow,
               DropCollectorPtr collector,
-              const std::string& thread_name);
+              const std::string& thread_name,
+              std::size_t shard_index);
 
     void unbind(penny::FlowEngine* flow);
 
     void upsert(DropCollectorPtr collector,
                 const std::string& thread_name,
+                std::size_t shard_index,
                 const FlowKey& key,
-                const std::string& packet_id,
-                const penny::PacketDropSnapshot& snap,
-                const openpenny::app::AggregatedCounters& agg);
+                penny::PacketDropId packet_id,
+                const penny::PacketDropSnapshot& snap);
 
 private:
     struct BindingContext {
         DropCollectorPtr collector;
         std::string thread_name;
+        std::size_t shard_index{0};
     };
 
     DropCollectorBinding() = default;
     BindingContext lookup(penny::FlowEngine* flow) const;
     void upsert_locked(const BindingContext& binding,
                        const FlowKey& key,
-                       const std::string& packet_id,
-                       const penny::PacketDropSnapshot& snap,
-                       const openpenny::app::AggregatedCounters& agg);
+                       penny::PacketDropId packet_id,
+                       const penny::PacketDropSnapshot& snap);
 
     mutable std::mutex mtx_;
     std::once_flag hook_once_;

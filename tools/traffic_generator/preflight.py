@@ -97,8 +97,13 @@ def _read_proc(path: str) -> Optional[str]:
         return None
 
 
-def _run(cmd: List[str], timeout: float = 2.0) -> Optional[str]:
-    """Run a command and return its stdout, or None on failure."""
+def _run(cmd: List[str], timeout: float = 2.0):
+    """Run a command and return (stdout, stderr, rc).
+
+    Returns (None, None, None) only if the command itself could not be
+    invoked (binary missing or timed out). Otherwise stdout/stderr are the
+    captured streams (stripped) and rc is the exit status.
+    """
     try:
         out = subprocess.run(
             cmd,
@@ -108,10 +113,16 @@ def _run(cmd: List[str], timeout: float = 2.0) -> Optional[str]:
             timeout=timeout,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None, None, None
+    return (out.stdout or "").strip(), (out.stderr or "").strip(), out.returncode
+
+
+def _run_stdout(cmd: List[str], timeout: float = 2.0) -> Optional[str]:
+    """Backwards-compatible wrapper: returns stdout on rc==0, else None."""
+    stdout, _stderr, rc = _run(cmd, timeout=timeout)
+    if rc != 0 or stdout is None:
         return None
-    if out.returncode != 0:
-        return None
-    return out.stdout.strip()
+    return stdout
 
 
 def _check_interface(iface: str, report: PreflightReport) -> None:
@@ -185,7 +196,7 @@ def _check_local_source_ip(src_ip: Optional[str], iface: str, report: PreflightR
     """Warn if --src-ip is actually a local address (not really spoofed)."""
     if not src_ip:
         return
-    addrs = _run(["ip", "-4", "-o", "addr", "show", "dev", iface]) or ""
+    addrs = _run_stdout(["ip", "-4", "-o", "addr", "show", "dev", iface]) or ""
     iface_ips = re.findall(r"inet\s+([\d.]+)/", addrs)
     if src_ip in iface_ips:
         report.add_info(
@@ -195,7 +206,7 @@ def _check_local_source_ip(src_ip: Optional[str], iface: str, report: PreflightR
         return
 
     # Check whether src_ip is bound on any interface.
-    all_addrs = _run(["ip", "-4", "-o", "addr"]) or ""
+    all_addrs = _run_stdout(["ip", "-4", "-o", "addr"]) or ""
     if re.search(rf"\binet\s+{re.escape(src_ip)}/", all_addrs):
         report.add_warn(
             f"--src-ip {src_ip} is configured on a different interface than "
@@ -205,19 +216,32 @@ def _check_local_source_ip(src_ip: Optional[str], iface: str, report: PreflightR
 
 def _check_destination_route(dest_ip: str, src_ip: Optional[str], iface: str,
                              report: PreflightReport) -> None:
-    """Use `ip route get` to see how the kernel will route the destination."""
-    cmd = ["ip", "route", "get", dest_ip]
-    if src_ip:
-        cmd += ["from", src_ip]
-    out = _run(cmd) or ""
-    if not out:
+    """Use `ip route get` to see how the kernel will route the destination.
+
+    We deliberately *do not* pass `from <src_ip>` here. That form asks the
+    kernel "how would I forward an inbound packet from <src_ip>?" — which for
+    a non-local (spoofed) source typically fails with `RTNETLINK answers:
+    Network is unreachable` or `Invalid cross-device link`, even though the
+    output path for a locally generated packet is perfectly fine. The
+    locally-generated path is what the spoofed_client actually exercises, so
+    that's what we look up. The forwarding-path probe is reported separately.
+    """
+    stdout, stderr, rc = _run(["ip", "route", "get", dest_ip])
+    if rc is None:
         report.add_warn(
-            f"`ip route get {dest_ip}` returned no result; the destination "
-            "may not be routable from this host."
+            "`ip` (iproute2) is not installed or timed out; "
+            "skipping route lookup."
+        )
+        return
+    if rc != 0 or not stdout:
+        msg = stderr or "no output"
+        report.add_warn(
+            f"`ip route get {dest_ip}` failed: {msg}. "
+            "The destination may not be routable from this host."
         )
         return
 
-    first_line = out.splitlines()[0]
+    first_line = stdout.splitlines()[0]
     report.add_info(f"route: {first_line}")
 
     m = re.search(r"\bdev\s+(\S+)", first_line)
@@ -225,19 +249,34 @@ def _check_destination_route(dest_ip: str, src_ip: Optional[str], iface: str,
         report.add_warn(
             f"kernel would normally egress {dest_ip} via {m.group(1)}, "
             f"but you asked for --iface {iface}. With --routed and "
-            "SO_BINDTODEVICE, the packet will leave from {iface} regardless, "
+            f"SO_BINDTODEVICE, the packet will leave from {iface} regardless, "
             "but the next hop on that link must be reachable from this host."
         )
+
+    # Optional sanity probe: does the kernel think a packet *forwarded* from
+    # the spoofed source could reach this destination? A failure here is
+    # informational, not a hard problem for the output path.
+    if src_ip:
+        _stdout, fwd_err, fwd_rc = _run(
+            ["ip", "route", "get", dest_ip, "from", src_ip]
+        )
+        if fwd_rc is not None and fwd_rc != 0:
+            report.add_info(
+                f"`ip route get {dest_ip} from {src_ip}` failed "
+                f"({fwd_err or 'no detail'}). This is expected for an off-net "
+                "spoofed source and does not block the output path; it just "
+                "means the kernel has no return route for that source IP."
+            )
 
 
 def _check_neighbour(dest_ip: str, iface: str, report: PreflightReport) -> None:
     """Confirm that a neighbour entry exists for the next hop."""
     # Find the gateway / next hop for the destination.
-    route = _run(["ip", "route", "get", dest_ip]) or ""
+    route = _run_stdout(["ip", "route", "get", dest_ip]) or ""
     m = re.search(r"\bvia\s+(\S+)", route)
     next_hop = m.group(1) if m else dest_ip
 
-    neigh = _run(["ip", "neigh", "show", next_hop, "dev", iface]) or ""
+    neigh = _run_stdout(["ip", "neigh", "show", next_hop, "dev", iface]) or ""
     if not neigh or "FAILED" in neigh.upper():
         report.add_warn(
             f"no neighbour entry for next-hop {next_hop} on {iface} "
@@ -251,7 +290,7 @@ def _check_neighbour(dest_ip: str, iface: str, report: PreflightReport) -> None:
 def _check_firewall(report: PreflightReport) -> None:
     """Look for nftables/iptables rules that may drop locally generated traffic."""
     if shutil.which("nft"):
-        out = _run(["nft", "list", "ruleset"]) or ""
+        out = _run_stdout(["nft", "list", "ruleset"]) or ""
         if re.search(r"chain\s+output", out, re.IGNORECASE) and \
            re.search(r"\b(drop|reject)\b", out):
             report.add_warn(
@@ -259,7 +298,7 @@ def _check_firewall(report: PreflightReport) -> None:
                 "Confirm they don't match your spoofed source/destination."
             )
     if shutil.which("iptables"):
-        out = _run(["iptables", "-S", "OUTPUT"]) or ""
+        out = _run_stdout(["iptables", "-S", "OUTPUT"]) or ""
         non_default = [
             line for line in out.splitlines()
             if line and not line.startswith("-P ") and "ACCEPT" not in line

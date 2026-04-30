@@ -16,4 +16,5 @@
 
 # Editor and OS files
 .DS_Store
+.DS_STORE
 *.swp

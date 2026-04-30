@@ -152,10 +152,10 @@ public:
     // Flow identity
     // ---------------------------------------------------------------------
 
-    /// Attach the 5-tuple (or equivalent) key to this flow.
+    /// Attach the protocol-aware flow key to this flow.
     void set_flow_key(const FlowKey& key) noexcept { flow_key_ = key; }
 
-    /// Return the flow key (5-tuple) associated with this FlowEngine.
+    /// Return the protocol-aware flow key associated with this FlowEngine.
     FlowKey flow_key() const noexcept { return flow_key_; }
 
     // ---------------------------------------------------------------------
@@ -432,7 +432,7 @@ private:
     // Flow identity
     // ---------------------------------------------------------------------
 
-    FlowKey flow_key_{};  ///< 5-tuple (or equivalent) identifying this flow.
+    FlowKey flow_key_{};  ///< Protocol-aware tuple identifying this flow.
 };
 
 } // namespace openpenny::penny

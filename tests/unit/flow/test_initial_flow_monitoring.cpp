@@ -24,7 +24,7 @@ namespace net = openpenny::net;
     auto now = steady_clock::time_point{};
 
     // Case 1: Flow starts with SYN.
-    openpenny::FlowKey flow_syn{1, 2, 1000, 2000};
+    openpenny::FlowKey flow_syn{1, 2, 1000, 2000, 6};
     net::PacketView syn_pkt{};
     syn_pkt.flow = flow_syn;
     syn_pkt.tcp.seq = 100;
@@ -47,7 +47,7 @@ namespace net = openpenny::net;
     auto& syn_entry_data = *syn_entry_data_ptr;
 
     // Case 2: Flow starts with data (no SYN yet).
-    openpenny::FlowKey flow_data{3, 4, 3000, 4000};
+    openpenny::FlowKey flow_data{3, 4, 3000, 4000, 6};
     auto t0 = steady_clock::time_point{};
     net::PacketView data_pkt0{};
     data_pkt0.flow = flow_data;
@@ -81,7 +81,7 @@ namespace net = openpenny::net;
     assert(data_entry3.flow.highest_sequence() == 60);
 
     // Case 3: Flow receives SYN after data-first start.
-    openpenny::FlowKey flow_data_then_syn{5, 6, 1234, 4321};
+    openpenny::FlowKey flow_data_then_syn{5, 6, 1234, 4321, 6};
     auto td0 = steady_clock::time_point{};
     net::PacketView first_data_pkt{};
     first_data_pkt.flow = flow_data_then_syn;

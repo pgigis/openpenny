@@ -29,7 +29,7 @@ int main() {
     cfg.active.rtt_timeout_factor = 3.0;
 
     openpenny::penny::ThreadFlowManager table(cfg.active);
-    openpenny::FlowKey flow{10, 20, 1111, 2222};
+    openpenny::FlowKey flow{10, 20, 1111, 2222, 6};
     auto now = steady_clock::time_point{};
 
     // Register a gap representing a dropped packet.

@@ -5,40 +5,17 @@
  * @file Stats.h
  * @brief Per-flow and aggregated statistics with a striped hash table.
  */
+#include "openpenny/agg/FlowKey.h"
+
 #include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <shared_mutex>
 #include <mutex>
 #include <chrono>
 
 namespace openpenny {
-
-struct FlowKey {
-    /**
-     * @brief Tuple identifying a TCP/UDP flow in host byte order.
-     */
-    uint32_t src; uint32_t dst; uint16_t sport; uint16_t dport;
-    bool operator==(const FlowKey& o) const noexcept {
-        return src==o.src && dst==o.dst && sport==o.sport && dport==o.dport;
-    }
-};
-
-struct FlowKeyHash {
-    /**
-     * @brief Mix all FlowKey fields into a single hash using 64-bit avalanching.
-     */
-    size_t operator()(const FlowKey& k) const noexcept {
-        uint64_t v = (static_cast<uint64_t>(k.src) << 32) ^ k.dst;
-        v ^= (static_cast<uint64_t>(k.sport) << 16) ^ k.dport;
-        v ^= (v >> 33); v *= 0xff51afd7ed558ccdULL;
-        v ^= (v >> 33); v *= 0xc4ceb9fe1a85ec53ULL;
-        v ^= (v >> 33);
-        return static_cast<size_t>(v);
-    }
-};
 
 /**
  * @brief Per-flow counters that mirror the BPF-side stats exposed to users.
@@ -91,7 +68,7 @@ public:
 private:
     struct Shard {
         mutable std::shared_mutex mutex;
-        std::unordered_map<FlowKey, Counters, FlowKeyHash> map;
+        FlowMap<Counters> map;
     };
     std::vector<Shard> shards_;
     FlowKeyHash hash_;

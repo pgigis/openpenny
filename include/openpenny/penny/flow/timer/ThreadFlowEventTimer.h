@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "openpenny/agg/Stats.h" // for FlowKey
+#include "openpenny/agg/FlowKey.h"
 #include "openpenny/penny/flow/state/PacketDropId.h"
 
 #include <atomic>

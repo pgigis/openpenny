@@ -178,6 +178,10 @@ add_executable(test_traffic_match tests/unit/net/test_traffic_match.cpp)
 target_link_libraries(test_traffic_match PRIVATE openpenny)
 add_test(NAME traffic_match COMMAND test_traffic_match)
 
+add_executable(test_packet_parser tests/unit/net/test_packet_parser.cpp)
+target_link_libraries(test_packet_parser PRIVATE openpenny)
+add_test(NAME packet_parser COMMAND test_packet_parser)
+
 add_executable(test_control_planner tests/unit/control/test_control_planner.cpp)
 target_link_libraries(test_control_planner PRIVATE openpenny)
 add_test(NAME control_planner COMMAND test_control_planner)

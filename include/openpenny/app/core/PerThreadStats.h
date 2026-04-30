@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "openpenny/agg/Stats.h" // for FlowKey
+#include "openpenny/agg/FlowKey.h"
 #include "openpenny/penny/flow/state/PacketDropId.h"
 
 namespace openpenny::app {

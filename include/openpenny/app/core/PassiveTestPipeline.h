@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "openpenny/agg/Stats.h"
+#include "openpenny/agg/FlowKey.h"
 #include "openpenny/app/core/OpenpennyPipelineDriver.h"
 #include "openpenny/app/core/PipelineRunner.h"
 #include "openpenny/config/Config.h"
@@ -13,8 +13,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace openpenny {
@@ -75,17 +73,19 @@ public:
     void finalize(ModeResult& result) override;
 
 private:
+    void reserve_for_config();
+
     const Config& cfg_;
     const PipelineOptions& opts_;
     FlowMatcher matcher_;
     net::PacketSourcePtr source_;
-    std::unordered_map<FlowKey, PassiveFlowState, FlowKeyHash> flows_;
+    FlowMap<PassiveFlowState> flows_;
     std::chrono::steady_clock::time_point start_time_{std::chrono::steady_clock::now()};
     std::size_t flows_seen_{0};
     std::size_t flows_finished_{0};
     std::vector<PassiveFlowState> finished_flows_;
-    std::unordered_map<FlowKey, std::size_t, FlowKeyHash> finished_index_;
-    std::unordered_set<FlowKey, FlowKeyHash> finished_keys_;
+    FlowMap<std::size_t> finished_index_;
+    FlowSet finished_keys_;
     bool stop_grace_active_{false};
     std::chrono::steady_clock::time_point stop_grace_start_{};
     bool stop_requested_{false};

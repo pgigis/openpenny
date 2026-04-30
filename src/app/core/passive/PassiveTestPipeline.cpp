@@ -31,7 +31,21 @@ PassiveTestPipelineRunner::PassiveTestPipelineRunner(const Config& cfg,
     : cfg_(cfg),
       opts_(opts),
       matcher_(std::move(matcher)),
-      source_(std::move(source)) {}
+      source_(std::move(source)) {
+    reserve_for_config();
+}
+
+void PassiveTestPipelineRunner::reserve_for_config() {
+    if (cfg_.passive.max_parallel_flows > 0) {
+        flows_.reserve(cfg_.passive.max_parallel_flows);
+    }
+
+    if (cfg_.passive.min_number_of_flows_to_finish > 0) {
+        finished_flows_.reserve(cfg_.passive.min_number_of_flows_to_finish);
+        finished_index_.reserve(cfg_.passive.min_number_of_flows_to_finish);
+        finished_keys_.reserve(cfg_.passive.min_number_of_flows_to_finish);
+    }
+}
 
 std::optional<ModeResult> PassiveTestPipelineRunner::run() {
     PipelineRunner runner(cfg_,

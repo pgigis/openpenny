@@ -21,11 +21,17 @@ import argparse
 import asyncio
 import os
 import random
+import socket
 import sys
 from dataclasses import dataclass
 from typing import List, Optional
 
-from scapy.all import IP, TCP, Raw, Ether, sendp  # type: ignore
+try:
+    from scapy.all import IP, TCP, Raw, Ether, sendp  # type: ignore
+    _SCAPY_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    IP = TCP = Raw = Ether = sendp = None  # type: ignore
+    _SCAPY_IMPORT_ERROR = exc
 
 
 @dataclass
@@ -139,6 +145,15 @@ def parse_args() -> argparse.Namespace:
         default="ff:ff:ff:ff:ff:ff",
         help="Destination MAC address for the Ethernet header (default: broadcast).",
     )
+    parser.add_argument(
+        "--routed",
+        action="store_true",
+        help=(
+            "Send at layer 3 through the kernel routing table instead of "
+            "injecting raw Ethernet frames. In this mode --dst-mac is ignored "
+            "and the host resolves the next hop normally."
+        ),
+    )
 
     # Random duplication / randomness controls.
     parser.add_argument(
@@ -162,6 +177,24 @@ def parse_args() -> argparse.Namespace:
         "--debug",
         action="store_true",
         help="Print a one-line summary for each crafted packet.",
+    )
+
+    # Preflight diagnostics.
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help=(
+            "Run pre-send diagnostics (rp_filter, route lookup, ARP, firewall, "
+            "common foot-guns) before sending any traffic."
+        ),
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help=(
+            "Run pre-send diagnostics and exit without sending anything. "
+            "Useful when investigating why spoofed traffic is not delivered."
+        ),
     )
 
     return parser.parse_args()
@@ -205,6 +238,56 @@ def clamp_args(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         args.duplication_prob = min(max(args.duplication_prob, 0.0), 1.0)
+
+
+def validate_runtime(args: argparse.Namespace) -> bool:
+    """Verify that the generator can actually send packets on this host."""
+    if _SCAPY_IMPORT_ERROR is not None:
+        print(
+            "[spoofed_client] scapy is not installed for this Python interpreter. "
+            "Install it with `python3 -m pip install scapy` or run the script "
+            "from the virtualenv that has scapy available.",
+            file=sys.stderr,
+        )
+        return False
+
+    try:
+        socket.if_nametoindex(args.iface)
+    except OSError:
+        known_ifaces = ", ".join(name for _, name in socket.if_nameindex())
+        print(
+            f"[spoofed_client] interface '{args.iface}' does not exist on this host."
+            + (f" Available interfaces: {known_ifaces}" if known_ifaces else ""),
+            file=sys.stderr,
+        )
+        return False
+
+    return True
+
+
+def open_routed_socket(iface: str) -> socket.socket:
+    """Open a raw IPv4 socket that still uses the kernel routing table."""
+    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+
+    if hasattr(socket, "SO_BINDTODEVICE"):
+        raw_sock.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_BINDTODEVICE,
+            iface.encode() + b"\0",
+        )
+
+    return raw_sock
+
+
+def send_routed_packets(packets: List, iface: str) -> None:
+    """Send fully formed IP packets through the kernel routing path."""
+    with open_routed_socket(iface) as raw_sock:
+        for pkt in packets:
+            ip_pkt = pkt.getlayer(IP)
+            if ip_pkt is None:
+                raise ValueError("routed send expects packets with an IP layer")
+            raw_sock.sendto(bytes(ip_pkt), (ip_pkt.dst, 0))
 
 
 def build_flow_params_list(args: argparse.Namespace, rng: random.Random) -> List[FlowParams]:
@@ -251,7 +334,7 @@ def build_flow_params_list(args: argparse.Namespace, rng: random.Random) -> List
     return flow_params
 
 
-def build_syn_packet(flow: FlowParams, eth_layer: Ether):
+def build_syn_packet(flow: FlowParams, eth_layer: Optional[Ether]):
     """Create the SYN packet for a flow."""
     ip_layer = flow.ip_layer or IP(dst=flow.dest_ip, src=flow.src_ip)  # fallback if needed
 
@@ -262,13 +345,13 @@ def build_syn_packet(flow: FlowParams, eth_layer: Ether):
         seq=flow.initial_seq,
         window=64240,
     )
-    syn_pkt = eth_layer / ip_layer / syn_tcp
+    syn_pkt = (eth_layer / ip_layer / syn_tcp) if eth_layer is not None else (ip_layer / syn_tcp)
     return syn_pkt
 
 
 def build_data_packets(
     flow: FlowParams,
-    eth_layer: Ether,
+    eth_layer: Optional[Ether],
     rng: random.Random,
     duplication_prob: float,
 ):
@@ -298,13 +381,21 @@ def build_data_packets(
         tcp_layer = base_tcp.copy()
         tcp_layer.seq = seq
 
-        pkt = eth_layer / ip_layer / tcp_layer / payload_layer
+        pkt = (
+            eth_layer / ip_layer / tcp_layer / payload_layer
+            if eth_layer is not None
+            else ip_layer / tcp_layer / payload_layer
+        )
         packets.append(pkt)
 
         # Optionally enqueue a duplicate with the same SEQ and payload.
         if duplication_prob > 0.0 and rng.random() < duplication_prob:
             dup_tcp = tcp_layer  # same header, same seq
-            dup_pkt = eth_layer / ip_layer / dup_tcp / payload_layer
+            dup_pkt = (
+                eth_layer / ip_layer / dup_tcp / payload_layer
+                if eth_layer is not None
+                else ip_layer / dup_tcp / payload_layer
+            )
             packets.append(dup_pkt)
 
         # Advance the sequence position by the number of payload bytes
@@ -314,7 +405,7 @@ def build_data_packets(
     return packets, seq
 
 
-def build_fin_packet(flow: FlowParams, eth_layer: Ether, final_seq: int):
+def build_fin_packet(flow: FlowParams, eth_layer: Optional[Ether], final_seq: int):
     """Create the FIN packet for a flow.
 
     The FIN consumes one additional sequence number.
@@ -329,13 +420,13 @@ def build_fin_packet(flow: FlowParams, eth_layer: Ether, final_seq: int):
         ack=flow.initial_ack,
         window=64240,
     )
-    fin_pkt = eth_layer / ip_layer / fin_tcp
+    fin_pkt = (eth_layer / ip_layer / fin_tcp) if eth_layer is not None else (ip_layer / fin_tcp)
     return fin_pkt
 
 
 def build_full_flow_packets(
     flow: FlowParams,
-    eth_layer: Ether,
+    eth_layer: Optional[Ether],
     rng: random.Random,
     duplication_prob: float,
 ):
@@ -366,8 +457,9 @@ def build_full_flow_packets(
 
 async def send_flow(
     flow: FlowParams,
-    eth_layer: Ether,
+    eth_layer: Optional[Ether],
     iface: str,
+    routed: bool,
     base_interval: float,
     interval_jitter: float,
     duplication_prob: float,
@@ -405,10 +497,14 @@ async def send_flow(
                     f"(flags={flags}, seq={seq})"
                 )
 
-        # Single blocking sendp() in a background thread.
-        await asyncio.to_thread(sendp, packets, iface=iface, verbose=0, inter=0)
+        if routed:
+            await asyncio.to_thread(send_routed_packets, packets, iface)
+        else:
+            # Single blocking sendp() in a background thread.
+            await asyncio.to_thread(sendp, packets, iface=iface, verbose=0, inter=0)
         if debug:
-            print(f"[DEBUG][flow={flow.flow_id}] Spoofed TCP flow completed (burst mode)")
+            mode = "routed" if routed else "burst mode"
+            print(f"[DEBUG][flow={flow.flow_id}] Spoofed TCP flow completed ({mode})")
         return
 
     # --- SLOW PATH: per-packet paced behaviour ---
@@ -420,7 +516,10 @@ async def send_flow(
             f"[DEBUG][flow={flow.flow_id}] SYN: {syn_pkt.summary()} "
             f"(seq={flow.initial_seq})"
         )
-    await asyncio.to_thread(sendp, syn_pkt, iface=iface, verbose=0)
+    if routed:
+        await asyncio.to_thread(send_routed_packets, [syn_pkt], iface)
+    else:
+        await asyncio.to_thread(sendp, syn_pkt, iface=iface, verbose=0)
 
     # 2. DATA (+ optional duplicates)
     data_packets, final_seq_before_fin = build_data_packets(
@@ -437,7 +536,10 @@ async def send_flow(
                 f"(seq={seq}, len={len(flow.payload)})"
             )
 
-        await asyncio.to_thread(sendp, pkt, iface=iface, verbose=0)
+        if routed:
+            await asyncio.to_thread(send_routed_packets, [pkt], iface)
+        else:
+            await asyncio.to_thread(sendp, pkt, iface=iface, verbose=0)
 
         # Compute per-packet pacing with jitter.
         if base_interval > 0.0 or interval_jitter > 0.0:
@@ -456,16 +558,21 @@ async def send_flow(
             f"[DEBUG][flow={flow.flow_id}] FIN: {fin_pkt.summary()} "
             f"(seq={fin_seq})"
         )
-    await asyncio.to_thread(sendp, fin_pkt, iface=iface, verbose=0)
+    if routed:
+        await asyncio.to_thread(send_routed_packets, [fin_pkt], iface)
+    else:
+        await asyncio.to_thread(sendp, fin_pkt, iface=iface, verbose=0)
 
     if debug:
-        print(f"[DEBUG][flow={flow.flow_id}] Spoofed TCP flow completed (paced mode)")
+        mode = "routed paced mode" if routed else "paced mode"
+        print(f"[DEBUG][flow={flow.flow_id}] Spoofed TCP flow completed ({mode})")
 
 
 async def run_all_flows(
     flows: List[FlowParams],
-    eth_layer: Ether,
+    eth_layer: Optional[Ether],
     iface: str,
+    routed: bool,
     base_interval: float,
     interval_jitter: float,
     duplication_prob: float,
@@ -483,6 +590,7 @@ async def run_all_flows(
                     flow=flow,
                     eth_layer=eth_layer,
                     iface=iface,
+                    routed=routed,
                     base_interval=base_interval,
                     interval_jitter=interval_jitter,
                     duplication_prob=duplication_prob,
@@ -496,7 +604,8 @@ async def run_all_flows(
     if debug:
         print(
             f"[DEBUG] Starting {len(tasks)} flow task(s) on {iface} "
-            f"(base_interval={base_interval}, jitter={interval_jitter}, "
+            f"(mode={'routed' if routed else 'l2'}, "
+            f"base_interval={base_interval}, jitter={interval_jitter}, "
             f"flow_start_interval={flow_start_interval})"
         )
 
@@ -504,20 +613,53 @@ async def run_all_flows(
 
 
 def main() -> int:
+    args = parse_args()
+    clamp_args(args)
+
     # Raw Ethernet injection requires root privileges.
     if os.geteuid() != 0:
         print("[spoofed_client] must run as root to send raw packets", file=sys.stderr)
         return 1
 
-    args = parse_args()
-    clamp_args(args)
+    if not validate_runtime(args):
+        return 1
+
+    # Optional preflight diagnostics. Imported lazily so the rest of the
+    # script keeps working in environments where preflight.py is missing.
+    if args.preflight or args.preflight_only:
+        try:
+            from preflight import run_preflight  # type: ignore
+        except ModuleNotFoundError:
+            print(
+                "[spoofed_client] preflight.py not found alongside this script; "
+                "skipping diagnostics.",
+                file=sys.stderr,
+            )
+        else:
+            print("[spoofed_client] running preflight diagnostics...")
+            report = run_preflight(
+                iface=args.iface,
+                dest_ip=args.dest_ip,
+                src_ip=args.src_ip,
+                routed=args.routed,
+                dst_mac=args.dst_mac,
+            )
+            if report.fatal:
+                print(
+                    "[spoofed_client] preflight reported fatal issues; aborting.",
+                    file=sys.stderr,
+                )
+                return 1
+            if args.preflight_only:
+                print("[spoofed_client] preflight-only mode; not sending traffic.")
+                return 0
 
     # Seeded RNG for reproducible behaviour when desired.
     rng = random.Random(args.seed)
 
     # Shared Ethernet header template. If you need per-flow MAC customisation,
     # move this into build_flow_params_list() or send_flow().
-    eth_layer = Ether(dst=args.dst_mac)
+    eth_layer = None if args.routed else Ether(dst=args.dst_mac)
 
     flows = build_flow_params_list(args, rng)
 
@@ -529,6 +671,17 @@ def main() -> int:
                 f"payload_size={len(f.payload)}, initial_seq={f.initial_seq}, "
                 f"initial_ack={f.initial_ack}"
             )
+        if args.routed and args.dst_mac != "ff:ff:ff:ff:ff:ff":
+            print("[DEBUG] --routed ignores --dst-mac; kernel routing decides the next hop MAC")
+    else:
+        print(
+            f"[spoofed_client] sending {len(flows)} flow(s) on {args.iface} "
+            f"(mode={'routed' if args.routed else 'l2'}): "
+            f"{args.src_ip or '<auto>'} -> {args.dest_ip}:{args.dest_port}, "
+            f"data_packets={args.count}, payload_size={args.payload_size}"
+        )
+        if args.routed and args.dst_mac != "ff:ff:ff:ff:ff:ff":
+            print("[spoofed_client] note: --routed ignores --dst-mac")
 
     # Run all flows concurrently using asyncio.
     asyncio.run(
@@ -536,6 +689,7 @@ def main() -> int:
             flows=flows,
             eth_layer=eth_layer,
             iface=args.iface,
+            routed=args.routed,
             base_interval=args.interval,
             interval_jitter=args.interval_jitter,
             duplication_prob=args.duplication_prob,
@@ -544,6 +698,8 @@ def main() -> int:
             debug=args.debug,
         )
     )
+    if not args.debug:
+        print("[spoofed_client] completed")
 
     return 0
 

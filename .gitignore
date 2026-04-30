@@ -18,3 +18,31 @@
 .DS_Store
 .DS_STORE
 *.swp
+*.swo
+*~
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python virtual environments and packaging artefacts
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environment files
+.env
+.env.local

@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "openpenny/agg/Stats.h" // for FlowKey
+#include "openpenny/agg/FlowKey.h"
 #include "openpenny/dataplane/Session.h"
 #include "openpenny/penny/flow/state/PacketDropId.h"
 
@@ -104,9 +104,9 @@ struct TcpHeaderView {
  * All pointers into the packet buffer are valid only during the handler call.
  */
 struct PacketView {
-    FlowKey    flow{};            ///< Flow identifier (5-tuple or 4-tuple depending on source).
+    FlowKey    flow{};            ///< Protocol-aware flow identifier (IPv4 src/dst, L4 ports, IP proto).
     TcpHeaderView tcp{};          ///< Minimal parsed TCP header subset.
-    uint8_t    ip_proto{0};        ///< IPv4 protocol number (TCP=6, UDP=17, etc.).
+    uint8_t    ip_proto{0};        ///< IPv4 protocol number (TCP=6, UDP=17, etc.); mirrors flow.ip_proto.
     uint64_t   payload_bytes{0};  ///< L4 payload length (0 for pure ACKs or empty payloads).
     uint64_t   timestamp_ns{0};   ///< Packet capture timestamp in nanoseconds.
     

@@ -2,14 +2,13 @@
 
 #pragma once
 
+#include "openpenny/agg/FlowKey.h"
 #include "openpenny/penny/flow/engine/FlowEngine.h"
 #include "openpenny/penny/flow/state/PennyStats.h"
 #include "openpenny/net/Packet.h"
 #include "openpenny/app/core/PerThreadStats.h"
 
 #include <limits>
-#include <unordered_map>
-#include <unordered_set>
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
@@ -254,6 +253,8 @@ public:
     }
 
 private:
+    void reserve_for_config(const Config::ActiveConfig& cfg);
+
     /**
      * @brief Count how many flows are currently considered "active".
      *
@@ -279,10 +280,10 @@ private:
     PennyStats stats_{};
 
     /// Map from flow key to the corresponding FlowEngineEntry for active or tracked flows.
-    std::unordered_map<FlowKey, FlowEngineEntry, FlowKeyHash> table_active_flows_;
+    FlowMap<FlowEngineEntry> table_active_flows_;
 
     /// Set of flow keys that have already been fully processed / completed.
-    std::unordered_set<FlowKey, FlowKeyHash> table_completed_flows_;
+    FlowSet table_completed_flows_;
 
     FlowEngine::DropSnapshotSink drop_sink_{};
 };

@@ -17,6 +17,7 @@ int main() {
     matching.dst = 0xc0000201u;
     matching.sport = 12345;
     matching.dport = 443;
+    matching.ip_proto = 6;
 
     openpenny::FlowKey non_matching = matching;
     non_matching.src = 0x0a020203u;
@@ -57,12 +58,18 @@ int main() {
     cfg.rules.clear();
     cfg.rules.push_back(tcp_https);
 
+    assert(openpenny::net::traffic_matches_flow(cfg, matching));
+    auto wrong_proto = matching;
+    wrong_proto.ip_proto = 17;
+    assert(!openpenny::net::traffic_matches_flow(cfg, wrong_proto));
+
     openpenny::net::PacketView packet{};
     packet.flow = matching;
     packet.ip_proto = 6;
     assert(openpenny::net::traffic_matches_packet(cfg, packet));
 
     packet.ip_proto = 17;
+    packet.flow.ip_proto = 17;
     assert(!openpenny::net::traffic_matches_packet(cfg, packet));
 
     cfg.default_action = openpenny::net::TrafficRuleAction::RedirectToUserspace;

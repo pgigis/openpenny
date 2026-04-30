@@ -39,9 +39,7 @@ bool ip_matches(std::uint32_t value, const TrafficIpPrefix& prefix) {
     return (value & prefix.mask_host) == (prefix.prefix_host & prefix.mask_host);
 }
 
-bool rule_matches_flow(const TrafficMatchRule& rule, const FlowKey& key) {
-    if (!rule.enabled) return false;
-
+bool rule_matches_endpoints(const TrafficMatchRule& rule, const FlowKey& key) {
     if (rule.src_ip && !ip_matches(key.src, *rule.src_ip)) return false;
     if (rule.dst_ip && !ip_matches(key.dst, *rule.dst_ip)) return false;
 
@@ -51,8 +49,16 @@ bool rule_matches_flow(const TrafficMatchRule& rule, const FlowKey& key) {
     return true;
 }
 
+bool rule_matches_flow(const TrafficMatchRule& rule, const FlowKey& key) {
+    if (!rule.enabled) return false;
+    if (!rule_matches_endpoints(rule, key)) return false;
+    if (rule.ip_proto && key.ip_proto != *rule.ip_proto) return false;
+    return true;
+}
+
 bool rule_matches_packet(const TrafficMatchRule& rule, const PacketView& packet) {
-    if (!rule_matches_flow(rule, packet.flow)) return false;
+    if (!rule.enabled) return false;
+    if (!rule_matches_endpoints(rule, packet.flow)) return false;
     if (rule.ip_proto && packet.ip_proto != *rule.ip_proto) return false;
     return true;
 }

@@ -9,14 +9,24 @@ namespace openpenny::penny {
 
 ThreadFlowManager::ThreadFlowManager() = default;
 
-ThreadFlowManager::ThreadFlowManager(const Config::ActiveConfig& cfg) : table_cfg_(cfg) {}
+ThreadFlowManager::ThreadFlowManager(const Config::ActiveConfig& cfg) : table_cfg_(cfg) {
+    reserve_for_config(cfg);
+}
 
 void ThreadFlowManager::configure(const Config::ActiveConfig& cfg) {
     table_cfg_ = cfg;
+    reserve_for_config(cfg);
     for (auto& [_, entry] : table_active_flows_) {
         entry.flow.configure(table_cfg_);
         entry.flow.set_drop_sink(drop_sink_);
     }
+}
+
+void ThreadFlowManager::reserve_for_config(const Config::ActiveConfig& cfg) {
+    if (cfg.max_tracked_flows == 0) return;
+
+    table_active_flows_.reserve(cfg.max_tracked_flows);
+    table_completed_flows_.reserve(cfg.max_tracked_flows);
 }
 
 void ThreadFlowManager::set_drop_sink(FlowEngine::DropSnapshotSink sink) {

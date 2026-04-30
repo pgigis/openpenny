@@ -3,7 +3,7 @@
 #pragma once
 
 #include "openpenny/config/Config.h"
-#include "openpenny/agg/Stats.h"
+#include "openpenny/agg/FlowKey.h"
 #include "openpenny/egress/PacketSink.h"
 #include "openpenny/penny/flow/state/PennySnapshot.h"
 #include "openpenny/penny/flow/state/PacketDropId.h"

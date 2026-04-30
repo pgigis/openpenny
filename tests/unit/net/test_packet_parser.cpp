@@ -73,6 +73,7 @@ void assert_decodes(const std::vector<std::uint8_t>& frame) {
     assert(packet.flow.dst == 0xc0a82902u);
     assert(packet.flow.sport == 40000);
     assert(packet.flow.dport == 5201);
+    assert(packet.flow.ip_proto == 6);
     assert(packet.ip_proto == 6);
 }
 

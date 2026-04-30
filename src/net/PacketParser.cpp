@@ -170,6 +170,7 @@ build_view:
     view.flow.dst   = dst;
     view.flow.sport = sport;
     view.flow.dport = dport;
+    view.flow.ip_proto = proto;
 
     view.ip_proto = proto;
 

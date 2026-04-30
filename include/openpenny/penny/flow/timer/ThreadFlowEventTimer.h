@@ -3,6 +3,7 @@
 #pragma once
 
 #include "openpenny/agg/Stats.h" // for FlowKey
+#include "openpenny/penny/flow/state/PacketDropId.h"
 
 #include <atomic>
 #include <chrono>
@@ -84,7 +85,7 @@ public:
      * @param snapshot_index Index of the snapshot inside FlowEngine::flow_drop_snapshots_.
      */
     void register_drop(const ::openpenny::FlowKey& key,
-                       const std::string& packet_id,
+                       PacketDropId packet_id,
                        std::chrono::steady_clock::time_point ts,
                        std::shared_ptr<bool> flow_alive,
                        FlowEngine* flow,
@@ -96,7 +97,7 @@ public:
      * The timer thread will later convert this into a callback that updates
      * the relevant snapshot in the owning FlowEngine.
      */
-    void enqueue_retransmitted(const std::string& packet_id, FlowEngine* flow);
+    void enqueue_retransmitted(PacketDropId packet_id, FlowEngine* flow);
 
     /**
      * @brief Queue an asynchronous "duplicate" event from the packet path.
@@ -132,7 +133,7 @@ public:
      * are drained.
      */
     static void set_snapshot_hook(std::function<void(FlowEngine*,
-                                                     const std::string&,
+                                                     PacketDropId,
                                                      SnapshotEventKind)> hook);
 
 private:
@@ -147,7 +148,7 @@ private:
         std::uint64_t token{0};    ///< Unique token for cancellation / tracking.
         std::chrono::steady_clock::time_point deadline{}; ///< Expiry time.
         ::openpenny::FlowKey key{};   ///< Flow key for logging / debugging.
-        std::string packet_id{};      ///< Snapshot identifier within the flow.
+        PacketDropId packet_id{0};    ///< Snapshot identifier within the flow.
         std::weak_ptr<bool> flow_alive; ///< Liveness flag to avoid calling dead flows.
         FlowEngine* flow{nullptr};      ///< Non-owning pointer to the FlowEngine.
         std::size_t snapshot_index{0}; ///< Index into the flow's snapshot vector.
@@ -170,7 +171,7 @@ private:
      */
     struct PacketKey {
         FlowEngine* flow{nullptr};
-        std::string packet_id{};
+        PacketDropId packet_id{0};
 
         bool operator==(const PacketKey& other) const noexcept {
             return flow == other.flow && packet_id == other.packet_id;
@@ -180,7 +181,7 @@ private:
     struct PacketKeyHash {
         std::size_t operator()(const PacketKey& k) const noexcept {
             std::size_t h1 = std::hash<FlowEngine*>{}(k.flow);
-            std::size_t h2 = std::hash<std::string>{}(k.packet_id);
+            std::size_t h2 = std::hash<PacketDropId>{}(k.packet_id);
             return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
         }
     };
@@ -198,7 +199,7 @@ private:
         };
 
         Kind kind{Kind::Retransmit};
-        std::string packet_id{};  ///< For retransmit events.
+        PacketDropId packet_id{0}; ///< For retransmit events.
         FlowEngine* flow{nullptr}; ///< Target flow; not owned.
         std::uint32_t seq{0};     ///< For duplicate events.
         std::uint32_t payload{0}; ///< Payload size for duplicate events.
@@ -217,7 +218,7 @@ private:
         };
 
         Kind kind{Kind::Expire};
-        std::string packet_id{};  ///< For Expire / Retransmit callbacks.
+        PacketDropId packet_id{0}; ///< For Expire / Retransmit callbacks.
         FlowEngine* flow{nullptr}; ///< Target flow; not owned.
         std::uint32_t seq{0};     ///< For Duplicate callbacks.
     };
@@ -297,7 +298,7 @@ private:
      */
     std::atomic<std::size_t> pending_callbacks_{0};
 
-    static std::function<void(FlowEngine*, const std::string&, SnapshotEventKind)> snapshot_hook_;
+    static std::function<void(FlowEngine*, PacketDropId, SnapshotEventKind)> snapshot_hook_;
 };
 
 } // namespace openpenny::penny

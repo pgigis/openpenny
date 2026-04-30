@@ -203,6 +203,11 @@ private:
     DropCollectorPtr drop_collector_;
 
     /**
+     * Collector shard assigned to this worker thread.
+     */
+    std::size_t drop_collector_shard_index_{0};
+
+    /**
      * Friendly name for this worker thread.
      */
     std::string thread_name_;

@@ -30,6 +30,13 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef OPENPENNY_WITH_LIBBPF
+extern "C" {
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+}
+#endif
+
 namespace openpenny::ingress::af_packet {
 
 namespace {
@@ -131,19 +138,52 @@ bool AfPacketMirrorReader::open(const std::string& ifname, unsigned /*queue*/) {
     ifname_  = ifname;
     TCPLOG_INFO("AfPacketMirrorReader: tapping '%s' (ifindex=%u, fd=%d, frame=%zu)",
                 ifname.c_str(), idx, fd_, frame_buf_.size());
-    // AF_PACKET runs AFTER the XDP hook in the kernel: if a previous run
-    // (or any other tool) left an XDP program attached on this interface,
-    // it sees packets first and we only see whatever it returns XDP_PASS
-    // for. With a stale "redirect" program from a prior active run, the
-    // matched traffic gets redirected away from us and our [afpkt_counters]
-    // line stays at rx=0. Surface this once at open so the operator has
-    // somewhere to start when nothing arrives.
+
+    // Detect a leftover XDP program. AF_PACKET runs *after* the XDP
+    // hook in the kernel pipeline, so any program already attached
+    // (e.g. from a prior active-mode run that didn't clean up) sees
+    // packets first and we only see what it returns XDP_PASS for.
+    // With a stale "redirect" program from a prior active run, the
+    // matched traffic gets redirected away from us and our
+    // [afpkt_counters] line stays at rx=0 indefinitely.
+    //
+    // When libbpf is available, query the netdev directly so the
+    // warning is precise (it fires only when there really is a
+    // program attached). Otherwise fall back to a generic hint.
+#ifdef OPENPENNY_WITH_LIBBPF
+    {
+        __u32 prog_id = 0;
+        const int qrc = bpf_xdp_query_id(static_cast<int>(idx), 0, &prog_id);
+        if (qrc == 0 && prog_id != 0) {
+            TCPLOG_WARN(
+                "AfPacketMirrorReader: an XDP program (id=%u) is "
+                "attached on '%s' RIGHT NOW. AF_PACKET runs after XDP, "
+                "so any traffic that program redirects or drops will "
+                "never reach this passive tap. To detach it and try "
+                "again:\n"
+                "    sudo ip link set dev %s xdp off\n"
+                "    sudo ip link set dev %s xdpgeneric off\n"
+                "    sudo ip link set dev %s xdpdrv off\n"
+                "    sudo rm -rf /sys/fs/bpf/openpenny*",
+                static_cast<unsigned>(prog_id),
+                ifname.c_str(),
+                ifname.c_str(), ifname.c_str(), ifname.c_str());
+        } else {
+            TCPLOG_INFO(
+                "AfPacketMirrorReader: no XDP program currently attached "
+                "on '%s' — AF_PACKET tap should see all traffic the "
+                "kernel delivers to this interface.",
+                ifname.c_str());
+        }
+    }
+#else
     TCPLOG_INFO("AfPacketMirrorReader: AF_PACKET runs after the XDP hook. "
                 "If rx stays at 0, check for a leftover XDP program with "
                 "`ip -d link show %s` and clean up via "
-                "`sudo python3 scripts/xdp_attach.py --iface %s --mode drv --detach && "
+                "`sudo ip link set dev %s xdp off && "
                 "sudo rm -rf /sys/fs/bpf/openpenny*`",
                 ifname.c_str(), ifname.c_str());
+#endif
     return true;
 }
 
@@ -170,7 +210,16 @@ bool AfPacketMirrorReader::poll(const net::PacketHandler& handler, std::size_t b
         }
     }
 
-    const std::size_t cap = std::min(budget, opts_.batch);
+    // Honour the IPipelineStrategy contract: a budget of 0 means "use the
+    // source's own default". PassiveTestPipelineRunner doesn't override
+    // poll_budget(), so it always passes 0 here; treating that literally as
+    // std::min(0, opts_.batch) collapsed cap to 0 and the recvfrom loop
+    // below never ran -- the AF_PACKET tap drained zero packets per poll,
+    // so nothing reached the strategy (no stats bumped, nothing forwarded
+    // through opts_.sink). Fall back to opts_.batch when no explicit
+    // budget is supplied; otherwise clamp the caller's budget to it.
+    const std::size_t cap = budget == 0 ? opts_.batch
+                                        : std::min(budget, opts_.batch);
     std::size_t drained = 0;
 
     while (drained < cap) {
@@ -210,6 +259,11 @@ bool AfPacketMirrorReader::poll(const net::PacketHandler& handler, std::size_t b
             continue;
         }
         view.timestamp_ns = now_nanos();
+        // Surface the original L2 frame (Ethernet header included) so
+        // sinks like RawNicSink can forward via SOCK_RAW without losing
+        // the original src/dst MAC addresses.
+        view.layer2_ptr = frame_buf_.data();
+        view.layer2_length = static_cast<std::uint32_t>(n);
 
         if (!opts_.match_config.empty() &&
             !net::traffic_matches_packet(opts_.match_config, view)) {

@@ -32,7 +32,7 @@ ThreadFlowEventTimerManager& ThreadFlowEventTimerManager::instance() {
     return mgr;
 }
 
-std::function<void(FlowEngine*, const std::string&, ThreadFlowEventTimerManager::SnapshotEventKind)>
+std::function<void(FlowEngine*, PacketDropId, ThreadFlowEventTimerManager::SnapshotEventKind)>
     ThreadFlowEventTimerManager::snapshot_hook_{};
 
 ThreadFlowEventTimerManager::~ThreadFlowEventTimerManager() {
@@ -87,7 +87,7 @@ void ThreadFlowEventTimerManager::stop() {
 // -----------------------------------------------------------------------------
 
 void ThreadFlowEventTimerManager::register_drop(const ::openpenny::FlowKey& key,
-                                         const std::string& packet_id,
+                                         PacketDropId packet_id,
                                          std::chrono::steady_clock::time_point ts,
                                          std::shared_ptr<bool> flow_alive,
                                          FlowEngine* flow,
@@ -115,7 +115,7 @@ void ThreadFlowEventTimerManager::register_drop(const ::openpenny::FlowKey& key,
     wake_locked(); // Wake timer thread to re-evaluate scheduling.
 }
 
-void ThreadFlowEventTimerManager::enqueue_retransmitted(const std::string& packet_id, FlowEngine* flow) {
+void ThreadFlowEventTimerManager::enqueue_retransmitted(PacketDropId packet_id, FlowEngine* flow) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!flow) return;
 
@@ -194,7 +194,7 @@ void ThreadFlowEventTimerManager::run_callbacks(std::deque<Callback>& pending) {
         else if (cb.kind == Callback::Kind::Duplicate) {
             cb.flow->register_duplicate_snapshot(cb.seq);
             cb.flow->evaluate_snapshot_duplicate_threshold();
-            if (snapshot_hook_) snapshot_hook_(cb.flow, {}, SnapshotEventKind::Duplicate);
+            if (snapshot_hook_) snapshot_hook_(cb.flow, 0, SnapshotEventKind::Duplicate);
         }
 
         cb.flow->evaluate_if_ready(); // Re-check whether the flow now satisfies its scheduling thresholds.
@@ -246,9 +246,10 @@ void ThreadFlowEventTimerManager::timer_loop() {
             // Ensure we only schedule snapshot mutation if the flow is still alive.
             if (auto alive = entry.flow_alive.lock(); alive && *alive && entry.flow) {
                 if (TCPLOG_ENABLED(INFO)) {
+                    const auto packet_id_text = format_packet_drop_id(entry.packet_id);
                     TCPLOG_INFO("[packet_expired] flow=%s packet_id=%s token=%" PRIu64,
                         flow_debug_details(entry.flow->flow_key()).c_str(),
-                        entry.packet_id.c_str(),
+                        packet_id_text.c_str(),
                         entry.token
                     );
                 }
@@ -291,9 +292,10 @@ void ThreadFlowEventTimerManager::timer_loop() {
                     cancelled_.insert(token);
 
                     if (TCPLOG_ENABLED(INFO)) {
+                        const auto packet_id_text = format_packet_drop_id(ev.packet_id);
                         TCPLOG_INFO("[packet_retransmitted] flow=%s packet_id=%s seq=%" PRIu32,
                             flow_debug_details(ev.flow->flow_key()).c_str(),
-                            ev.packet_id.c_str(),
+                            packet_id_text.c_str(),
                             ev.seq
                         );
                     }
@@ -370,7 +372,7 @@ void ThreadFlowEventTimerManager::drain_callbacks() {
 }
 
 void ThreadFlowEventTimerManager::set_snapshot_hook(std::function<void(FlowEngine*,
-                                                                       const std::string&,
+                                                                       PacketDropId,
                                                                        SnapshotEventKind)> hook) {
     snapshot_hook_ = std::move(hook);
 }

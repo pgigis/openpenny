@@ -91,12 +91,41 @@ bool RawSocketSink::write(const net::PacketView& packet) {
         return true;
     }
     const int err = errno;
-    if (err != EAGAIN && err != EWOULDBLOCK) {
-        TCPLOG_WARN("RawSocketSink::write (%u bytes) failed on fd=%d: %s",
-                    static_cast<unsigned>(packet.layer3_length), fd_,
-                    std::strerror(err));
-        stats_.errors.fetch_add(1, std::memory_order_relaxed);
+    if (err == EAGAIN || err == EWOULDBLOCK) {
+        // Transient back-pressure on a non-blocking raw socket; the
+        // packet is dropped and no error is recorded (the same policy
+        // the active path uses).
+        return false;
     }
+    if (err == EMSGSIZE) {
+        // The IP datagram is larger than the egress interface MTU.
+        // IPPROTO_RAW with IP_HDRINCL cannot fragment for us, so this
+        // is a hard "won't fit" result. Common on passive taps that
+        // capture jumbo frames and try to forward them out a 1500-MTU
+        // NIC. Log a single actionable hint, silently count the rest.
+        stats_.errors.fetch_add(1, std::memory_order_relaxed);
+        bool expected = false;
+        if (oversized_logged_.compare_exchange_strong(
+                expected, true, std::memory_order_relaxed)) {
+            TCPLOG_WARN(
+                "RawSocketSink: dropped %u-byte IP datagram on fd=%d "
+                "(EMSGSIZE) — packet exceeds the egress interface MTU "
+                "and a raw socket cannot fragment. Either raise the "
+                "egress MTU (e.g. `ip link set %s mtu %u`) or switch "
+                "egress.kind to `tun`/`raw_nic` on a path that supports "
+                "the packet size. Further oversized drops will be "
+                "counted silently.",
+                static_cast<unsigned>(packet.layer3_length),
+                fd_,
+                cfg_.device.empty() ? "<egress-iface>" : cfg_.device.c_str(),
+                static_cast<unsigned>(packet.layer3_length));
+        }
+        return false;
+    }
+    TCPLOG_WARN("RawSocketSink::write (%u bytes) failed on fd=%d: %s",
+                static_cast<unsigned>(packet.layer3_length), fd_,
+                std::strerror(err));
+    stats_.errors.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 

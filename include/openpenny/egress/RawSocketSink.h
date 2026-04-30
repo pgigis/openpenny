@@ -14,6 +14,8 @@
 
 #include "openpenny/egress/PacketSink.h"
 
+#include <atomic>
+
 namespace openpenny::egress {
 
 class RawSocketSink : public PacketSink {
@@ -30,6 +32,13 @@ public:
 private:
     EgressConfig cfg_{};
     int fd_ = -1;
+    /// Latched once we have logged the first EMSGSIZE failure. The kernel
+    /// returns EMSGSIZE for any IP datagram larger than the egress
+    /// interface MTU (raw sockets cannot fragment), and on a busy
+    /// passive tap that would otherwise emit a WARN per oversized
+    /// packet. We log a single, actionable hint and silently count the
+    /// rest in stats_.errors.
+    std::atomic<bool> oversized_logged_{false};
 };
 
 } // namespace openpenny::egress

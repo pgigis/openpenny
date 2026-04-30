@@ -3,14 +3,24 @@ log:
   level: info
 
 # Passive observation example. The pipeline mirrors traffic without
-# touching the data path: AF_PACKET copies frames out of the kernel,
-# the runtime policy runs in passive mode, and egress is disabled so
-# nothing is reinjected. Includes are resolved relative to this file
-# and the combined config is schema-validated before OpenPenny starts.
+# touching the data path: AF_PACKET copies frames out of the kernel
+# while the kernel keeps delivering the originals to the real
+# application. Matched packets are then forwarded out of OpenPenny via
+# the egress sink so a downstream collector / NIC can receive them. If
+# you do not want any re-emission, swap `egress` back to
+# `platform/egress_none.yaml` (which uses the no-op NullSink).
+#
+# Includes are resolved relative to this file and the combined config
+# is schema-validated before OpenPenny starts.
 includes:
   traffic_policy: policies/traffic_default.yaml
   runtime_policy: policies/runtime_passive.yaml
   platform: platform/af_xdp.yaml
-  traffic_forwarding: platform/forwarding_disabled.yaml
-  egress: platform/egress_none.yaml
+  # Forward matched packets via an IPPROTO_RAW socket so the kernel
+  # routing table picks the egress hop. Replace with
+  # `platform/egress_raw_nic.yaml` to replay the original Ethernet
+  # frame out a specific NIC, or `platform/egress_tun.yaml` to hand
+  # them to a local TUN consumer. `platform/egress_none.yaml` keeps the
+  # historical "observe only, do not forward" behaviour.
+  egress: platform/egress_raw_socket.yaml
   grpc: platform/grpc.yaml

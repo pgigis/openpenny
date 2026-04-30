@@ -42,6 +42,8 @@ NIC -> {AF_XDP redirect | AF_PACKET copy | DPDK} -> PacketSource -> PacketParser
   - Aggregated counters can short-circuit decisions once enough drops have outcomes.
 - Egress:
   - `cfg.egress.kind = tun` by default in examples; switch to `raw_socket` / `raw_nic` / `none` as needed.
+  - `raw_socket` is the routed L3 path: the kernel picks the next hop and rewrites the Ethernet header.
+  - `raw_nic` is the L2 replay path: it sends the original Ethernet frame unchanged and is only correct when that captured L2 header is still valid on the target segment.
 
 ## Passive mode
 - Observes flows without inducing drops.
@@ -57,6 +59,7 @@ NIC -> {AF_XDP redirect | AF_PACKET copy | DPDK} -> PacketSource -> PacketParser
   - Override with `ingress_mode: redirect` to force AF_XDP in passive mode (e.g. to measure the fast path); the captured stream must then be reinjected through a TUN egress to reach the application.
 - Egress:
   - Typically `cfg.egress.kind = none` in copy mode (the kernel has already delivered the packet). Enable `tun` / `raw_socket` / `raw_nic` only if the captured stream should be mirrored elsewhere or if `ingress_mode: redirect` is in use.
+  - For redirected traffic that must still reach a local app or a routed downstream host, prefer `tun` or `raw_socket`; `raw_nic` does not perform route / ARP resolution.
 
 ## CLI vs gRPC
 - CLI: `openpenny_cli --mode active|passive ...` uses on-disk config, optionally overridden by flags.

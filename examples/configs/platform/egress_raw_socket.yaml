@@ -1,0 +1,13 @@
+# Example egress configuration: send matched packets back through the
+# kernel routing stack via an IPPROTO_RAW socket.
+#
+# Use this when the destination should still be reached through normal
+# L3 routing and neighbour resolution (for example, when this host acts
+# as a router and must rewrite the next-hop Ethernet header).
+#
+# Unlike `raw_nic`, this path does not replay the original Ethernet
+# frame. The kernel chooses the next hop from the routing table and
+# resolves the neighbour MAC as needed.
+egress:
+  kind: raw_socket
+  device: ens5f0np0

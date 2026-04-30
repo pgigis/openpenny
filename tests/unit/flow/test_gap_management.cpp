@@ -6,8 +6,6 @@
 
 #include <cassert>
 #include <chrono>
-#include <string>
-
 using namespace std::chrono;
 using openpenny::penny::FlowTrackingState;
 namespace net = openpenny::net;
@@ -36,7 +34,7 @@ int main() {
 
     // Register a gap representing a dropped packet.
     auto& entry = track(table, flow, true, 1000, now);
-    std::string gap_id = "pkt-1000-1100";
+    const auto gap_id = openpenny::penny::make_packet_drop_id(1000, 100);
     entry.flow.register_gap(1000, 1100, gap_id);
 
     // First retransmission partially fills the gap.

@@ -167,6 +167,10 @@ bool DpdkReader::poll(const net::PacketHandler& handler, std::size_t budget) {
                 continue;
             }
             packet.timestamp_ns = now_ns();
+            // Surface the original L2 frame for L2-level egress paths
+            // (RawNicSink with SOCK_RAW needs the Ethernet header).
+            packet.layer2_ptr = data;
+            packet.layer2_length = len;
             handler(packet);
         }
         rte_pktmbuf_free(mbuf);

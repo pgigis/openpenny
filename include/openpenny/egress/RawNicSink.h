@@ -3,14 +3,15 @@
 #pragma once
 /**
  * @file RawNicSink.h
- * @brief PacketSink implementation that emits layer-3 packets out a
- *        specific NIC via an AF_PACKET/SOCK_DGRAM socket.
+ * @brief PacketSink implementation that replays original Ethernet frames
+ *        out a specific NIC via AF_PACKET/SOCK_RAW.
  *
  * Unlike RawSocketSink (IPPROTO_RAW, which consults the routing table),
- * this sink writes frames straight to a named interface using
- * AF_PACKET, making it appropriate for mirroring / reinjection
- * scenarios where the operator wants the traffic to leave a physical
- * port without being re-routed by the local host.
+ * this sink transmits a captured layer-2 frame straight to a named
+ * interface. It does not ARP / route / rewrite next-hop MAC addresses,
+ * and it does not deliver packets into the local host stack. Use it only
+ * when replaying the original Ethernet frame is actually valid for the
+ * target egress segment.
  */
 
 #include "openpenny/egress/PacketSink.h"

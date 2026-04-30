@@ -166,6 +166,10 @@ add_executable(test_flow_thresholds tests/unit/flow/test_flow_thresholds.cpp)
 target_link_libraries(test_flow_thresholds PRIVATE openpenny)
 add_test(NAME flow_thresholds COMMAND test_flow_thresholds)
 
+add_executable(test_aggregate_drop_budget tests/unit/flow/test_aggregate_drop_budget.cpp)
+target_link_libraries(test_aggregate_drop_budget PRIVATE openpenny)
+add_test(NAME aggregate_drop_budget COMMAND test_aggregate_drop_budget)
+
 add_executable(test_cli_options tests/unit/cli/test_cli_options.cpp)
 target_link_libraries(test_cli_options PRIVATE openpenny)
 add_test(NAME cli_options COMMAND test_cli_options)

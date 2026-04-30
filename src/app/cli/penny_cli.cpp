@@ -498,11 +498,9 @@ int main(int argc, char** argv) {
     }
 
     // Child process from here onward. The egress sink (if any) is built
-    // from the declarative cfg->egress once the config is loaded; its fd
-    // lifecycle is owned by the PacketSink, so the old local `tun_fd`
-    // bookkeeping is gone.
+    // from the declarative cfg->egress once the config is loaded;
 
-    // Load configuration file.
+    // Load configuration file.    
     auto cfg = openpenny::Config::from_file(cli_opts.config_path);
     if (!cfg) {
         std::cerr
@@ -511,7 +509,27 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Determine source backend.
+    // Determine source backend. The CLI default is "xdp", but when the
+    // operator did not type --source we'd rather honour whatever the YAML
+    // already set in cfg->input.backend. Re-derive `cli_opts.source` from
+    // the loaded config so every later branch (queue auto-probe, XDP
+    // attach, etc.) sees the same answer the pipeline driver will use.
+    if (!cli_opts.source_set) {
+        switch (cfg->input.backend) {
+            case openpenny::PacketInputBackend::XdpAfXdp:
+                cli_opts.source = "xdp";
+                break;
+            case openpenny::PacketInputBackend::Dpdk:
+                cli_opts.source = "dpdk";
+                break;
+            case openpenny::PacketInputBackend::AfPacketMirror:
+                // AF_PACKET mirror is configured via the YAML platform
+                // file directly; the legacy --source flag is XDP/DPDK
+                // only, so map it to "xdp" for the helper checks below.
+                cli_opts.source = "xdp";
+                break;
+        }
+    }
     const bool use_xdp  = openpenny::cli::to_lower(cli_opts.source) == "xdp";
     const bool use_dpdk = openpenny::cli::to_lower(cli_opts.source) == "dpdk";
 
@@ -540,8 +558,19 @@ int main(int argc, char** argv) {
         cfg->queue = cli_opts.queue_value;
     }
 
-    // Number of queues to process in this run.
-    cfg->queue_count = std::max(1u, cli_opts.queue_count);
+    // Number of queues to process in this run. Only let the CLI value
+    // win when the operator actually typed `--queues N`; otherwise keep
+    // whatever the YAML already loaded into cfg->queue_count so a
+    // config that says `queue_count: 4` does not get silently demoted
+    // to the CLI default of 1. Either way, mirror the resolved value
+    // back onto cli_opts so later code (init_thread_counters, the run
+    // banner) reads the same number the driver will use.
+    if (cli_opts.queue_count_set) {
+        cfg->queue_count = std::max(1u, cli_opts.queue_count);
+    } else {
+        cfg->queue_count = std::max(1u, cfg->queue_count);
+    }
+    cli_opts.queue_count = cfg->queue_count;
 
     // For AF_XDP, sanity-check the requested queue range against the NIC's
     // actual RX queue count. Two failure modes are surfaced explicitly here
@@ -639,15 +668,19 @@ int main(int argc, char** argv) {
         cfg->xdp_runtime.pin_settings_path = cli_opts.pin_settings_path;
     }
 
-    // Prepare per-thread counters.
-    openpenny::app::init_thread_counters(std::max(1u, cli_opts.queue_count));
+    // TODO: update code here
+
+    // Prepare per-thread counters. cfg->queue_count is the resolved
+    // value (CLI > YAML > 1) computed above, so use it directly rather
+    // than re-reading the now-mirrored cli_opts.queue_count.
+    openpenny::app::init_thread_counters(std::max(1u, cfg->queue_count));
     openpenny::app::set_thread_counter_index(0);
 
     // Small helper thread for periodically checking aggregate counters.
     // Currently this looks like a hook point for future reporting/export.
     std::atomic<bool> agg_stop{false};
     std::atomic<uint64_t> agg_drop_threshold{12};
-
+    std::cout << "agg_drop_threshold " << agg_drop_threshold << std::endl;
     std::thread agg_thread([&agg_stop, &agg_drop_threshold] {
         uint64_t last_agg_drops = 0;
 
@@ -666,6 +699,8 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     });
+
+
 
     // Apply source-specific setup to the config.
     if (use_xdp) {
@@ -752,7 +787,22 @@ int main(int argc, char** argv) {
         return g_stop_requested != 0;
     };
 
-    pipeline_opts.mode              = cli_opts.mode;
+    // Pipeline mode resolution. The CLI default is Active, but the YAML
+    // can carry `runtime_policy.mode: passive` (mirrored onto cfg->mode
+    // by the loader). When the operator did not pass --mode, take the
+    // mode from the loaded config so a passive YAML actually starts in
+    // passive. --mode on the CLI still overrides everything for ad-hoc
+    // overrides.
+    if (cli_opts.mode_set) {
+        pipeline_opts.mode = cli_opts.mode;
+    } else if (openpenny::cli::to_lower(cfg->mode) == "passive") {
+        pipeline_opts.mode = openpenny::PipelineOptions::Mode::Passive;
+    } else {
+        pipeline_opts.mode = cli_opts.mode; // baseline default: Active.
+    }
+    // Mirror the resolved mode back onto cli_opts so later helpers (run
+    // banner, summary printout) see the same value.
+    cli_opts.mode = pipeline_opts.mode;
     pipeline_opts.stats_socket_path = cli_opts.stats_socket_path;
     pipeline_opts.queue_count       = std::max(1u, cli_opts.queue_count);
 

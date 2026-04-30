@@ -1547,6 +1547,11 @@ bool XdpReader::poll(const net::PacketHandler& handler, std::size_t budget) {
             net::PacketView packet{};
             if (net::PacketParser::decode(pkt, len, packet)) {
                 packet.timestamp_ns = now_ns();
+                // Publish the L2 frame so egress sinks that need to
+                // forward via the NIC (e.g. RawNicSink with SOCK_RAW)
+                // can replay the original Ethernet header.
+                packet.layer2_ptr = pkt;
+                packet.layer2_length = len;
                 handler(packet);
             } else {
                 ++rs.decode_failures;

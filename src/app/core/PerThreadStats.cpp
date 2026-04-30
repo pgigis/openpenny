@@ -29,6 +29,16 @@ static thread_local std::size_t g_counter_index = 0;
 // Static array holding counter objects, one per queue or thread.
 static PerThreadStats g_counters[kMaxCounters]{};
 
+// Dedicated per-worker aggregate-drop budget counters.
+//
+// Unlike the broader PerThreadStats struct, this storage is explicitly atomic
+// because it participates in the active-mode drop admission path.
+struct alignas(64) AggregateDropBudgetCounter {
+    std::atomic<std::uint64_t> drops{0};
+};
+
+static AggregateDropBudgetCounter g_drop_budget_counters[kMaxCounters]{};
+
 // Defines how many counter slots are currently active. Atomic to allow
 // safe updates when initialising systems with multiple queues.
 static std::atomic<std::size_t> g_counters_size{1};
@@ -49,7 +59,11 @@ static std::atomic<std::size_t> g_counters_size{1};
  */
 void init_thread_counters(std::size_t count) {
     const auto clamped = std::min(count, kMaxCounters);
-    
+
+    for (auto& counter : g_drop_budget_counters) {
+        counter.drops.store(0, std::memory_order_relaxed);
+    }
+
     // Ensure at least one counter slot is active.
     g_counters_size.store(
         clamped == 0 ? 1 : clamped,
@@ -74,6 +88,14 @@ void set_thread_counter_index(std::size_t idx) {
     }
 }
 
+std::size_t current_thread_counter_index() noexcept {
+    const auto size = g_counters_size.load(std::memory_order_relaxed);
+    if (g_counter_index >= size) {
+        g_counter_index = size - 1;
+    }
+    return g_counter_index;
+}
+
 /**
  * @brief Retrieve the PerThreadStats instance bound to the current thread.
  *
@@ -83,14 +105,7 @@ void set_thread_counter_index(std::size_t idx) {
  * @return PerThreadStats reference for this thread's counters.
  */
 PerThreadStats& current_thread_counters() {
-    const auto size = g_counters_size.load(std::memory_order_relaxed);
-    
-    if (g_counter_index >= size) {
-        // Thread index is stale, correct it to the final valid active counter.
-        g_counter_index = size - 1;
-    }
-
-    return g_counters[g_counter_index];
+    return g_counters[current_thread_counter_index()];
 }
 
 // -----------------------------------------------------------------------------
@@ -167,6 +182,40 @@ std::uint64_t aggregate_active_flows() {
     const auto size = g_counters_size.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < size; ++i) {
         total += g_counters[i].active_flows;
+    }
+    return total;
+}
+
+bool try_reserve_aggregate_drop(std::uint64_t max_total_drops) noexcept {
+    if (max_total_drops == 0) {
+        return true;
+    }
+
+    const auto size = g_counters_size.load(std::memory_order_relaxed);
+    if (g_counter_index >= size) {
+        g_counter_index = size - 1;
+    }
+
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < size; ++i) {
+        total += g_drop_budget_counters[i].drops.load(std::memory_order_relaxed);
+    }
+    if (total >= max_total_drops) {
+        return false;
+    }
+
+    g_drop_budget_counters[g_counter_index].drops.fetch_add(
+        1,
+        std::memory_order_relaxed
+    );
+    return true;
+}
+
+std::uint64_t aggregate_drop_budget_drops() noexcept {
+    std::uint64_t total = 0;
+    const auto size = g_counters_size.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < size; ++i) {
+        total += g_drop_budget_counters[i].drops.load(std::memory_order_relaxed);
     }
     return total;
 }

@@ -16,6 +16,10 @@
 
 #include "openpenny/egress/PacketSink.h"
 
+#include <atomic>
+#include <mutex>
+#include <vector>
+
 namespace openpenny::egress {
 
 class RawNicSink : public PacketSink {
@@ -30,9 +34,15 @@ public:
     EgressKind kind() const noexcept override { return EgressKind::RawNic; }
 
 private:
+    int open_socket_fd(bool resolve_ifindex, bool log_failures);
+    int thread_fd();
+
     EgressConfig cfg_{};
     int fd_ = -1;
     int if_index_ = -1; ///< Cached ifindex for sendto(2).
+    std::mutex fds_mtx_;
+    std::vector<int> additional_fds_;
+    std::atomic<bool> backpressure_logged_{false};
 };
 
 } // namespace openpenny::egress

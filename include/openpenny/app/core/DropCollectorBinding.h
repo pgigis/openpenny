@@ -5,33 +5,23 @@
 #include "openpenny/app/core/OpenpennyPipelineDriver.h"
 #include "openpenny/agg/Stats.h"
 
-#include <mutex>
 #include <string>
-#include <unordered_map>
-
-namespace openpenny::penny {
-class FlowEngine;
-}
+#include <utility>
+#include <vector>
 
 namespace openpenny::app {
 
 /**
- * @brief Maintains FlowEngine -> DropCollector bindings and installs the
- * snapshot hook so drop events are mirrored into the shared collector.
+ * @brief Mirrors per-flow drop snapshots into the shared collector.
+ *
+ * New drops are inserted one at a time via upsert(). Snapshot state changes
+ * that affect a suffix of the per-flow snapshot vector (duplicate/rtx/expire)
+ * are mirrored via refresh_from() so the collector can rescan the already
+ * contiguous, append-only snapshot storage directly.
  */
 class DropCollectorBinding {
 public:
     static DropCollectorBinding& instance();
-
-    // Ensure the global timer snapshot hook is installed exactly once.
-    void ensure_snapshot_hook();
-
-    void bind(penny::FlowEngine* flow,
-              DropCollectorPtr collector,
-              const std::string& thread_name,
-              std::size_t shard_index);
-
-    void unbind(penny::FlowEngine* flow);
 
     void upsert(DropCollectorPtr collector,
                 const std::string& thread_name,
@@ -40,23 +30,23 @@ public:
                 penny::PacketDropId packet_id,
                 const penny::PacketDropSnapshot& snap);
 
-private:
-    struct BindingContext {
-        DropCollectorPtr collector;
-        std::string thread_name;
-        std::size_t shard_index{0};
-    };
+    void refresh_from(
+        DropCollectorPtr collector,
+        const std::string& thread_name,
+        std::size_t shard_index,
+        const FlowKey& key,
+        const std::vector<std::pair<penny::PacketDropId, penny::PacketDropSnapshot>>& snapshots,
+        std::size_t start_index);
 
+private:
     DropCollectorBinding() = default;
-    BindingContext lookup(penny::FlowEngine* flow) const;
-    void upsert_locked(const BindingContext& binding,
+
+    void upsert_locked(DropCollector& collector,
+                       DropCollector::Shard& shard,
+                       const std::string& thread_name,
                        const FlowKey& key,
                        penny::PacketDropId packet_id,
                        const penny::PacketDropSnapshot& snap);
-
-    mutable std::mutex mtx_;
-    std::once_flag hook_once_;
-    std::unordered_map<penny::FlowEngine*, BindingContext> bindings_;
 };
 
 } // namespace openpenny::app

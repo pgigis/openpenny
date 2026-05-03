@@ -205,6 +205,9 @@ PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts
     TCPLOG_INFO("[openpenny] traffic match: %s",
                 net::describe_traffic_match(opts_local.traffic_match).c_str());
 
+    // Number of queues to process traffic.
+    const unsigned qcount = std::max(1u, opts_local.queue_count);
+
     // Capture the runtime setup at worker start so observers can inspect it.
     set_runtime_setup(cfg,
                       opts_local,
@@ -219,8 +222,6 @@ PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts
     auto matcher = [&](const FlowKey& key) {
         return net::traffic_matches_flow(opts_local.traffic_match, key);
     };
-    // Number of queues to process traffic.
-    const unsigned qcount = std::max(1u, opts_local.queue_count);
 
     // ------------------------------------------------------------------
     // One-line startup summary at INFO. With many queues the per-worker
@@ -338,6 +339,7 @@ PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts
     aggregates_controller.join();
     const auto agg_counters_now = openpenny::app::aggregate_counters();
     bool individual_stop_hit = aggregates_controller.individual_stop_hit();
+    bool closed_loop_stop_hit = aggregates_controller.closed_loop_stop_hit();
     if (!individual_stop_hit &&
         cfg.active.stop_after_individual_flows > 0 &&
         opts_local.mode == PipelineOptions::Mode::Active &&
@@ -346,12 +348,18 @@ PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts
     }
     if (individual_stop_hit &&
         cfg.active.aggregates_enabled &&
-        runtime_setup_mutable().aggregates_status == RuntimeStatus::AggregatesStatus::PENDING &&
+        current_aggregates_status() == RuntimeStatus::AggregatesStatus::PENDING &&
         aggregates_controller.aggregates_ready()) {
-        runtime_setup_mutable().aggregates_status = RuntimeStatus::AggregatesStatus::DUPLICATES_EXCEEDED;
+        set_current_aggregates_status(RuntimeStatus::AggregatesStatus::NON_CLOSED_LOOP);
     }
     aggregates_controller.populate_drop_snapshots(summary);
     aggregates_controller.evaluate_pending_if_needed(cfg, summary);
+    if (!closed_loop_stop_hit &&
+        opts_local.mode == PipelineOptions::Mode::Active &&
+        cfg.active.min_closed_loop_flows > 0 &&
+        agg_counters_now.flows_closed_loop >= cfg.active.min_closed_loop_flows) {
+        closed_loop_stop_hit = true;
+    }
 
     // Fold per-thread results into a single aggregated ModeResult.
     ModeResult aggregate{};
@@ -385,12 +393,26 @@ PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts
                 r->passive_gap_summaries.begin(),
                 r->passive_gap_summaries.end());
         }
+        if (!r->closed_loop_flow_summaries.empty()) {
+            aggregate.closed_loop_flow_summaries.insert(
+                aggregate.closed_loop_flow_summaries.end(),
+                r->closed_loop_flow_summaries.begin(),
+                r->closed_loop_flow_summaries.end());
+        }
+        if (!r->duplicate_exceeded_flow_summaries.empty()) {
+            aggregate.duplicate_exceeded_flow_summaries.insert(
+                aggregate.duplicate_exceeded_flow_summaries.end(),
+                r->duplicate_exceeded_flow_summaries.begin(),
+                r->duplicate_exceeded_flow_summaries.end());
+        }
 
         // Completion flags are combined with logical OR.
         aggregate.penny_completed =
             aggregate.penny_completed || r->penny_completed;
         aggregate.aggregates_penny_completed =
             aggregate.aggregates_penny_completed || r->aggregates_penny_completed;
+        aggregate.closed_loop_stop_hit =
+            aggregate.closed_loop_stop_hit || r->closed_loop_stop_hit;
     }
     // Use aggregated counters to avoid undercounting packets processed.
     aggregate.packets_processed = std::max<std::size_t>(
@@ -398,16 +420,23 @@ PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts
         static_cast<std::size_t>(agg_counters_now.packets));
     if (aggregates_controller.collector_completed()) {
         const bool agg_done_status =
-            runtime_setup_mutable().aggregates_status != RuntimeStatus::AggregatesStatus::PENDING;
+            current_aggregates_status() != RuntimeStatus::AggregatesStatus::PENDING;
         aggregate.aggregates_penny_completed = agg_done_status;
         aggregate.penny_completed = agg_done_status;
     }
     if (individual_stop_hit) {
         aggregate.penny_completed = true;
     }
+    if (closed_loop_stop_hit) {
+        aggregate.closed_loop_stop_hit = true;
+    }
     if (auto snapshot = aggregates_controller.aggregates_snapshot()) {
         aggregate.aggregates_snapshot = snapshot;
     }
+    std::sort(aggregate.closed_loop_flow_summaries.begin(),
+              aggregate.closed_loop_flow_summaries.end());
+    std::sort(aggregate.duplicate_exceeded_flow_summaries.begin(),
+              aggregate.duplicate_exceeded_flow_summaries.end());
 
     // Only populate the summary if at least one worker reported results.
     if (any) {

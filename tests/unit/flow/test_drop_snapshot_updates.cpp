@@ -22,9 +22,10 @@
 //
 // Synchronization caveat:
 //   `FlowEngine::register_filled_gaps()` enqueues a Retransmit event on
-//   the global `ThreadFlowEventTimerManager`; the actual mutation happens
-//   on the timer thread. The test polls until the mutation is observed
-//   so we don't race against the background thread.
+//   the thread-local `ThreadFlowEventTimerManager`; the actual mutation
+//   is applied when the worker drains callbacks. The test polls and
+//   drives that drain explicitly so the assertions observe the updated
+//   snapshots deterministically.
 
 #include "openpenny/config/Config.h"
 #include "openpenny/penny/flow/engine/FlowEngine.h"
@@ -40,15 +41,16 @@ using namespace std::chrono;
 namespace {
 
 // Wait up to `timeout` for `predicate()` to become true. Used to
-// synchronise the test thread with the FlowEngine timer thread, which
-// processes Retransmit events asynchronously.
+// synchronise the test thread with the cooperative timer manager.
 template <class Predicate>
 bool wait_for(Predicate predicate, milliseconds timeout = milliseconds{2000}) {
     const auto deadline = steady_clock::now() + timeout;
     while (steady_clock::now() < deadline) {
+        openpenny::penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
         if (predicate()) return true;
         std::this_thread::sleep_for(milliseconds{5});
     }
+    openpenny::penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
     return predicate();
 }
 
@@ -63,11 +65,11 @@ int main() {
     // is deterministic regardless of the random number generator state.
     cfg.active.drop_probability = 1.0;
     // Long retransmission timeout. With `now = steady_clock::now()`, the
-    // deadline = `now + 60s` lies far in the future so the timer-manager
-    // background thread's expiry path never runs during this test —
-    // only the explicit `register_filled_gaps()` events do. (The test's
-    // assertions break if `mark_snapshot_expired` runs concurrently and
-    // decrements pending on entries we haven't filled yet.)
+    // deadline = `now + 60s` lies far in the future so the cooperative
+    // expiry path never runs during this test — only the explicit
+    // `register_filled_gaps()` events do. (The test's assertions break
+    // if `mark_snapshot_expired` also runs and decrements pending on
+    // entries we haven't filled yet.)
     cfg.active.rtt_timeout_factor = 60.0;
 
     openpenny::penny::FlowEngine flow(cfg.active);
@@ -120,7 +122,7 @@ int main() {
     // Phase 2: drop1 is retransmitted (gap filled by a later packet)
     // ----------------------------------------------------------------
     // register_filled_gaps() queues a Retransmit event on the timer
-    // manager. The timer thread picks it up and calls
+    // manager. drain_callbacks() then applies
     // mark_snapshot_retransmitted on this thread's FlowEngine, which:
     //   - decrements flow_stats_.pending_retransmissions by 1,
     //   - increments flow_stats_.retransmitted_packets by 1,
@@ -130,8 +132,7 @@ int main() {
     //     decrementing its frozen pending count.
     flow.register_filled_gaps(std::vector<openpenny::penny::PacketDropId>{drop1_id});
 
-    // Wait for the timer thread to process the event before asserting.
-    // Without this, the assertions race against the background thread.
+    // Drain the queued retransmit event before asserting.
     assert(wait_for([&] { return flow.retransmitted_packets() == 1; }));
 
     // Phase 2 verification: flow-wide counters

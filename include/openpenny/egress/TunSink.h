@@ -15,6 +15,7 @@
 
 #include "openpenny/egress/PacketSink.h"
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -54,6 +55,7 @@ private:
     /// the `thread_local` cache are lock-free after the first call.
     std::mutex fds_mtx_;
     std::vector<int> additional_fds_;
+    std::atomic<bool> backpressure_logged_{false};
 };
 
 } // namespace openpenny::egress

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <mutex>
 #include <thread>
@@ -30,6 +31,20 @@ namespace openpenny {
 
 namespace {
 thread_local ActiveTestPipelineRunner* tls_runner = nullptr;
+
+std::string format_closed_loop_flow_summary(const FlowKey& key,
+                                            const penny::FlowEngine& flow) {
+    std::ostringstream summary;
+    summary << flow_debug_details(key)
+            << " data=" << flow.data_packets()
+            << " dropped=" << flow.dropped_packets()
+            << " rtx=" << flow.retransmitted_packets()
+            << " non_rtx=" << flow.non_retransmitted_packets()
+            << " dup=" << flow.duplicate_packets()
+            << " in_order=" << flow.in_order_packets()
+            << " out_of_order=" << flow.out_of_order_packets();
+    return summary.str();
+}
 } // namespace
 
 // Constructs an active OpenPenny traffic processing pipeline runner.
@@ -53,7 +68,6 @@ ActiveTestPipelineRunner::ActiveTestPipelineRunner(
         std::chrono::duration<double>(cfg.active.flow_idle_timeout_seconds))} // Idle expiry window.
 {
     if (drop_collector_) {
-        app::DropCollectorBinding::instance().ensure_snapshot_hook();
         flow_manager_.set_drop_sink(
             [collector = drop_collector_,
              name = thread_name_,
@@ -68,6 +82,21 @@ ActiveTestPipelineRunner::ActiveTestPipelineRunner(
                 packet_id,
                 snapshot);
         });
+        flow_manager_.set_snapshot_refresh_sink(
+            [collector = drop_collector_,
+             name = thread_name_,
+             shard_index = drop_collector_shard_index_](
+                const FlowKey& key,
+                const std::vector<std::pair<penny::PacketDropId, penny::PacketDropSnapshot>>& snapshots,
+                std::size_t start_index) {
+                app::DropCollectorBinding::instance().refresh_from(
+                    collector,
+                    name,
+                    shard_index,
+                    key,
+                    snapshots,
+                    start_index);
+            });
     }
 }
 
@@ -178,7 +207,8 @@ void ActiveTestPipelineRunner::after_poll(
     if (idle_timeout_.count() > 0) {
         expire_idle_flows(now);
     }
-    sweep_expired_snapshots(now);
+    evaluate_individual_flows_if_enabled();
+    complete_resolved_terminal_flows();
     // Mirrors the post-loop drain in the legacy run() so deferred
     // expirations aren't stranded between iterations.
     penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
@@ -187,17 +217,23 @@ void ActiveTestPipelineRunner::after_poll(
 void ActiveTestPipelineRunner::on_closing() {
     // Flush any callbacks that arrived after the final poll iteration.
     penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
-    sweep_expired_snapshots(std::chrono::steady_clock::now());
+    evaluate_individual_flows_if_enabled();
+    complete_resolved_terminal_flows();
 }
 
 void ActiveTestPipelineRunner::finalize(ModeResult& result) {
-    // Expire any pending snapshots on remaining flows to ensure expirations are logged/applied.
+    // Resolve any pending snapshots on remaining flows without bypassing the
+    // configured retransmission timeout at shutdown.
     flow_manager_.for_each_flow([](const FlowKey&, penny::FlowEngineEntry& entry) {
-        entry.flow.expire_all_pending_snapshots();
+        entry.flow.resolve_pending_snapshots(std::chrono::steady_clock::now());
     });
+    evaluate_individual_flows_if_enabled();
+    complete_resolved_terminal_flows();
 
     result.packets_forwarded = total_pkts_forwarded_;
     result.forward_errors = total_forward_errors_;
+    result.closed_loop_flow_summaries = closed_loop_flow_summaries_;
+    result.duplicate_exceeded_flow_summaries = duplicate_exceeded_flow_summaries_;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,32 +245,105 @@ void ActiveTestPipelineRunner::expire_idle_flows(const std::chrono::steady_clock
     if (idle_timeout_.count() <= 0) return;
     auto expired = flow_manager_.collect_idle_flows(now, idle_timeout_);
     for (const auto& key : expired) {
-        if (auto* entry = flow_manager_.find(key)) {
-            app::DropCollectorBinding::instance().unbind(&entry->flow);
-        }
-        flow_manager_.complete_flow(key, "idle_timeout");
+        complete_flow_with_summary(key, "idle_timeout");
     }
 }
 
-void ActiveTestPipelineRunner::sweep_expired_snapshots(const std::chrono::steady_clock::time_point& now) {
-    // Expire packet drop snapshots using the configured retransmission timeout (seconds).
-    const auto retransmission_timeout = std::chrono::duration<double>(cfg_.active.rtt_timeout_factor);
-    if (retransmission_timeout.count() <= 0.0) return;
-    flow_manager_.for_each_flow([&](const FlowKey&, penny::FlowEngineEntry& entry) {
-        const auto& snaps = entry.flow.drop_snapshots();
-        for (const auto& pair : snaps) {
-            if (pair.second.state != penny::SnapshotState::Pending) continue;
-            if (now - pair.second.timestamp >= retransmission_timeout) {
-                if (TCPLOG_ENABLED(INFO)) {
-                    const auto packet_id_text = penny::format_packet_drop_id(pair.first);
-                    TCPLOG_INFO("[packet_expired] flow=%s packet_id=%s",
-                                flow_debug_details(entry.flow.flow_key()).c_str(),
-                                packet_id_text.c_str());
+bool ActiveTestPipelineRunner::individual_flow_evaluation_enabled() const {
+    const bool aggregate_phase_configured =
+        cfg_.active.aggregates_enabled &&
+        cfg_.active.max_drops_aggregates > 0;
+    if (!aggregate_phase_configured) {
+        return true;
+    }
+    const auto status = current_aggregates_status();
+    return status == RuntimeStatus::AggregatesStatus::NON_CLOSED_LOOP ||
+           status == RuntimeStatus::AggregatesStatus::DUPLICATES_EXCEEDED;
+}
+
+void ActiveTestPipelineRunner::evaluate_individual_flows_if_enabled() {
+    if (!individual_flow_evaluation_enabled()) {
+        return;
+    }
+
+    flow_manager_.for_each_flow([&](const FlowKey& key, penny::FlowEngineEntry& entry) {
+        const bool immutable_terminal_state =
+            entry.state == penny::FlowTrackingState::INTERRUPTED_RST ||
+            entry.state == penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED ||
+            entry.state == penny::FlowTrackingState::INTERRUPTED_OUT_OF_ORDER_EXCEEDED ||
+            entry.state == penny::FlowTrackingState::FINISHED;
+
+        if (!immutable_terminal_state) {
+            if (flow_out_of_order_threshold_exceeded(entry.flow)) {
+                entry.state = penny::FlowTrackingState::INTERRUPTED_OUT_OF_ORDER_EXCEEDED;
+                if (TCPLOG_ENABLED(DEBUG)) {
+                    const auto flow_tag = flow_debug_details(key);
+                    TCPLOG_DEBUG("Out-of-order threshold exceeded %s", flow_tag.c_str());
                 }
-                entry.flow.mark_snapshot_expired(pair.first);
+                return;
+            }
+            if (flow_duplicate_threshold_exceeded(entry.flow)) {
+                entry.state = penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED;
+                if (TCPLOG_ENABLED(DEBUG)) {
+                    const auto flow_tag = flow_debug_details(key);
+                    TCPLOG_DEBUG("Duplicate threshold exceeded %s", flow_tag.c_str());
+                }
+                return;
             }
         }
+
+        if (entry.flow.final_decision() == penny::FlowEngine::FlowDecision::PENDING) {
+            entry.flow.evaluate_if_ready();
+        }
+
+        if (entry.state != penny::FlowTrackingState::CONNECTION_CLOSED_FIN &&
+            !immutable_terminal_state &&
+            entry.flow.final_decision() != penny::FlowEngine::FlowDecision::PENDING) {
+            entry.state = penny::FlowTrackingState::FINISHED;
+        }
     });
+}
+
+void ActiveTestPipelineRunner::complete_resolved_terminal_flows() {
+    std::vector<FlowKey> completed_keys;
+    const bool individual_eval_enabled = individual_flow_evaluation_enabled();
+    flow_manager_.for_each_flow([&](const FlowKey& key, penny::FlowEngineEntry& entry) {
+        const bool terminal_state =
+            entry.state == penny::FlowTrackingState::INTERRUPTED_RST ||
+            entry.state == penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED ||
+            entry.state == penny::FlowTrackingState::INTERRUPTED_OUT_OF_ORDER_EXCEEDED ||
+            entry.state == penny::FlowTrackingState::CONNECTION_CLOSED_FIN ||
+            entry.state == penny::FlowTrackingState::FINISHED;
+        if (!terminal_state) return;
+        if (!individual_eval_enabled &&
+            entry.flow.final_decision() == penny::FlowEngine::FlowDecision::PENDING) {
+            return;
+        }
+        if (entry.flow.pending_retransmissions() != 0) return;
+        completed_keys.push_back(key);
+    });
+
+    for (const auto& key : completed_keys) {
+        complete_flow_with_summary(key, "terminal_state");
+    }
+}
+
+void ActiveTestPipelineRunner::complete_flow_with_summary(const FlowKey& key, const char* reason) {
+    auto* existing = flow_manager_.find(key);
+    if (!existing) {
+        return;
+    }
+    existing->flow.resolve_pending_snapshots(std::chrono::steady_clock::now());
+    const auto final_decision = existing->flow.final_decision();
+    const auto summary = format_closed_loop_flow_summary(key, existing->flow);
+    if (final_decision == penny::FlowEngine::FlowDecision::FINISHED_CLOSED_LOOP) {
+        closed_loop_flow_summaries_.push_back(summary);
+    }
+    if (existing->state == penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED ||
+        final_decision == penny::FlowEngine::FlowDecision::FINISHED_DUPLICATE_EXCEEDED) {
+        duplicate_exceeded_flow_summaries_.push_back(summary);
+    }
+    flow_manager_.complete_flow(key, reason);
 }
 
 void ActiveTestPipelineRunner::handle_packet(const net::PacketView& packet,
@@ -276,45 +385,37 @@ void ActiveTestPipelineRunner::handle_packet(const net::PacketView& packet,
 penny::FlowEngineEntry* ActiveTestPipelineRunner::admit_or_forward_flow(
     const net::PacketView& packet,
     const std::chrono::steady_clock::time_point& now) {
+    auto* flow_entry = flow_manager_.find(packet.flow);
 
     // Skip flows we've already monitored in the past.
-    if (flow_manager_.was_completed(packet.flow)) {
+    if (!flow_entry && flow_manager_.was_completed(packet.flow)) {
         forward_packet(packet);
         return nullptr;
     }
 
-    const auto monitor_state = flow_manager_.flow_state(packet.flow);
-    if (monitor_state == penny::FlowTrackingState::NOT_ACTIONABLE &&
-        flow_manager_.is_flow_monitoring_capacity_full()) {
+    if (!flow_entry && flow_manager_.is_flow_monitoring_capacity_full()) {
         // Flow is not tracked, and there are no spare monitoring slots.
         forward_packet(packet);
         return nullptr;
     }
 
-    if (monitor_state == penny::FlowTrackingState::INTERRUPTED_RST ||
-        monitor_state == penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED ||
-        monitor_state == penny::FlowTrackingState::INTERRUPTED_OUT_OF_ORDER_EXCEEDED ||
-        monitor_state == penny::FlowTrackingState::CONNECTION_CLOSED_FIN ||
-        monitor_state == penny::FlowTrackingState::FINISHED) {
-        // Mark flow as complete and free the monitoring slot.
-        if (auto* existing = flow_manager_.find(packet.flow)) {
-            app::DropCollectorBinding::instance().unbind(&existing->flow);
+    if (flow_entry &&
+        (flow_entry->state == penny::FlowTrackingState::INTERRUPTED_RST ||
+         flow_entry->state == penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED ||
+         flow_entry->state == penny::FlowTrackingState::INTERRUPTED_OUT_OF_ORDER_EXCEEDED ||
+         flow_entry->state == penny::FlowTrackingState::CONNECTION_CLOSED_FIN ||
+         flow_entry->state == penny::FlowTrackingState::FINISHED)) {
+        // Terminal flows with unresolved drops stay resident until the
+        // retransmission gap is filled or the timeout expires.
+        if (flow_entry->flow.pending_retransmissions() == 0) {
+            complete_flow_with_summary(packet.flow, "terminal_state");
         }
-        flow_manager_.complete_flow(packet.flow, "terminal_state");
         forward_packet(packet);
         return nullptr;
     }
 
-    // Check whether the packet belongs to one of the flows currently being monitored.
-    auto* flow_entry = flow_manager_.find(packet.flow);
-
     if (flow_entry) {
         const auto penny_flow_decision = flow_entry->flow.final_decision();
-        if (penny_flow_decision != penny::FlowEngine::FlowDecision::PENDING){
-            // From Penny perspective the test for the flow is done.
-
-
-        }
         const bool terminal_state =
         flow_entry->state == penny::FlowTrackingState::INTERRUPTED_RST ||
         flow_entry->state == penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED ||
@@ -324,35 +425,25 @@ penny::FlowEngineEntry* ActiveTestPipelineRunner::admit_or_forward_flow(
 
         if (!terminal_state && penny_flow_decision != penny::FlowEngine::FlowDecision::PENDING) {
             flow_entry->state = penny::FlowTrackingState::FINISHED;
-            app::DropCollectorBinding::instance().unbind(&flow_entry->flow);
-            flow_manager_.complete_flow(packet.flow, "penny_decision");
+            complete_flow_with_summary(packet.flow, "penny_decision");
             forward_packet(packet);
             return nullptr;
         }
     }
 
-    if (!flow_entry && !flow_manager_.is_flow_monitoring_capacity_full()) {
+    if (!flow_entry) {
         try {
             const bool is_syn = packet.tcp.flags_view().syn;
-            const bool inserted = flow_manager_.add_new_flow(
+            flow_entry = flow_manager_.add_new_flow(
                 packet.flow,
                 packet.tcp.seq,
                 static_cast<uint32_t>(packet.payload_bytes),
                 is_syn,
                 now);
-            if (inserted) {
-                if (drop_collector_) {
-                    if (auto* entry = flow_manager_.find(packet.flow)) {
-                        app::DropCollectorBinding::instance().bind(
-                            &entry->flow,
-                            drop_collector_,
-                            thread_name_,
-                            drop_collector_shard_index_);
-                    }
-                }
+            if (flow_entry) {
                 if (TCPLOG_ENABLED(INFO)) {
                     const auto flow_tag = flow_debug_details(packet.flow);
-                    TCPLOG_INFO("[monitor_start] %s flow=%s seq=%" PRIu32 " payload_bytes=%zu",
+                    TCPLOG_INFO("[flow_track] action=start trigger=%s flow=%s seq=%" PRIu32 " payload=%zu",
                         is_syn ? "syn" : "data",
                         flow_tag.c_str(),
                         packet.tcp.seq,
@@ -426,7 +517,7 @@ bool ActiveTestPipelineRunner::promote_pending_flow(
     return false;
 }
 
-// Fast-path check for RST that marks outstanding drop snapshots as expired.
+// Fast-path check for RST that marks outstanding drop snapshots as invalid.
 void ActiveTestPipelineRunner::handle_rst(penny::FlowEngineEntry& entry, const net::PacketView& packet) {
     if ((packet.tcp.flags & 0x04) == 0) return; // RST bit not set.
 
@@ -450,7 +541,8 @@ void ActiveTestPipelineRunner::handle_rst(penny::FlowEngineEntry& entry, const n
     entry.state = penny::FlowTrackingState::INTERRUPTED_RST;
 }
 
-// Fast-path check for FIN that marks outstanding drop snapshots as expired.
+// Fast-path check for FIN. A clean close means any still-missing dropped
+// payload was not retransmitted before teardown, so we resolve it immediately.
 void ActiveTestPipelineRunner::handle_fin(penny::FlowEngineEntry& entry, const net::PacketView& packet) {
     if ((packet.tcp.flags & 0x01) == 0) return; // FIN bit not set.
 
@@ -460,13 +552,12 @@ void ActiveTestPipelineRunner::handle_fin(penny::FlowEngineEntry& entry, const n
         for (const auto& snap_pair : snapshots) {
             const auto& snapshot = snap_pair.second;
 
-            // Skip snapshots already decided.
             if (snapshot.state != penny::SnapshotState::Pending ||
                 snapshot.stats.pending_retransmissions() == 0) {
                 continue;
             }
 
-            flow.mark_snapshot_invalid(snap_pair.first); // Treat pending gaps as invalid on close.
+            flow.mark_snapshot_expired(snap_pair.first);
             if (flow.pending_retransmissions() == 0) break;
         }
         penny::ThreadFlowEventTimerManager::instance().purge_flow(&flow);
@@ -525,7 +616,9 @@ void ActiveTestPipelineRunner::handle_data_packet(penny::FlowEngineEntry& entry,
                          end_seq,
                          entry.flow.highest_sequence());
         }
-        const bool ooo_exceeded = flow_out_of_order_threshold_exceeded(entry.flow);
+        const bool ooo_exceeded =
+            individual_flow_evaluation_enabled() &&
+            flow_out_of_order_threshold_exceeded(entry.flow);
         if (ooo_exceeded) {
             entry.state = penny::FlowTrackingState::INTERRUPTED_OUT_OF_ORDER_EXCEEDED;
             if (TCPLOG_ENABLED(DEBUG)) {
@@ -553,7 +646,9 @@ void ActiveTestPipelineRunner::handle_data_packet(penny::FlowEngineEntry& entry,
             penny::ThreadFlowEventTimerManager::instance().enqueue_duplicate(&entry.flow, start_seq, packet.payload_bytes);
             // Logging handled in timer callback.
 
-            const bool dup_exceeded = flow_duplicate_threshold_exceeded(entry.flow);
+            const bool dup_exceeded =
+                individual_flow_evaluation_enabled() &&
+                flow_duplicate_threshold_exceeded(entry.flow);
             if (dup_exceeded) {
                 entry.state = penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED;
                 if (TCPLOG_ENABLED(DEBUG)) {
@@ -576,7 +671,9 @@ void ActiveTestPipelineRunner::handle_data_packet(penny::FlowEngineEntry& entry,
             penny::ThreadFlowEventTimerManager::instance().enqueue_duplicate(&entry.flow, start_seq, packet.payload_bytes);
             // Logging handled in timer callback.
 
-            const bool dup_exceeded = flow_duplicate_threshold_exceeded(entry.flow);
+            const bool dup_exceeded =
+                individual_flow_evaluation_enabled() &&
+                flow_duplicate_threshold_exceeded(entry.flow);
             if (dup_exceeded) {
                 entry.state = penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED;
                 if (TCPLOG_ENABLED(DEBUG)) {

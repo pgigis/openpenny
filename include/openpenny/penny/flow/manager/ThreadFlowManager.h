@@ -124,17 +124,19 @@ public:
      * @param is_syn        True if the first packet carried a SYN flag.
      * @param ts            Timestamp of the first packet (for data timing).
      *
-     * @return true if a new flow entry was inserted, false if the flow already existed
-     *         or had been monitored before.
+     * @return pointer to the new flow entry when inserted, nullptr otherwise.
      */
-    bool add_new_flow(const FlowKey& key,
-                      uint32_t seq,
-                      uint32_t payload_bytes,
-                      bool is_syn,
-                      const std::chrono::steady_clock::time_point& ts);
+    FlowEngineEntry* add_new_flow(const FlowKey& key,
+                                  uint32_t seq,
+                                  uint32_t payload_bytes,
+                                  bool is_syn,
+                                  const std::chrono::steady_clock::time_point& ts);
 
     /// Install a sink that receives drop snapshots from all managed FlowEngines.
     void set_drop_sink(FlowEngine::DropSnapshotSink sink);
+
+    /// Install a sink that mirrors in-place snapshot updates from managed FlowEngines.
+    void set_snapshot_refresh_sink(FlowEngine::SnapshotRefreshSink sink);
 
     /**
      * @brief Update or create the FlowEngine entry corresponding to a packet.
@@ -286,6 +288,7 @@ private:
     FlowSet table_completed_flows_;
 
     FlowEngine::DropSnapshotSink drop_sink_{};
+    FlowEngine::SnapshotRefreshSink snapshot_refresh_sink_{};
 };
 
 } // namespace openpenny::penny

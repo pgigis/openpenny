@@ -142,9 +142,9 @@ public:
      * @brief Emit a parsed packet. Must be thread-safe.
      *
      * Returns true on a successful write, false on any error. Transient
-     * EAGAIN/EWOULDBLOCK are counted as errors==0 (pipeline drops the
-     * packet) because the pipeline is not responsible for reliable
-     * delivery -- it's a passive mirror.
+     * EAGAIN/EWOULDBLOCK still mean the packet was dropped; sinks may count
+     * those in stats_.errors as backpressure-induced loss so operators can
+     * distinguish real reinjection congestion from intentional Penny drops.
      */
     virtual bool write(const net::PacketView& packet) = 0;
 

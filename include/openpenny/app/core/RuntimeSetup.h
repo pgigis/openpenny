@@ -18,4 +18,13 @@ const RuntimeSetupSnapshot& current_runtime_setup();
 // Mutable view for helpers that need to update status fields.
 RuntimeSetupSnapshot& runtime_setup_mutable();
 
+bool current_aggregates_active() noexcept;
+void set_current_aggregates_active(bool value) noexcept;
+
+RuntimeStatus::AggregatesStatus current_aggregates_status() noexcept;
+void set_current_aggregates_status(RuntimeStatus::AggregatesStatus status) noexcept;
+
+bool current_has_aggregate_eval() noexcept;
+void set_current_has_aggregate_eval(bool value) noexcept;
+
 } // namespace openpenny

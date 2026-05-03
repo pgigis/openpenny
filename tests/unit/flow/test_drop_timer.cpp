@@ -4,6 +4,7 @@
 #include "openpenny/penny/flow/timer/ThreadFlowEventTimer.h"
 #include "openpenny/penny/flow/state/PennySnapshot.h"
 #include "openpenny/penny/flow/engine/FlowEngine.h"
+#include "openpenny/app/core/PerThreadStats.h"
 #include "openpenny/net/Packet.h"
 
 #include <cassert>
@@ -82,6 +83,40 @@ int main() {
         assert(flow.pending_retransmissions() == 0);
         assert(flow.retransmitted_packets() == 1);
         assert(flow.non_retransmitted_packets() == 0);
+    }
+
+    // Timer callbacks must publish into the same per-thread counter shard as the
+    // worker that owns the flow; otherwise multi-queue aggregate pending_rtx can
+    // stay stuck forever.
+    openpenny::penny::ThreadFlowEventTimerManager::instance().stop();
+    openpenny::app::init_thread_counters(2);
+    openpenny::app::set_thread_counter_index(1);
+    {
+        openpenny::Config cfg;
+        cfg.active.drop_probability = 1.0;
+        cfg.active.rtt_timeout_factor = 0.05;
+
+        openpenny::penny::FlowEngine flow(cfg.active);
+        openpenny::FlowKey key{};
+        const auto now = std::chrono::steady_clock::now();
+        const auto packet_id = openpenny::penny::make_packet_drop_id(3000, 100);
+
+        flow.record_data(3000, now);
+        const bool dropped = flow.drop_packet(3000, 3100, packet_id, key, now);
+        assert(dropped);
+        assert(openpenny::app::aggregate_counters().pending_retransmissions == 1);
+
+        sleep_for_ms(80);
+        openpenny::penny::ThreadFlowEventTimerManager::instance().drain_callbacks();
+
+        const auto counters = openpenny::app::thread_counters();
+        assert(counters.size() >= 2);
+        assert(counters[0].pending_retransmissions == 0);
+        assert(counters[0].non_retransmitted_packets == 0);
+        assert(counters[1].pending_retransmissions == 0);
+        assert(counters[1].non_retransmitted_packets == 1);
+        assert(openpenny::app::aggregate_counters().pending_retransmissions == 0);
+        assert(openpenny::app::aggregate_counters().non_retransmitted_packets == 1);
     }
 
     // Clean shutdown for other tests.

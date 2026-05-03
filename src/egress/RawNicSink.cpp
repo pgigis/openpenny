@@ -33,10 +33,12 @@ RawNicSink::~RawNicSink() {
     close();
 }
 
-bool RawNicSink::open() {
+int RawNicSink::open_socket_fd(bool resolve_ifindex, bool log_failures) {
     if (cfg_.device.empty()) {
-        TCPLOG_ERROR("RawNicSink: device name is required%s", "");
-        return false;
+        if (log_failures) {
+            TCPLOG_ERROR("RawNicSink: device name is required%s", "");
+        }
+        return -1;
     }
 
     // SOCK_RAW (not SOCK_DGRAM): we want to forward the original frame
@@ -47,52 +49,67 @@ bool RawNicSink::open() {
     // destination. SOCK_RAW preserves the original L2 verbatim.
     //
     // ETH_P_ALL on the protocol so we can write any frame type.
-    fd_ = ::socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_ALL));
-    if (fd_ < 0) {
-        TCPLOG_ERROR("RawNicSink: socket(AF_PACKET, SOCK_RAW) failed: %s (need CAP_NET_RAW)",
-                     std::strerror(errno));
-        return false;
+    int fd = ::socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_ALL));
+    if (fd < 0) {
+        if (log_failures) {
+            TCPLOG_ERROR("RawNicSink: socket(AF_PACKET, SOCK_RAW) failed: %s (need CAP_NET_RAW)",
+                         std::strerror(errno));
+        }
+        return -1;
     }
 
-    // Resolve ifindex once so the hot path doesn't need another syscall.
-    ifreq ifr{};
-    std::strncpy(ifr.ifr_name, cfg_.device.c_str(), IFNAMSIZ - 1);
-    if (::ioctl(fd_, SIOCGIFINDEX, &ifr) != 0) {
-        const int saved = errno;
-        TCPLOG_ERROR("RawNicSink: SIOCGIFINDEX('%s') failed: %s",
-                     cfg_.device.c_str(), std::strerror(saved));
-        ::close(fd_);
-        fd_ = -1;
-        errno = saved;
-        return false;
+    if (resolve_ifindex || if_index_ <= 0) {
+        ifreq ifr{};
+        std::strncpy(ifr.ifr_name, cfg_.device.c_str(), IFNAMSIZ - 1);
+        if (::ioctl(fd, SIOCGIFINDEX, &ifr) != 0) {
+            const int saved = errno;
+            if (log_failures) {
+                TCPLOG_ERROR("RawNicSink: SIOCGIFINDEX('%s') failed: %s",
+                             cfg_.device.c_str(), std::strerror(saved));
+            }
+            ::close(fd);
+            errno = saved;
+            return -1;
+        }
+        if_index_ = ifr.ifr_ifindex;
     }
-    if_index_ = ifr.ifr_ifindex;
 
-    // Bind to the interface so sendto(2) without a sockaddr works too, and
-    // so the kernel drops incoming frames targeted at other ifaces.
     sockaddr_ll addr{};
     addr.sll_family = AF_PACKET;
     addr.sll_protocol = htons(ETH_P_ALL);
     addr.sll_ifindex = if_index_;
-    if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         const int saved = errno;
-        TCPLOG_ERROR("RawNicSink: bind to '%s' (ifindex=%d) failed: %s",
-                     cfg_.device.c_str(), if_index_, std::strerror(saved));
-        ::close(fd_);
-        fd_ = -1;
-        if_index_ = -1;
+        if (log_failures) {
+            TCPLOG_ERROR("RawNicSink: bind to '%s' (ifindex=%d) failed: %s",
+                         cfg_.device.c_str(), if_index_, std::strerror(saved));
+        }
+        ::close(fd);
         errno = saved;
-        return false;
+        return -1;
     }
 
     if (cfg_.raw_nic_bind_device) {
-        // Redundant with the bind() above on modern kernels, but harmless,
-        // and it mirrors the IPPROTO_RAW path for consistency.
-        if (::setsockopt(fd_, SOL_SOCKET, SO_BINDTODEVICE,
+        if (::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE,
                          cfg_.device.c_str(), cfg_.device.size()) != 0) {
             TCPLOG_WARN("RawNicSink: SO_BINDTODEVICE('%s') failed: %s",
                         cfg_.device.c_str(), std::strerror(errno));
         }
+    }
+
+    int sndbuf = 16 * 1024 * 1024;
+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) != 0) {
+        TCPLOG_WARN("RawNicSink: SO_SNDBUF(%d) failed: %s",
+                    sndbuf, std::strerror(errno));
+    }
+
+    return fd;
+}
+
+bool RawNicSink::open() {
+    fd_ = open_socket_fd(true, true);
+    if (fd_ < 0) {
+        return false;
     }
 
     TCPLOG_INFO("RawNicSink: opened (fd=%d, device='%s', ifindex=%d)",
@@ -101,6 +118,16 @@ bool RawNicSink::open() {
 }
 
 void RawNicSink::close() noexcept {
+    std::vector<int> to_close;
+    {
+        std::lock_guard<std::mutex> lock(fds_mtx_);
+        to_close.swap(additional_fds_);
+    }
+    for (int fd : to_close) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+    }
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
@@ -108,8 +135,37 @@ void RawNicSink::close() noexcept {
     if_index_ = -1;
 }
 
+int RawNicSink::thread_fd() {
+    thread_local int t_fd = -1;
+    thread_local const RawNicSink* t_owner = nullptr;
+    if (t_owner == this && t_fd >= 0) {
+        return t_fd;
+    }
+    if (fd_ < 0 || if_index_ <= 0) {
+        t_owner = this;
+        t_fd = -1;
+        return t_fd;
+    }
+
+    int fd = open_socket_fd(false, false);
+    if (fd < 0) {
+        t_owner = this;
+        t_fd = fd_;
+        return t_fd;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(fds_mtx_);
+        additional_fds_.push_back(fd);
+    }
+    t_owner = this;
+    t_fd = fd;
+    return t_fd;
+}
+
 bool RawNicSink::write(const net::PacketView& packet) {
-    if (fd_ < 0) {
+    const int fd = thread_fd();
+    if (fd < 0) {
         return false;
     }
 
@@ -147,7 +203,7 @@ bool RawNicSink::write(const net::PacketView& packet) {
     dst.sll_protocol = htons(ETH_P_ALL);
     dst.sll_ifindex = if_index_;
 
-    const ssize_t written = ::sendto(fd_,
+    const ssize_t written = ::sendto(fd,
                                      buf,
                                      static_cast<size_t>(len),
                                      0,
@@ -158,12 +214,21 @@ bool RawNicSink::write(const net::PacketView& packet) {
         return true;
     }
     const int err = errno;
-    if (err != EAGAIN && err != EWOULDBLOCK) {
-        TCPLOG_WARN("RawNicSink::write (%u bytes) failed on fd=%d (device='%s'): %s",
-                    static_cast<unsigned>(len), fd_,
-                    cfg_.device.c_str(), std::strerror(err));
+    if (err == EAGAIN || err == EWOULDBLOCK) {
         stats_.errors.fetch_add(1, std::memory_order_relaxed);
+        if (!backpressure_logged_.exchange(true, std::memory_order_relaxed)) {
+            TCPLOG_WARN(
+                "RawNicSink: TX backpressure on fd=%d (EAGAIN/EWOULDBLOCK); "
+                "dropping packets. This can induce real TCP retransmissions at "
+                "high rates because OpenPenny does not keep a copy-backed TX queue.",
+                fd);
+        }
+        return false;
     }
+    TCPLOG_WARN("RawNicSink::write (%u bytes) failed on fd=%d (device='%s'): %s",
+                static_cast<unsigned>(len), fd,
+                cfg_.device.c_str(), std::strerror(err));
+    stats_.errors.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 

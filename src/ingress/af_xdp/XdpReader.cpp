@@ -53,7 +53,9 @@ static uint64_t now_ns() {
 
 struct SharedAttachState {
     std::mutex mutex;
-    unsigned refs{0};
+    unsigned refs{0};         ///< Workers currently opening or opened on this shared attach state.
+    unsigned ready_workers{0}; ///< Workers that finished AF_XDP socket bring-up and published xsks_map.
+    bool shared_resources_ready{false}; ///< Shared BPF maps / program are prepared for sibling workers.
     bool rss_checked{false};   ///< Only the first-opening worker runs the RSS coverage check.
 #ifdef OPENPENNY_WITH_LIBBPF
     bool attached{false};
@@ -511,10 +513,11 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
         return false;
     }
 
-    // Serialise the per-interface attach / map-pin dance across worker
-    // threads so two queue workers on the same NIC can't race when creating
-    // or pinning the shared BPF objects.
-    std::lock_guard<std::mutex> shared_lock(impl.shared_attach->mutex);
+    // Serialise only the shared BPF attach / map-pin phase across queue
+    // workers. The expensive per-queue socket bring-up runs after this and is
+    // intentionally parallel.
+    std::unique_lock<std::mutex> shared_lock(impl.shared_attach->mutex);
+    bool shared_ref_acquired = false;
 
     if (impl.tuning.verbose) {
         TCPLOG_INFO("Attempting AF_XDP reader on %s queue %u", ifname.c_str(), queue);
@@ -557,6 +560,37 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
         }
         rs.attached = false;
         rs.ready    = false;
+    };
+
+    auto release_shared_startup_ref = [&]() {
+        if (!shared_ref_acquired || !impl.shared_attach) {
+            return;
+        }
+        bool release_state = false;
+        {
+            std::lock_guard<std::mutex> lock(impl.shared_attach->mutex);
+            if (impl.shared_attach->refs > 0) {
+                --impl.shared_attach->refs;
+            }
+            if (impl.shared_attach->refs == 0) {
+                if (impl.shared_attach->attached && impl.tuning.detach_on_close) {
+                    bpf_xdp_detach(impl.shared_attach->ifindex,
+                                   impl.shared_attach->xdp_flags,
+                                   nullptr);
+                }
+                impl.shared_attach->attached = false;
+                impl.shared_attach->ifindex = 0;
+                impl.shared_attach->xdp_flags = 0;
+                impl.shared_attach->ready_workers = 0;
+                impl.shared_attach->shared_resources_ready = false;
+                impl.shared_attach->rss_checked = false;
+                release_state = true;
+            }
+        }
+        shared_ref_acquired = false;
+        if (release_state) {
+            release_shared_attach_state(impl.shared_attach_key, impl.shared_attach);
+        }
     };
 
     // Populate rs.*_fd from a freshly loaded bpf_object.
@@ -928,12 +962,12 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
     //   c) Otherwise, load the object fresh and (optionally) pin the maps
     //      so sibling workers can find them.
 
-    const bool shared_reader_already_open = impl.shared_attach->refs > 0;
+    const bool shared_resources_ready = impl.shared_attach->shared_resources_ready;
     bool pins_ok = false;
-    if (shared_reader_already_open && open_maps_from_pins()) {
-        pins_ok = true;
-        rs.pinned_maps = true;
+    bool need_open_maps_from_pins_after_unlock = false;
+    if (shared_resources_ready) {
         rs.xdp_flags = impl.shared_attach->xdp_flags;
+        need_open_maps_from_pins_after_unlock = true;
     } else if (impl.tuning.reuse_pins && open_maps_from_pins()) {
         bool stale_pins = false;
         bpf_map_info conf_info{};
@@ -988,11 +1022,6 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
             pins_ok = true;
             rs.pinned_maps = true;
         }
-    } else if (shared_reader_already_open) {
-        TCPLOG_ERROR("Pinned AF_XDP maps are not available for shared queue startup on %s.",
-                     ifname.c_str());
-        cleanup();
-        return false;
     }
 
     if (!pins_ok) {
@@ -1037,7 +1066,7 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
     // match rules are deferred to the LAST worker (see Step 6 below) so
     // every queue's xsks_map[N] entry is in place before redirects begin.
     const bool should_publish_pass_defaults =
-        impl.tuning.update_conf_map && !shared_reader_already_open;
+        impl.tuning.update_conf_map && !shared_resources_ready;
     if (should_publish_pass_defaults &&
         !xdp::program_xdp_pass_defaults(
             xdp::XdpRuleMapFds{rs.conf_fd, rs.settings_fd},

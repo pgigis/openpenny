@@ -60,6 +60,9 @@ static std::atomic<std::size_t> g_counters_size{1};
 void init_thread_counters(std::size_t count) {
     const auto clamped = std::min(count, kMaxCounters);
 
+    for (auto& counter : g_counters) {
+        counter = {};
+    }
     for (auto& counter : g_drop_budget_counters) {
         counter.drops.store(0, std::memory_order_relaxed);
     }

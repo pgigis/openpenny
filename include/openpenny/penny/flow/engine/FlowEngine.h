@@ -44,6 +44,10 @@ public:
     using DropSnapshotSink = std::function<void(const FlowKey&,
                                                 PacketDropId,
                                                 const PacketDropSnapshot&)>;
+    using SnapshotRefreshSink = std::function<void(
+        const FlowKey&,
+        const std::vector<std::pair<PacketDropId, PacketDropSnapshot>>&,
+        std::size_t start_index)>;
 
     /// High-level decision / outcome for this flow.
     enum class FlowDecision {
@@ -186,6 +190,9 @@ public:
 
     /// Install a sink to receive drop snapshots as they are created.
     void set_drop_sink(DropSnapshotSink sink);
+
+    /// Install a sink to mirror in-place snapshot updates from a given suffix onward.
+    void set_snapshot_refresh_sink(SnapshotRefreshSink sink);
 
     // ---------------------------------------------------------------------
     // Sequence interval classification
@@ -335,12 +342,21 @@ public:
     /// Mark all pending snapshots as expired (used on shutdown/cleanup).
     void expire_all_pending_snapshots();
 
+    /// Resolve pending snapshots at teardown using the configured timeout.
+    void resolve_pending_snapshots(const std::chrono::steady_clock::time_point& now);
+
 private:
     /**
      * @brief Compute the final classification decision for this flow based on
      *        its current statistics and hypothesis probabilities.
      */
     FlowDecision evaluate() const;
+
+    /// Mirror snapshot updates affecting [start_index, end) to any external collector.
+    void publish_snapshot_refresh(std::size_t start_index);
+
+    /// Publish a single-snapshot update when no bulk refresh sink is installed.
+    void publish_single_snapshot_update(PacketDropId packet_id, std::size_t snapshot_index);
 
     // ---------------------------------------------------------------------
     // Internal gap bookkeeping structures
@@ -383,6 +399,7 @@ private:
     /// Mapping from snapshot packet_id to its index in flow_drop_snapshots_.
     std::unordered_map<PacketDropId, size_t> flow_snapshot_index_by_id_;
     DropSnapshotSink drop_sink_{};
+    SnapshotRefreshSink snapshot_refresh_sink_{};
 
     /**
      * @brief Shared liveness flag observed by timer entries.

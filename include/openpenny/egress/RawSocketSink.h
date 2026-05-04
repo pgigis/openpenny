@@ -15,6 +15,8 @@
 #include "openpenny/egress/PacketSink.h"
 
 #include <atomic>
+#include <mutex>
+#include <vector>
 
 namespace openpenny::egress {
 
@@ -30,8 +32,14 @@ public:
     EgressKind kind() const noexcept override { return EgressKind::RawSocket; }
 
 private:
+    int open_socket_fd(bool log_failures);
+    int thread_fd();
+
     EgressConfig cfg_{};
     int fd_ = -1;
+    std::mutex fds_mtx_;
+    std::vector<int> additional_fds_;
+    std::atomic<bool> backpressure_logged_{false};
     /// Latched once we have logged the first EMSGSIZE failure. The kernel
     /// returns EMSGSIZE for any IP datagram larger than the egress
     /// interface MTU (raw sockets cannot fragment), and on a busy

@@ -4,6 +4,7 @@
 #include "openpenny/penny/flow/engine/FlowEvaluation.h"
 #include "openpenny/app/core/OpenpennyPipelineDriver.h"
 #include "openpenny/app/core/PerThreadStats.h"
+#include "openpenny/app/core/RuntimeSetup.h"
 #include "openpenny/log/Log.h"
 #include "openpenny/app/core/utils/FlowDebug.h"
 
@@ -31,6 +32,35 @@ void FlowEngine::configure(const Config::ActiveConfig& cfg) {
 
 void FlowEngine::set_drop_sink(DropSnapshotSink sink) {
     drop_sink_ = std::move(sink);
+}
+
+void FlowEngine::set_snapshot_refresh_sink(SnapshotRefreshSink sink) {
+    snapshot_refresh_sink_ = std::move(sink);
+}
+
+void FlowEngine::publish_snapshot_refresh(std::size_t start_index) {
+    if (!snapshot_refresh_sink_) {
+        return;
+    }
+    if (start_index >= flow_drop_snapshots_.size()) {
+        return;
+    }
+    snapshot_refresh_sink_(flow_key_, flow_drop_snapshots_, start_index);
+}
+
+void FlowEngine::publish_single_snapshot_update(PacketDropId packet_id,
+                                                std::size_t snapshot_index) {
+    if (snapshot_refresh_sink_) {
+        publish_snapshot_refresh(snapshot_index);
+        return;
+    }
+    if (!drop_sink_) {
+        return;
+    }
+    if (snapshot_index >= flow_drop_snapshots_.size()) {
+        return;
+    }
+    drop_sink_(flow_key_, packet_id, flow_drop_snapshots_[snapshot_index].second);
 }
 
 void FlowEngine::reset() {
@@ -215,14 +245,19 @@ void FlowEngine::register_duplicate_snapshot(uint32_t seq) {
     // Snanpshots are ordered by insertion; once we find the first snapshot whose coverage
     // includes this seq (highest_seq >= seq), all later snapshots should reflect the duplicate.
     bool update = false;
+    std::size_t first_updated_index = flow_drop_snapshots_.size();
     for (size_t i = 0; i < flow_drop_snapshots_.size(); ++i) {
         auto& snap = flow_drop_snapshots_[i].second;
         if (!update && snap.stats.highest_seq() >= seq) {
             update = true;
+            first_updated_index = i;
         }
         if (update) {
             snap.stats.record_duplicate_packet();
         }
+    }
+    if (update) {
+        publish_snapshot_refresh(first_updated_index);
     }
 }
 
@@ -273,8 +308,7 @@ bool FlowEngine::drop_packet(uint32_t start,
     }
 
     if (max_drops_in_aggregates > 0) {
-        const auto& runtime = openpenny::current_runtime_setup();
-        if (runtime.aggregates_active &&
+        if (openpenny::current_aggregates_active() &&
             !openpenny::app::try_reserve_aggregate_drop(max_drops_in_aggregates)) {
             // Best-effort global drop budget has been exhausted. The atomic
             // per-worker counters may still allow a small overshoot under
@@ -319,7 +353,8 @@ bool FlowEngine::drop_packet(uint32_t start,
     const size_t snapshot_index = flow_drop_snapshots_.size() - 1;
     flow_snapshot_index_by_id_[packet_id] = snapshot_index;
     
-    // Timer thread will later emit a callback (via ThreadFlowEventTimerManager) that we apply on this thread.
+    // The owning worker thread will later drain this scheduled timeout/event
+    // via ThreadFlowEventTimerManager and apply the callback inline.
     ThreadFlowEventTimerManager::instance().register_drop(key, packet_id, snap.timestamp, flow_alive_flag_, this, snapshot_index);
     
     // Register the gap in the SEQ space.
@@ -328,7 +363,7 @@ bool FlowEngine::drop_packet(uint32_t start,
     if (TCPLOG_ENABLED(INFO)) {
         const auto flow_tag = ::openpenny::flow_debug_details(key);
         TCPLOG_INFO(
-            "[drop] flow=%s seq_range=%" PRIu32 "-%" PRIu32 " (len=%" PRIu32 ")",
+            "[drop_event] action=drop flow=%s start_seq=%" PRIu32 " end_seq=%" PRIu32 " len=%" PRIu32,
             flow_tag.c_str(),
             start,
             end,
@@ -406,6 +441,8 @@ void FlowEngine::mark_snapshot_retransmitted(PacketDropId packet_id) {
 
     // Remove the packet → snapshot mapping; the snapshot is resolved.
     flow_snapshot_index_by_id_.erase(index_it);
+
+    publish_single_snapshot_update(packet_id, idx);
 }
 
 /**
@@ -481,9 +518,7 @@ void FlowEngine::mark_snapshot_expired(PacketDropId packet_id) {
     // We no longer need to look up this snapshot by packet ID.
     flow_snapshot_index_by_id_.erase(index_it);
 
-    if (drop_sink_) {
-        drop_sink_(flow_key_, packet_id, snapshot);
-    }
+    publish_single_snapshot_update(packet_id, idx);
 }
 
 /**
@@ -531,6 +566,8 @@ void FlowEngine::mark_snapshot_invalid(PacketDropId packet_id) {
 
     // Adjust flow-wide pending retransmission statistics.
     flow_stats_.dec_pending_retransmission();
+    auto& counters = openpenny::app::current_thread_counters();
+    if (counters.pending_retransmissions > 0) counters.pending_retransmissions--;
 
     // Ensure snapshots recorded after this one remain statistically consistent.
     // They may still include this packet as pending, so remove that dependency.
@@ -545,6 +582,8 @@ void FlowEngine::mark_snapshot_invalid(PacketDropId packet_id) {
 
     // Remove the packet → snapshot index mapping; this snapshot is now resolved.
     flow_snapshot_index_by_id_.erase(index_it);
+
+    publish_single_snapshot_update(packet_id, idx);
 }
 
 void FlowEngine::expire_all_pending_snapshots() {
@@ -557,6 +596,33 @@ void FlowEngine::expire_all_pending_snapshots() {
     }
     for (const auto& id : pending_ids) {
         mark_snapshot_expired(id);
+    }
+}
+
+void FlowEngine::resolve_pending_snapshots(const std::chrono::steady_clock::time_point& now) {
+    std::vector<PacketDropId> expired_ids;
+    std::vector<PacketDropId> invalid_ids;
+    expired_ids.reserve(flow_drop_snapshots_.size());
+    invalid_ids.reserve(flow_drop_snapshots_.size());
+
+    const bool timeout_enabled = flow_cfg_.rtt_timeout_factor > 0.0;
+    const auto timeout = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(flow_cfg_.rtt_timeout_factor));
+
+    for (const auto& pair : flow_drop_snapshots_) {
+        if (pair.second.state != SnapshotState::Pending) continue;
+        if (timeout_enabled && now - pair.second.timestamp >= timeout) {
+            expired_ids.push_back(pair.first);
+        } else {
+            invalid_ids.push_back(pair.first);
+        }
+    }
+
+    for (const auto& id : expired_ids) {
+        mark_snapshot_expired(id);
+    }
+    for (const auto& id : invalid_ids) {
+        mark_snapshot_invalid(id);
     }
 }
 
@@ -575,11 +641,27 @@ FlowEngine::FlowDecision FlowEngine::evaluate() const {
         const double miss_prob = std::clamp(flow_cfg_.retransmission_miss_probability, 0.0, 1.0);
 
         const auto flow_tag = flow_debug_details(flow_key_);
+        const auto* verdict_text = [&]() -> const char* {
+            switch (eval.decision) {
+                case FlowDecision::FINISHED_CLOSED_LOOP:
+                    return "closed_loop";
+                case FlowDecision::FINISHED_NOT_CLOSED_LOOP:
+                    return "not_closed_loop";
+                case FlowDecision::FINISHED_DUPLICATE_EXCEEDED:
+                    return "duplicates_exceeded";
+                case FlowDecision::FINISHED_NO_DECISION:
+                    return "no_decision";
+                case FlowDecision::PENDING:
+                default:
+                    return "pending";
+            }
+        }();
 
         TCPLOG_INFO(
-            "[flow_eval] flow=%s data_pkts=%llu dup_pkts=%llu rtx_pkts=%llu non_rtx_pkts=%llu "
-            "dup_ratio=%.6f miss_prob=%.6f p_closed=%.6f p_not_closed=%.6f denom=%.6f closed_weight=%.6f",
+            "[flow_eval] flow=%s verdict=%s data=%llu dup=%llu rtx=%llu non_rtx=%llu "
+            "dup_ratio=%.6f miss_prob=%.6f p_closed=%.6f p_not_closed=%.6f closed_weight=%.6f",
             flow_tag.c_str(),
+            verdict_text,
             static_cast<unsigned long long>(data_pkts),
             static_cast<unsigned long long>(dup_pkts),
             static_cast<unsigned long long>(retransmitted),
@@ -588,7 +670,6 @@ FlowEngine::FlowDecision FlowEngine::evaluate() const {
             miss_prob,
             eval.p_closed,
             eval.p_not_closed,
-            eval.p_closed + eval.p_not_closed,
             eval.closed_weight);
     }
 
@@ -609,6 +690,16 @@ FlowEngine::FlowDecision FlowEngine::evaluate() const {
 void FlowEngine::evaluate_if_ready() {
     if (flow_final_decision_ != FlowDecision::PENDING) {
         return; // Decision already made; keep it.
+    }
+
+    const bool aggregate_phase_configured =
+        flow_cfg_.aggregates_enabled &&
+        flow_cfg_.max_drops_aggregates > 0;
+    const auto aggregates_status = openpenny::current_aggregates_status();
+    if (aggregate_phase_configured &&
+        aggregates_status != RuntimeStatus::AggregatesStatus::NON_CLOSED_LOOP &&
+        aggregates_status != RuntimeStatus::AggregatesStatus::DUPLICATES_EXCEEDED) {
+        return;
     }
 
     // Do not evaluate if we have not observed any data packets; the classifier

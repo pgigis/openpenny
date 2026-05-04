@@ -294,12 +294,21 @@ bool TunSink::write(const net::PacketView& packet) {
         return true;
     }
     const int err = errno;
-    if (err != EAGAIN && err != EWOULDBLOCK) {
-        TCPLOG_WARN("TunSink::write (%u bytes) failed on fd=%d: %s",
-                    static_cast<unsigned>(packet.layer3_length), fd,
-                    std::strerror(err));
+    if (err == EAGAIN || err == EWOULDBLOCK) {
         stats_.errors.fetch_add(1, std::memory_order_relaxed);
+        if (!backpressure_logged_.exchange(true, std::memory_order_relaxed)) {
+            TCPLOG_WARN(
+                "TunSink: TX backpressure on fd=%d (EAGAIN/EWOULDBLOCK); "
+                "dropping packets. This can induce real TCP retransmissions at "
+                "high rates because OpenPenny does not keep a copy-backed TX queue.",
+                fd);
+        }
+        return false;
     }
+    TCPLOG_WARN("TunSink::write (%u bytes) failed on fd=%d: %s",
+                static_cast<unsigned>(packet.layer3_length), fd,
+                std::strerror(err));
+    stats_.errors.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 

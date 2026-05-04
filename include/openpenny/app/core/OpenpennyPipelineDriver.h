@@ -124,6 +124,10 @@ struct DropCollector {
 
     std::atomic<bool> accepting{true};
     std::size_t shard_count{1};
+    std::size_t snapshot_limit{0};
+    std::atomic<std::size_t> accepted_snapshot_count{0};
+    mutable std::mutex frozen_aggregate_counters_mtx;
+    std::optional<openpenny::app::AggregatedCounters> frozen_aggregate_counters;
     std::array<Shard, kMaxShards> shards{};
 
     std::size_t clamp_shard_index(std::size_t idx) const noexcept {
@@ -160,10 +164,13 @@ struct ModeResult {
     std::size_t flows_tracked_data = 0;
     bool penny_completed = false; // True when Penny heuristics triggered shutdown.
     bool aggregates_penny_completed = false; // Flag representing aggregate Penny status.
+    bool closed_loop_stop_hit = false; // True when the configured min_closed_loop_flows threshold was observed.
     // Passive-mode gap summary.
     std::size_t passive_flows_with_open_gaps = 0;
     std::size_t passive_open_gaps = 0;
     std::vector<std::string> passive_gap_summaries;
+    std::vector<std::string> closed_loop_flow_summaries;
+    std::vector<std::string> duplicate_exceeded_flow_summaries;
     std::size_t passive_flows_rst = 0;
     std::size_t passive_flows_syn_only = 0;
     std::size_t passive_flows_finished = 0;

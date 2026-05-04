@@ -168,8 +168,17 @@ private:
     /** Expire idle flows based on configured timeout. */
     void expire_idle_flows(const std::chrono::steady_clock::time_point& now);
 
-    /** Sweep pending snapshots and expire those past timeout. */
-    void sweep_expired_snapshots(const std::chrono::steady_clock::time_point& now);
+    /** Return true once the aggregate phase has completed and per-flow tests may run. */
+    bool individual_flow_evaluation_enabled() const;
+
+    /** Evaluate already-tracked flows once per-flow testing becomes active. */
+    void evaluate_individual_flows_if_enabled();
+
+    /** Complete terminal flows once all pending drop snapshots are resolved. */
+    void complete_resolved_terminal_flows();
+
+    /** Complete a flow and preserve a printable closed-loop summary if applicable. */
+    void complete_flow_with_summary(const FlowKey& key, const char* reason);
 
     // -------------------------------------------------------------------------
     // Member state
@@ -232,6 +241,8 @@ private:
      */
     std::size_t total_pkts_forwarded_{0};
     std::size_t total_forward_errors_{0};
+    std::vector<std::string> closed_loop_flow_summaries_;
+    std::vector<std::string> duplicate_exceeded_flow_summaries_;
 
     /**
      * Last time we logged global stats (prevents log flooding).

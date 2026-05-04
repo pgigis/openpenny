@@ -1041,8 +1041,15 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
                                                       ? (aggregates_decision_complete ? "completed" : "running")
                                                       : "n/a";
 
-    // Build a JSON summary akin to the CLI output.
-    nlohmann::json summary;
+    // Build a JSON summary akin to the CLI output, preserving any
+    // worker-emitted detail sections that do not have dedicated proto fields.
+    nlohmann::json summary = nlohmann::json::object();
+    if (!response->json_summary().empty()) {
+        auto parsed = nlohmann::json::parse(response->json_summary(), nullptr, false);
+        if (parsed.is_object()) {
+            summary = std::move(parsed);
+        }
+    }
     summary["test_id"] = response->test_id();
     summary["status"] = response->status();
     summary["packets"] = {

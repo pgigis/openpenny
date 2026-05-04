@@ -8,8 +8,8 @@
  * Design principles:
  *   1. Expirations are prioritised to ensure snapshots age out promptly.
  *   2. Flow mutation never happens while holding internal locks.
- *   3. All callbacks execute in the timer thread itself to avoid
- *      cross-thread data races.
+ *   3. All callbacks execute on the owning worker thread when it drains
+ *      this manager, avoiding per-queue helper-thread context switches.
  *   4. Cancelled events are garbage collected lazily using a token heap.
  */
 
@@ -32,11 +32,8 @@ ThreadFlowEventTimerManager& ThreadFlowEventTimerManager::instance() {
     return mgr;
 }
 
-std::function<void(FlowEngine*, PacketDropId, ThreadFlowEventTimerManager::SnapshotEventKind)>
-    ThreadFlowEventTimerManager::snapshot_hook_{};
-
 ThreadFlowEventTimerManager::~ThreadFlowEventTimerManager() {
-    stop(); // Ensure the timer thread is terminated cleanly.
+    stop(); // Ensure the worker-local timer state is flushed cleanly.
 }
 
 // -----------------------------------------------------------------------------
@@ -46,40 +43,25 @@ ThreadFlowEventTimerManager::~ThreadFlowEventTimerManager() {
 void ThreadFlowEventTimerManager::start(double timeout_sec) {
     std::lock_guard<std::mutex> lock(mutex_);
     timeout_sec_ = timeout_sec;
-
-    if (running_) return; // Prevent multiple timer threads from starting.
-
-    stop_flag_ = false;
+    if (running_) return;
     running_ = true;
-    thread_ = std::thread(&ThreadFlowEventTimerManager::timer_loop, this); // Spawn background timer loop.
+    next_deadline_.store(kNoDeadline, std::memory_order_release);
+    queued_event_count_.store(0, std::memory_order_release);
 }
 
 void ThreadFlowEventTimerManager::stop() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!running_) return; // No action needed if thread is not running.
-        stop_flag_ = true;
-    }
-
-    cv_.notify_all(); // Wake sleeping thread so it can terminate.
-
-    if (thread_.joinable()) {
-        thread_.join(); // Wait for graceful thread shutdown.
-    }
-
-    // Reset all internal state after stopping.
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        running_ = false;
-        heap_ = {};
-        by_id_.clear();
-        by_flow_.clear();
-        cancelled_.clear();
-        retransmit_seen_.clear();
-        events_.clear();
-        callbacks_.clear();
-        next_token_ = 1;
-    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!running_) return;
+    running_ = false;
+    heap_ = {};
+    by_id_.clear();
+    by_flow_.clear();
+    cancelled_.clear();
+    retransmit_seen_.clear();
+    events_.clear();
+    queued_event_count_.store(0, std::memory_order_release);
+    next_deadline_.store(kNoDeadline, std::memory_order_release);
+    next_token_ = 1;
 }
 
 // -----------------------------------------------------------------------------
@@ -111,8 +93,11 @@ void ThreadFlowEventTimerManager::register_drop(const ::openpenny::FlowKey& key,
     heap_.push(e); // Add to min-heap ordered by nearest expiry first.
     by_id_[PacketKey{flow, packet_id}] = e; // Register lookup by (flow, packet_id).
     by_flow_.emplace(flow, e.token); // Track token association to flow.
-
-    wake_locked(); // Wake timer thread to re-evaluate scheduling.
+    const auto deadline = e.deadline.time_since_epoch().count();
+    const auto current = next_deadline_.load(std::memory_order_relaxed);
+    if (deadline < current) {
+        next_deadline_.store(deadline, std::memory_order_release);
+    }
 }
 
 void ThreadFlowEventTimerManager::enqueue_retransmitted(PacketDropId packet_id, FlowEngine* flow) {
@@ -121,8 +106,7 @@ void ThreadFlowEventTimerManager::enqueue_retransmitted(PacketDropId packet_id, 
 
     // Queue retransmission event for later servicing.
     events_.push_back(Event{Event::Kind::Retransmit, packet_id, flow, 0});
-
-    wake_locked(); // Wake timer loop.
+    queued_event_count_.store(events_.size(), std::memory_order_release);
 }
 
 void ThreadFlowEventTimerManager::enqueue_duplicate(FlowEngine* flow, std::uint32_t seq, std::uint32_t payload) {
@@ -131,8 +115,7 @@ void ThreadFlowEventTimerManager::enqueue_duplicate(FlowEngine* flow, std::uint3
 
     // Queue duplicate detection event for later servicing.
     events_.push_back(Event{Event::Kind::Duplicate, {}, flow, seq, payload});
-
-    wake_locked(); // Wake timer loop.
+    queued_event_count_.store(events_.size(), std::memory_order_release);
 }
 
 // -----------------------------------------------------------------------------
@@ -150,28 +133,19 @@ void ThreadFlowEventTimerManager::purge_flow(FlowEngine* flow) {
     }
 
     by_flow_.erase(flow); // Remove all tokens referencing flow.
-    retransmit_seen_.erase(
-        std::remove_if(retransmit_seen_.begin(),
-                       retransmit_seen_.end(),
-                       [flow](const PacketKey& k) { return k.flow == flow; }),
-        retransmit_seen_.end()
-    );
-
-    // Remove pending callbacks that reference the purged flow.
-    callbacks_.erase(
-        std::remove_if(callbacks_.begin(), callbacks_.end(),
-                       [flow](const Callback& cb) { return cb.flow == flow; }),
-        callbacks_.end()
-    );
-    // Resync the lock-free counter with the post-erase deque size so the
-    // drain_callbacks() fast path doesn't keep firing on stale entries.
-    pending_callbacks_.store(callbacks_.size(), std::memory_order_release);
-
-    wake_locked(); // Wake timer loop to apply purge.
-}
-
-void ThreadFlowEventTimerManager::wake_locked() {
-    cv_.notify_all(); // Wake timer thread (called while holding mutex_).
+    for (auto it = retransmit_seen_.begin(); it != retransmit_seen_.end();) {
+        if (it->flow == flow) {
+            it = retransmit_seen_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    events_.erase(
+        std::remove_if(events_.begin(), events_.end(),
+                       [flow](const Event& ev) { return ev.flow == flow; }),
+        events_.end());
+    queued_event_count_.store(events_.size(), std::memory_order_release);
+    refresh_next_deadline_locked();
 }
 
 // -----------------------------------------------------------------------------
@@ -185,56 +159,52 @@ void ThreadFlowEventTimerManager::run_callbacks(std::deque<Callback>& pending) {
         // Dispatch callback by type (snapshot mutation).
         if (cb.kind == Callback::Kind::Expire) {
             cb.flow->mark_snapshot_expired(cb.packet_id);
-            if (snapshot_hook_) snapshot_hook_(cb.flow, cb.packet_id, SnapshotEventKind::Expire);
         }
         else if (cb.kind == Callback::Kind::Retransmit) {
             cb.flow->mark_snapshot_retransmitted(cb.packet_id);
-            if (snapshot_hook_) snapshot_hook_(cb.flow, cb.packet_id, SnapshotEventKind::Retransmit);
         }
         else if (cb.kind == Callback::Kind::Duplicate) {
             cb.flow->register_duplicate_snapshot(cb.seq);
             cb.flow->evaluate_snapshot_duplicate_threshold();
-            if (snapshot_hook_) snapshot_hook_(cb.flow, 0, SnapshotEventKind::Duplicate);
         }
 
         cb.flow->evaluate_if_ready(); // Re-check whether the flow now satisfies its scheduling thresholds.
     }
 }
 
-// -----------------------------------------------------------------------------
-// Timer loop (long running background scheduling thread)
-// -----------------------------------------------------------------------------
+void ThreadFlowEventTimerManager::refresh_next_deadline_locked() {
+    while (!heap_.empty() && cancelled_.count(heap_.top().token)) {
+        cancelled_.erase(heap_.top().token);
+        heap_.pop();
+    }
 
-void ThreadFlowEventTimerManager::timer_loop() {
-    std::unique_lock<std::mutex> lock(mutex_);
+    if (heap_.empty()) {
+        next_deadline_.store(kNoDeadline, std::memory_order_release);
+    } else {
+        next_deadline_.store(
+            heap_.top().deadline.time_since_epoch().count(),
+            std::memory_order_release);
+    }
+}
 
+void ThreadFlowEventTimerManager::collect_ready_callbacks(
+    std::deque<Callback>& pending,
+    const std::chrono::steady_clock::time_point& now) {
     while (true) {
-        if (stop_flag_) break; // Stop signal received.
-
-        const auto now = std::chrono::steady_clock::now();
-
-        // Remove stale cancelled entries at the top of the heap.
-        while (!heap_.empty() && cancelled_.count(heap_.top().token)) {
-            cancelled_.erase(heap_.top().token);
-            heap_.pop();
-        }
-
+        refresh_next_deadline_locked();
         bool processed_item = false;
 
-        // 1) Process the next expiry if it is due.
         if (!heap_.empty() && now >= heap_.top().deadline) {
             auto entry = heap_.top();
             heap_.pop();
 
-            // Remove entry from lookup maps if not already invalidated.
             auto id_it = by_id_.find(PacketKey{entry.flow, entry.packet_id});
             if (id_it != by_id_.end() && id_it->second.token == entry.token) {
                 by_id_.erase(id_it);
             }
 
-            // Remove only the token that matches this entry for the given flow.
             auto range = by_flow_.equal_range(entry.flow);
-            for (auto it = range.first; it != range.second; ) {
+            for (auto it = range.first; it != range.second;) {
                 if (it->second == entry.token) {
                     it = by_flow_.erase(it);
                     break;
@@ -243,47 +213,34 @@ void ThreadFlowEventTimerManager::timer_loop() {
                 }
             }
 
-            // Ensure we only schedule snapshot mutation if the flow is still alive.
             if (auto alive = entry.flow_alive.lock(); alive && *alive && entry.flow) {
                 if (TCPLOG_ENABLED(INFO)) {
                     const auto packet_id_text = format_packet_drop_id(entry.packet_id);
                     TCPLOG_INFO("[packet_expired] flow=%s packet_id=%s token=%" PRIu64,
-                        flow_debug_details(entry.flow->flow_key()).c_str(),
-                        packet_id_text.c_str(),
-                        entry.token
-                    );
+                                flow_debug_details(entry.flow->flow_key()).c_str(),
+                                packet_id_text.c_str(),
+                                entry.token);
                 }
-
-                // Schedule expiration callback for lock-free handling.
-                callbacks_.push_back(Callback{
-                    Callback::Kind::Expire, entry.packet_id, entry.flow, 0
-                });
-                pending_callbacks_.fetch_add(1, std::memory_order_release);
+                pending.push_back(
+                    Callback{Callback::Kind::Expire, entry.packet_id, entry.flow, 0});
             }
 
             processed_item = true;
-        }
-
-        // 2) If no expiration was ready, service one queued event.
-        else if (!events_.empty()) {
+        } else if (!events_.empty()) {
             auto ev = events_.front();
             events_.pop_front();
+            queued_event_count_.store(events_.size(), std::memory_order_release);
 
             if (ev.kind == Event::Kind::Retransmit && ev.flow) {
                 auto it = by_id_.find(PacketKey{ev.flow, ev.packet_id});
                 if (it != by_id_.end()) {
                     const auto token = it->second.token;
-
-                    // Skip duplicate retransmit handling for the same flow/packet_id.
                     const PacketKey key{ev.flow, ev.packet_id};
-                    if (std::find(retransmit_seen_.begin(), retransmit_seen_.end(), key) != retransmit_seen_.end()) {
+                    const auto [_, inserted] = retransmit_seen_.insert(key);
+                    if (!inserted) {
                         processed_item = true;
                         continue;
                     }
-                    retransmit_seen_.push_back(key);
-
-                    // If we've already cancelled this token (due to an earlier
-                    // retransmit event), skip duplicate handling/logging.
                     if (cancelled_.find(token) != cancelled_.end()) {
                         processed_item = true;
                         continue;
@@ -293,88 +250,55 @@ void ThreadFlowEventTimerManager::timer_loop() {
 
                     if (TCPLOG_ENABLED(INFO)) {
                         const auto packet_id_text = format_packet_drop_id(ev.packet_id);
-                        TCPLOG_INFO("[packet_retransmitted] flow=%s packet_id=%s seq=%" PRIu32,
+                        TCPLOG_INFO(
+                            "[drop_event] action=retransmitted flow=%s packet_id=%s seq=%" PRIu32,
                             flow_debug_details(ev.flow->flow_key()).c_str(),
                             packet_id_text.c_str(),
-                            ev.seq
-                        );
+                            ev.seq);
                     }
 
-                    callbacks_.push_back(Callback{
-                        Callback::Kind::Retransmit, ev.packet_id, it->second.flow, 0
-                    });
-                    pending_callbacks_.fetch_add(1, std::memory_order_release);
+                    pending.push_back(
+                        Callback{Callback::Kind::Retransmit, ev.packet_id, it->second.flow, 0});
                 }
-            }
-            else if (ev.kind == Event::Kind::Duplicate && ev.flow) {
+            } else if (ev.kind == Event::Kind::Duplicate && ev.flow) {
                 if (TCPLOG_ENABLED(DEBUG)) {
                     TCPLOG_DEBUG("[duplicate_detected] flow=%s seq=%" PRIu32 " payload=%u",
-                        flow_debug_details(ev.flow->flow_key()).c_str(),
-                        ev.seq,
-                        ev.payload);
+                                 flow_debug_details(ev.flow->flow_key()).c_str(),
+                                 ev.seq,
+                                 ev.payload);
                 }
-
-                callbacks_.push_back(Callback{
-                    Callback::Kind::Duplicate, {}, ev.flow, ev.seq
-                });
-                pending_callbacks_.fetch_add(1, std::memory_order_release);
+                pending.push_back(Callback{Callback::Kind::Duplicate, {}, ev.flow, ev.seq});
             }
 
             processed_item = true;
         }
 
-        // 2.5) Run callbacks immediately if any were produced.
-        if (processed_item && !callbacks_.empty()) {
-            std::deque<Callback> pending;
-            pending.swap(callbacks_); // Extract callbacks without copying.
-
-            lock.unlock();
-            run_callbacks(pending); // Execute snapshot mutations in lock-free mode.
-            lock.lock();
-
-            continue; // Re-evaluate loop state after callback execution.
-        }
-
-        if (processed_item) continue;
-
-        // 3) No action needed right now: sleep until the next expiry or event wake.
-        if (!heap_.empty() && timeout_sec_ > 0.0) {
-            cv_.wait_until(lock, heap_.top().deadline, [&] {
-                return stop_flag_ || !events_.empty();
-            });
-        } else {
-            cv_.wait(lock, [&] {
-                return stop_flag_ || !events_.empty() ||
-                       (!heap_.empty() && timeout_sec_ > 0.0);
-            });
+        if (!processed_item) {
+            refresh_next_deadline_locked();
+            return;
         }
     }
 }
 
 void ThreadFlowEventTimerManager::drain_callbacks() {
-    // Lock-free fast path. drain_callbacks() is called from every worker's
-    // before_poll() — i.e. potentially millions of times per second across
-    // busy-polling AF_XDP workers. Acquiring mutex_ on every call serialises
-    // the hot path on a single global lock; with many workers this becomes
-    // the dominant bottleneck. Skip the lock entirely when no callbacks
-    // are queued, which is the overwhelming common case.
-    if (pending_callbacks_.load(std::memory_order_acquire) == 0) {
-        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (queued_event_count_.load(std::memory_order_acquire) == 0) {
+        const auto next_deadline = next_deadline_.load(std::memory_order_acquire);
+        if (next_deadline == kNoDeadline ||
+            now.time_since_epoch().count() < next_deadline) {
+            return;
+        }
     }
 
     std::deque<Callback> pending;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        pending.swap(callbacks_);
-        pending_callbacks_.store(0, std::memory_order_release);
+        if (!running_) {
+            return;
+        }
+        collect_ready_callbacks(pending, now);
     }
     run_callbacks(pending);
-}
-
-void ThreadFlowEventTimerManager::set_snapshot_hook(std::function<void(FlowEngine*,
-                                                                       PacketDropId,
-                                                                       SnapshotEventKind)> hook) {
-    snapshot_hook_ = std::move(hook);
 }
 
 } // namespace openpenny::penny

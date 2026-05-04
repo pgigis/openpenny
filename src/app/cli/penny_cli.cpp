@@ -862,12 +862,8 @@ int main(int argc, char** argv) {
     //
     //   End state: Passive pipeline completed (flows=42)
     if (result.active) {
-        const auto agg_snapshot =
-            (result.active->aggregates_snapshot
-                ? *result.active->aggregates_snapshot
-                : openpenny::app::aggregate_counters());
-
         const auto agg_live = openpenny::app::aggregate_counters();
+        const auto& agg_snapshot = agg_live;
         const auto runtime  = openpenny::current_runtime_setup();
 
         const bool is_passive =
@@ -892,6 +888,15 @@ int main(int argc, char** argv) {
             result.aggregates_enabled &&
             runtime.aggregates_status !=
                 openpenny::RuntimeStatus::AggregatesStatus::PENDING;
+        const std::uint64_t closed_loop_flows_observed = std::max(
+            agg_snapshot.flows_closed_loop,
+            agg_live.flows_closed_loop);
+        const std::uint64_t closed_loop_flows_found = std::max<std::uint64_t>(
+            closed_loop_flows_observed,
+            result.active->closed_loop_flow_summaries.size());
+        const std::uint64_t duplicate_exceeded_flows_found = std::max<std::uint64_t>(
+            agg_snapshot.flows_duplicates_exceeded,
+            result.active->duplicate_exceeded_flow_summaries.size());
 
         // --- Run ---------------------------------------------------------
         print_section(std::cout, "Run");
@@ -1020,40 +1025,84 @@ int main(int argc, char** argv) {
                             agg_snapshot.flows_duplicates_exceeded);
         }
 
-        // --- Per-flow detail (passive only, if any) ----------------------
+        // --- Per-flow detail ---------------------------------------------
         if (is_passive && !result.active->passive_gap_summaries.empty()) {
             print_section(std::cout, "Per-flow detail");
             for (const auto& g : result.active->passive_gap_summaries) {
                 std::cout << "  " << g << "\n";
             }
         }
+        if (!is_passive && !result.active->closed_loop_flow_summaries.empty()) {
+            print_section(std::cout, "Closed-loop flows");
+            for (const auto& s : result.active->closed_loop_flow_summaries) {
+                std::cout << "  " << s << "\n";
+            }
+        }
+        if (!is_passive && !result.active->duplicate_exceeded_flow_summaries.empty()) {
+            print_section(std::cout, "Duplicate-exceeded flows");
+            for (const auto& s : result.active->duplicate_exceeded_flow_summaries) {
+                std::cout << "  " << s << "\n";
+            }
+        }
 
         // --- End state ---------------------------------------------------
-        std::ostringstream end_state;
+        std::ostringstream end_state_primary;
+        std::ostringstream end_state_closed_loop_suffix;
+        std::ostringstream end_state_duplicate_suffix;
         const char* end_color = "";
+        const char* closed_loop_suffix_color = "";
+        const char* duplicate_suffix_color = "";
         if (!is_passive && agg_done) {
-            end_state << "Aggregates completed (" << agg_status_str << ")";
+            end_state_primary << "Aggregates completed (" << agg_status_str << ")";
+            if (closed_loop_flows_found > 0) {
+                end_state_closed_loop_suffix << ", found " << fmt_count(closed_loop_flows_found)
+                                             << " closed-loop flow"
+                                             << (closed_loop_flows_found == 1 ? "" : "s");
+                closed_loop_suffix_color = kAnsiBlue;
+            }
+            if (duplicate_exceeded_flows_found > 0) {
+                end_state_duplicate_suffix << ", found "
+                                           << fmt_count(duplicate_exceeded_flows_found)
+                                           << " duplicate-exceeded flow"
+                                           << (duplicate_exceeded_flows_found == 1 ? "" : "s");
+                duplicate_suffix_color = kAnsiYellow;
+            }
             end_color = color_for_agg_status(agg_status_str);
         } else if (result.active->penny_completed) {
             if (is_passive) {
-                end_state << "Passive pipeline completed (flows="
-                          << result.active->passive_flows_finished << ")";
+                end_state_primary << "Passive pipeline completed (flows="
+                                  << result.active->passive_flows_finished << ")";
                 end_color = kAnsiGreen;
             } else {
-                end_state << "Penny heuristics completed";
+                end_state_primary << "Penny heuristics completed";
+                if (closed_loop_flows_found > 0) {
+                    end_state_closed_loop_suffix << ", found " << fmt_count(closed_loop_flows_found)
+                                                 << " closed-loop flow"
+                                                 << (closed_loop_flows_found == 1 ? "" : "s");
+                    closed_loop_suffix_color = kAnsiBlue;
+                }
+                if (duplicate_exceeded_flows_found > 0) {
+                    end_state_duplicate_suffix << ", found "
+                                               << fmt_count(duplicate_exceeded_flows_found)
+                                               << " duplicate-exceeded flow"
+                                               << (duplicate_exceeded_flows_found == 1 ? "" : "s");
+                    duplicate_suffix_color = kAnsiYellow;
+                }
                 end_color = kAnsiGreen;
             }
         } else if (g_stop_requested != 0) {
-            end_state << "Stopped via signal (Ctrl+C)";
+            end_state_primary << "Stopped via signal (Ctrl+C)";
             end_color = kAnsiYellow;
         } else {
-            end_state << "Reader/pipeline error (see logs)";
+            end_state_primary << "Reader/pipeline error (see logs)";
             end_color = kAnsiRed;
         }
 
         std::cout << "\n"
                   << ansi(kAnsiBold) << "End state:" << ansi(kAnsiReset) << " "
-                  << ansi(end_color) << end_state.str() << ansi(kAnsiReset)
+                  << ansi(end_color) << end_state_primary.str() << ansi(kAnsiReset)
+                  << ansi(closed_loop_suffix_color) << end_state_closed_loop_suffix.str() << ansi(kAnsiReset)
+                  << ansi(duplicate_suffix_color) << end_state_duplicate_suffix.str() << ansi(kAnsiReset)
                   << "\n";
     } else {
         // No active result usually means no packets were processed or the

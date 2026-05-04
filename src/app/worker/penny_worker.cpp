@@ -6,6 +6,7 @@
 #include "openpenny/egress/PacketSink.h"
 #include "openpenny/log/Log.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -297,9 +298,7 @@ int main(int argc, char** argv) {
     const uint64_t aggregates_snapshots = aggregates_enabled ? summary.drop_snapshots.size() : 0;
     openpenny::app::AggregatedCounters agg_snapshot{};
     if (is_active_mode) {
-        agg_snapshot = res.aggregates_snapshot
-                           ? *res.aggregates_snapshot
-                           : openpenny::app::aggregate_counters();
+        agg_snapshot = openpenny::app::aggregate_counters();
     }
     std::cout << "aggregates_status=" << aggregates_status_str << "\n";
     std::cout << "aggregates_decision_complete=" << (aggregates_done ? 1 : 0) << "\n";
@@ -315,6 +314,12 @@ int main(int argc, char** argv) {
     std::cout << "aggregate_flows_not_closed_loop=" << agg_snapshot.flows_not_closed_loop << "\n";
     std::cout << "aggregate_flows_rst=" << agg_snapshot.flows_rst << "\n";
     std::cout << "aggregate_flows_duplicates_exceeded=" << agg_snapshot.flows_duplicates_exceeded << "\n";
+    const uint64_t closed_loop_flows_found = std::max<std::uint64_t>(
+        agg_snapshot.flows_closed_loop,
+        res.closed_loop_flow_summaries.size());
+    const uint64_t duplicate_exceeded_flows_found = std::max<std::uint64_t>(
+        agg_snapshot.flows_duplicates_exceeded,
+        res.duplicate_exceeded_flow_summaries.size());
     // Emit JSON summary similar to CLI output.
     nlohmann::json j;
     j["test_id"] = args.test_id;
@@ -357,6 +362,35 @@ int main(int argc, char** argv) {
         {"rst", agg_snapshot.flows_rst},
         {"duplicates_exceeded", agg_snapshot.flows_duplicates_exceeded}
     };
+    j["closed_loop_flows_found"] = closed_loop_flows_found;
+    j["duplicate_exceeded_flows_found"] = duplicate_exceeded_flows_found;
+    j["closed_loop_flows"] = nlohmann::json::array();
+    for (const auto& line : res.closed_loop_flow_summaries) {
+        j["closed_loop_flows"].push_back(line);
+    }
+    j["duplicate_exceeded_flows"] = nlohmann::json::array();
+    for (const auto& line : res.duplicate_exceeded_flow_summaries) {
+        j["duplicate_exceeded_flows"].push_back(line);
+    }
+    std::string end_state;
+    if (aggregates_done) {
+        end_state = "Aggregates completed (" + aggregates_status_str + ")";
+    } else if (res.penny_completed) {
+        end_state = is_active_mode
+            ? "Penny heuristics completed"
+            : "Passive pipeline completed (flows=" + std::to_string(res.passive_flows_finished) + ")";
+    } else {
+        end_state = "Reader/pipeline error";
+    }
+    if (closed_loop_flows_found > 0) {
+        end_state += ", found " + std::to_string(closed_loop_flows_found) + " closed-loop flow";
+        if (closed_loop_flows_found != 1) end_state += "s";
+    }
+    if (duplicate_exceeded_flows_found > 0) {
+        end_state += ", found " + std::to_string(duplicate_exceeded_flows_found) + " duplicate-exceeded flow";
+        if (duplicate_exceeded_flows_found != 1) end_state += "s";
+    }
+    j["end_state"] = end_state;
     // Aggregate snapshot counters, if available.
     if (res.passive_flows_finished > 0 || !res.passive_gap_summaries.empty()) {
         nlohmann::json passive;

@@ -2,11 +2,9 @@
 
 #include "openpenny/app/core/DropCollectorBinding.h"
 
-#include "openpenny/penny/flow/engine/FlowEngine.h"
-#include "openpenny/penny/flow/timer/ThreadFlowEventTimer.h"
+#include "openpenny/app/core/PerThreadStats.h"
 
 #include <algorithm>
-#include <utility>
 
 namespace openpenny::app {
 namespace {
@@ -20,57 +18,62 @@ bool is_pending_snapshot(const penny::PacketDropSnapshot& snap) noexcept {
     return snap.state == penny::SnapshotState::Pending;
 }
 
+bool try_reserve_snapshot_slot(DropCollector& collector) noexcept {
+    if (collector.snapshot_limit == 0) {
+        return true;
+    }
+    auto reserved = collector.accepted_snapshot_count.load(std::memory_order_relaxed);
+    while (reserved < collector.snapshot_limit) {
+        if (collector.accepted_snapshot_count.compare_exchange_weak(
+                reserved,
+                reserved + 1,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void maybe_freeze_aggregate_window(DropCollector& collector,
+                                   const openpenny::app::AggregatedCounters& agg) {
+    if (collector.snapshot_limit == 0 ||
+        collector.accepted_snapshot_count.load(std::memory_order_relaxed) < collector.snapshot_limit) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(collector.frozen_aggregate_counters_mtx);
+    if (!collector.frozen_aggregate_counters) {
+        collector.frozen_aggregate_counters = agg;
+    }
+}
+
+void apply_frozen_aggregate_transition(DropCollector& collector,
+                                       const penny::PacketDropSnapshot& before,
+                                       const penny::PacketDropSnapshot& after) {
+    if (before.state == after.state) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(collector.frozen_aggregate_counters_mtx);
+    if (!collector.frozen_aggregate_counters) {
+        return;
+    }
+    auto& agg = *collector.frozen_aggregate_counters;
+    if (before.state == penny::SnapshotState::Pending &&
+        agg.pending_retransmissions > 0) {
+        --agg.pending_retransmissions;
+    }
+    if (after.state == penny::SnapshotState::Retransmitted) {
+        ++agg.retransmitted_packets;
+    } else if (after.state == penny::SnapshotState::Expired) {
+        ++agg.non_retransmitted_packets;
+    }
+}
+
 } // namespace
 
 DropCollectorBinding& DropCollectorBinding::instance() {
     static DropCollectorBinding inst;
     return inst;
-}
-
-void DropCollectorBinding::ensure_snapshot_hook() {
-    std::call_once(hook_once_, []() {
-        penny::ThreadFlowEventTimerManager::set_snapshot_hook(
-            [](penny::FlowEngine* flow,
-               penny::PacketDropId packet_id,
-               penny::ThreadFlowEventTimerManager::SnapshotEventKind /*kind*/) {
-                auto& self = DropCollectorBinding::instance();
-                const auto binding = self.lookup(flow);
-                if (!binding.collector) return;
-                if (!binding.collector->accepting.load(std::memory_order_relaxed)) return;
-
-                const auto& snaps = flow->drop_snapshots();
-                const auto key = flow->flow_key();
-                auto& shard = binding.collector->shard_for(binding.shard_index);
-
-                std::lock_guard<std::mutex> lock(shard.mtx);
-                if (!binding.collector->accepting.load(std::memory_order_relaxed)) return;
-                // Mirror any updated packet drop snapshots from the FlowEngine into
-                // the shared collector so aggregate decisions see fresh stats.
-                for (const auto& pair : snaps) {
-                    if (packet_id != 0 && pair.first != packet_id) continue;
-                    self.upsert_locked(binding, key, pair.first, pair.second);
-                }
-            });
-    });
-}
-
-void DropCollectorBinding::bind(penny::FlowEngine* flow,
-                                DropCollectorPtr collector,
-                                const std::string& thread_name,
-                                std::size_t shard_index) {
-    if (!flow || !collector) return;
-    std::lock_guard<std::mutex> lock(mtx_);
-    bindings_[flow] = BindingContext{
-        std::move(collector),
-        thread_name,
-        shard_index
-    };
-}
-
-void DropCollectorBinding::unbind(penny::FlowEngine* flow) {
-    if (!flow) return;
-    std::lock_guard<std::mutex> lock(mtx_);
-    bindings_.erase(flow);
 }
 
 void DropCollectorBinding::upsert(DropCollectorPtr collector,
@@ -84,30 +87,43 @@ void DropCollectorBinding::upsert(DropCollectorPtr collector,
     auto& shard = collector->shard_for(shard_index);
     std::lock_guard<std::mutex> lock(shard.mtx);
     if (!collector->accepting.load(std::memory_order_relaxed)) return;
-    upsert_locked(BindingContext{collector, thread_name, shard_index}, key, packet_id, snap);
+    upsert_locked(*collector, shard, thread_name, key, packet_id, snap);
 }
 
-DropCollectorBinding::BindingContext DropCollectorBinding::lookup(penny::FlowEngine* flow) const {
-    std::lock_guard<std::mutex> lock(mtx_);
-    auto it = bindings_.find(flow);
-    if (it != bindings_.end()) {
-        return it->second;
+void DropCollectorBinding::refresh_from(
+    DropCollectorPtr collector,
+    const std::string& thread_name,
+    std::size_t shard_index,
+    const FlowKey& key,
+    const std::vector<std::pair<penny::PacketDropId, penny::PacketDropSnapshot>>& snapshots,
+    std::size_t start_index) {
+    if (!collector) return;
+    if (!collector->accepting.load(std::memory_order_relaxed)) return;
+    if (start_index >= snapshots.size()) return;
+
+    auto& shard = collector->shard_for(shard_index);
+    std::lock_guard<std::mutex> lock(shard.mtx);
+    if (!collector->accepting.load(std::memory_order_relaxed)) return;
+
+    for (std::size_t i = start_index; i < snapshots.size(); ++i) {
+        const auto& pair = snapshots[i];
+        upsert_locked(*collector, shard, thread_name, key, pair.first, pair.second);
     }
-    return {};
 }
 
-void DropCollectorBinding::upsert_locked(const BindingContext& binding,
+void DropCollectorBinding::upsert_locked(DropCollector& collector,
+                                         DropCollector::Shard& shard,
+                                         const std::string& thread_name,
                                          const FlowKey& key,
                                          penny::PacketDropId packet_id,
                                          const penny::PacketDropSnapshot& snap) {
-    if (!binding.collector) return;
-    auto& shard = binding.collector->shard_for(binding.shard_index);
     auto& snapshots = shard.snapshots;
     DropCollector::SnapshotKey snapshot_key{key, packet_id};
 
     auto index_it = shard.snapshot_index.find(snapshot_key);
     if (index_it != shard.snapshot_index.end()) {
         auto& rec = snapshots[index_it->second];
+        const auto previous_snapshot = rec.snapshot;
         auto pending_count = shard.pending_snapshot_count.load(std::memory_order_relaxed);
         const bool was_pending = is_pending_snapshot(rec.snapshot);
         const bool now_pending = is_pending_snapshot(snap);
@@ -120,9 +136,14 @@ void DropCollectorBinding::upsert_locked(const BindingContext& binding,
             }
             shard.pending_snapshot_count.store(pending_count, std::memory_order_relaxed);
         }
+        apply_frozen_aggregate_transition(collector, previous_snapshot, snap);
     } else {
+        if (!try_reserve_snapshot_slot(collector)) {
+            return;
+        }
+        const auto agg_now = openpenny::app::aggregate_counters();
         const auto idx = snapshots.size();
-        snapshots.push_back(DropSnapshotRecord{key, packet_id, snap, {}, binding.thread_name});
+        snapshots.push_back(DropSnapshotRecord{key, packet_id, snap, agg_now, thread_name});
         shard.snapshot_index.emplace(std::move(snapshot_key), idx);
         shard.snapshot_count.store(snapshots.size(), std::memory_order_relaxed);
         if (is_pending_snapshot(snap)) {
@@ -137,6 +158,7 @@ void DropCollectorBinding::upsert_locked(const BindingContext& binding,
             shard.latest_snapshot_index.store(idx, std::memory_order_relaxed);
             shard.latest_snapshot_timestamp.store(ts, std::memory_order_relaxed);
         }
+        maybe_freeze_aggregate_window(collector, agg_now);
     }
 }
 

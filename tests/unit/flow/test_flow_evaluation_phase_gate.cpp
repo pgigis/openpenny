@@ -20,9 +20,9 @@ int main() {
     opts.mode = openpenny::PipelineOptions::Mode::Active;
 
     openpenny::set_runtime_setup(cfg, opts, false, false);
-    auto& runtime = openpenny::runtime_setup_mutable();
-    runtime.aggregates_status = openpenny::RuntimeStatus::AggregatesStatus::PENDING;
-    runtime.aggregates_active = true;
+    openpenny::set_current_aggregates_status(
+        openpenny::RuntimeStatus::AggregatesStatus::PENDING);
+    openpenny::set_current_aggregates_active(true);
 
     openpenny::penny::FlowEngine flow(cfg.active);
     flow.record_data_packet();
@@ -32,15 +32,17 @@ int main() {
     assert(flow.final_decision() ==
            openpenny::penny::FlowEngine::FlowDecision::PENDING);
 
-    runtime.aggregates_status = openpenny::RuntimeStatus::AggregatesStatus::CLOSED_LOOP;
-    runtime.aggregates_active = false;
+    openpenny::set_current_aggregates_status(
+        openpenny::RuntimeStatus::AggregatesStatus::CLOSED_LOOP);
+    openpenny::set_current_aggregates_active(false);
 
     flow.evaluate_if_ready();
     assert(flow.final_decision() ==
            openpenny::penny::FlowEngine::FlowDecision::PENDING);
 
-    runtime.aggregates_status = openpenny::RuntimeStatus::AggregatesStatus::NON_CLOSED_LOOP;
-    runtime.aggregates_active = false;
+    openpenny::set_current_aggregates_status(
+        openpenny::RuntimeStatus::AggregatesStatus::NON_CLOSED_LOOP);
+    openpenny::set_current_aggregates_active(false);
 
     flow.evaluate_if_ready();
     assert(flow.final_decision() ==

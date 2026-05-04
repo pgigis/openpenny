@@ -81,10 +81,11 @@ int main() {
 
     openpenny::set_runtime_setup(cfg, opts, false, false);
     auto& runtime = openpenny::runtime_setup_mutable();
-    runtime.aggregates_status = openpenny::RuntimeStatus::AggregatesStatus::PENDING;
+    openpenny::set_current_aggregates_status(
+        openpenny::RuntimeStatus::AggregatesStatus::PENDING);
     runtime.aggregate_eval_counters = {};
-    runtime.has_aggregate_eval = false;
-    runtime.aggregates_active = true;
+    openpenny::set_current_has_aggregate_eval(false);
+    openpenny::set_current_aggregates_active(true);
 
     std::atomic<bool> stop_flag{false};
     auto collector = std::make_shared<openpenny::DropCollector>(1);
@@ -106,10 +107,11 @@ int main() {
     assert(controller.aggregates_ready());
     assert(controller.collector_completed());
 
-    runtime.aggregates_status = openpenny::RuntimeStatus::AggregatesStatus::PENDING;
+    openpenny::set_current_aggregates_status(
+        openpenny::RuntimeStatus::AggregatesStatus::PENDING);
     runtime.aggregate_eval_counters = {};
-    runtime.has_aggregate_eval = false;
-    runtime.aggregates_active = true;
+    openpenny::set_current_has_aggregate_eval(false);
+    openpenny::set_current_aggregates_active(true);
 
     openpenny::PipelineSummary invalid_summary;
     invalid_summary.drop_snapshots.push_back(make_invalid_snapshot_record());
@@ -120,10 +122,12 @@ int main() {
            openpenny::RuntimeStatus::AggregatesStatus::NON_CLOSED_LOOP);
     assert(runtime.has_aggregate_eval);
 
-    runtime.aggregates_status = openpenny::RuntimeStatus::AggregatesStatus::PENDING;
+    openpenny::set_current_aggregates_status(
+        openpenny::RuntimeStatus::AggregatesStatus::PENDING);
     runtime.aggregate_eval_counters = {};
-    runtime.has_aggregate_eval = false;
-    runtime.aggregates_active = true;
+    openpenny::set_current_has_aggregate_eval(false);
+    openpenny::set_current_aggregates_active(true);
+    cfg.active.max_duplicate_fraction = 0.1;
 
     openpenny::PipelineSummary duplicate_summary;
     duplicate_summary.drop_snapshots.push_back(make_duplicate_exceeded_snapshot_record());

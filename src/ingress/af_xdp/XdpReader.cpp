@@ -54,8 +54,6 @@ static uint64_t now_ns() {
 struct SharedAttachState {
     std::mutex mutex;
     unsigned refs{0};         ///< Workers currently opening or opened on this shared attach state.
-    unsigned ready_workers{0}; ///< Workers that finished AF_XDP socket bring-up and published xsks_map.
-    bool shared_resources_ready{false}; ///< Shared BPF maps / program are prepared for sibling workers.
     bool rss_checked{false};   ///< Only the first-opening worker runs the RSS coverage check.
 #ifdef OPENPENNY_WITH_LIBBPF
     bool attached{false};
@@ -513,11 +511,10 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
         return false;
     }
 
-    // Serialise only the shared BPF attach / map-pin phase across queue
-    // workers. The expensive per-queue socket bring-up runs after this and is
-    // intentionally parallel.
+    // Serialize queue-worker bring-up against the shared attach state so
+    // xsks_map publication and live-rule activation happen in a well-defined
+    // order across every queue.
     std::unique_lock<std::mutex> shared_lock(impl.shared_attach->mutex);
-    bool shared_ref_acquired = false;
 
     if (impl.tuning.verbose) {
         TCPLOG_INFO("Attempting AF_XDP reader on %s queue %u", ifname.c_str(), queue);
@@ -560,37 +557,6 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
         }
         rs.attached = false;
         rs.ready    = false;
-    };
-
-    auto release_shared_startup_ref = [&]() {
-        if (!shared_ref_acquired || !impl.shared_attach) {
-            return;
-        }
-        bool release_state = false;
-        {
-            std::lock_guard<std::mutex> lock(impl.shared_attach->mutex);
-            if (impl.shared_attach->refs > 0) {
-                --impl.shared_attach->refs;
-            }
-            if (impl.shared_attach->refs == 0) {
-                if (impl.shared_attach->attached && impl.tuning.detach_on_close) {
-                    bpf_xdp_detach(impl.shared_attach->ifindex,
-                                   impl.shared_attach->xdp_flags,
-                                   nullptr);
-                }
-                impl.shared_attach->attached = false;
-                impl.shared_attach->ifindex = 0;
-                impl.shared_attach->xdp_flags = 0;
-                impl.shared_attach->ready_workers = 0;
-                impl.shared_attach->shared_resources_ready = false;
-                impl.shared_attach->rss_checked = false;
-                release_state = true;
-            }
-        }
-        shared_ref_acquired = false;
-        if (release_state) {
-            release_shared_attach_state(impl.shared_attach_key, impl.shared_attach);
-        }
     };
 
     // Populate rs.*_fd from a freshly loaded bpf_object.
@@ -962,12 +928,19 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
     //   c) Otherwise, load the object fresh and (optionally) pin the maps
     //      so sibling workers can find them.
 
-    const bool shared_resources_ready = impl.shared_attach->shared_resources_ready;
+    const bool shared_reader_already_open = impl.shared_attach->refs > 0;
     bool pins_ok = false;
-    bool need_open_maps_from_pins_after_unlock = false;
-    if (shared_resources_ready) {
-        rs.xdp_flags = impl.shared_attach->xdp_flags;
-        need_open_maps_from_pins_after_unlock = true;
+    if (shared_reader_already_open) {
+        if (!open_maps_from_pins()) {
+            TCPLOG_ERROR("Shared AF_XDP maps are unavailable for %s queue %u; "
+                         "ensure bpffs pins remain accessible while using "
+                         "multiple queues.",
+                         ifname.c_str(), queue);
+            cleanup();
+            return false;
+        }
+        rs.pinned_maps = true;
+        pins_ok = true;
     } else if (impl.tuning.reuse_pins && open_maps_from_pins()) {
         bool stale_pins = false;
         bpf_map_info conf_info{};
@@ -1066,7 +1039,7 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
     // match rules are deferred to the LAST worker (see Step 6 below) so
     // every queue's xsks_map[N] entry is in place before redirects begin.
     const bool should_publish_pass_defaults =
-        impl.tuning.update_conf_map && !shared_resources_ready;
+        impl.tuning.update_conf_map && !shared_reader_already_open;
     if (should_publish_pass_defaults &&
         !xdp::program_xdp_pass_defaults(
             xdp::XdpRuleMapFds{rs.conf_fd, rs.settings_fd},
@@ -1133,27 +1106,18 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
 
     // Real match rules are deferred to the last worker.
     //
-    // Why: worker setup is serialised through shared_attach->mutex and
-    // takes ~80-100 ms per worker (UMEM alloc + bind + fill-ring prime).
-    // With queue_count=63 that's a 5+ second startup window. If worker 0
-    // publishes the real rules during ITS open(), the BPF program starts
-    // redirecting matched packets immediately — but only xsks_map[0] is
-    // populated, so packets to queues 1..62 hit xsk_miss until each later
-    // worker registers. We saw this in the wild: after a 9k-packet burst,
-    // 2946 xsk_hit (queue 0) and 6213 xsk_miss (the rest).
+    // Why: worker setup is serialized through shared_attach->mutex and can
+    // take noticeable time per queue (UMEM alloc + bind + fill-ring prime).
+    // If worker 0 publishes the real rules during its own open(), the BPF
+    // program starts redirecting matched packets immediately while later
+    // queues still have no xsks_map entry yet.
     //
     // Fix: every worker publishes pass-only-defaults during worker 0's
     // open (so the program never blackholes), then the LAST worker swaps
     // to the real rules once every queue has registered its socket.
     //
-    // "Last worker" check: we bump refs BEFORE the check so refs reflects
-    // the total number of workers that have completed setup, including
-    // this one. With queue_count=N, the worker that observes refs == N
-    // after its own increment is the last and owns the rule swap.
-    //
-    // Transfer ownership of the attach from this reader to the shared
-    // state first so the program stays attached if this worker closes
-    // early, then bump refs and -- if we're last -- publish real rules.
+    // "Last worker" check: refs is bumped after this worker finishes setup,
+    // so the worker that observes refs == queue_count owns the real-rule swap.
     if (rs.attached) {
         impl.shared_attach->attached = true;
         impl.shared_attach->ifindex = rs.ifindex;

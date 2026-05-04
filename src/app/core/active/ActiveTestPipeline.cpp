@@ -21,6 +21,7 @@
 #include "openpenny/app/core/PipelineRunner.h"
 #include "openpenny/app/core/PerThreadStats.h"
 #include "openpenny/app/core/DropCollectorBinding.h"
+#include "openpenny/app/core/RuntimeSetup.h"
 #include "openpenny/log/Log.h"
 #include "openpenny/penny/flow/engine/FlowEngine.h"
 #include "openpenny/penny/flow/timer/ThreadFlowEventTimer.h"
@@ -256,7 +257,7 @@ bool ActiveTestPipelineRunner::individual_flow_evaluation_enabled() const {
     if (!aggregate_phase_configured) {
         return true;
     }
-    const auto status = current_aggregates_status();
+    const auto status = openpenny::current_aggregates_status();
     return status == RuntimeStatus::AggregatesStatus::NON_CLOSED_LOOP ||
            status == RuntimeStatus::AggregatesStatus::DUPLICATES_EXCEEDED;
 }

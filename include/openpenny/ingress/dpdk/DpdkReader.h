@@ -8,12 +8,12 @@
 namespace openpenny {
 
 /**
- * @brief Packet reader using a :contentReference[oaicite:0]{index=0} data plane.
+ * @brief Packet reader using the DPDK data plane.
  *
- * This class integrates with the Penny pipeline by implementing the backend-neutral
- * dataplane session
- * interface. Its goal is to pull packets from an interface using DPDK without
- * exposing DPDK specifics to upper layers.
+ * This class integrates with the Penny pipeline by implementing the
+ * backend-neutral dataplane session interface. Its goal is to pull packets
+ * from an interface using DPDK without exposing DPDK specifics to upper
+ * layers.
  */
 class DpdkReader : public net::PacketSource {
 public:
@@ -62,8 +62,13 @@ public:
     /**
      * @brief Open the interface for packet polling using DPDK.
      *
-     * @param ifname Name of the network interface (e.g., "eth0").
-     * @param queue  Queue index, if multi-queue polling is used.
+     * @param ifname DPDK port name. Unlike Linux, DPDK identifies ports by
+     *               their bus address (e.g. "0000:01:00.0") or by a vdev
+     *               name (e.g. "net_tap0", "net_pcap0"); a kernel ifname
+     *               like "eth0" will fail unless a matching device has been
+     *               created in DPDK's device list.
+     * @param queue  Queue index, if multi-queue polling is used. open()
+     *               configures the port with (queue + 1) RX queues.
      * @return true  if the interface was opened successfully.
      */
     bool open(const std::string& ifname, unsigned queue) override;

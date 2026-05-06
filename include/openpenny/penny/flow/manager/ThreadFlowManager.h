@@ -36,9 +36,7 @@ enum class FlowTrackingState {
 };
 
 /**
- * @brief Whether to skip or process a given packet through Penny.
- *
- * @brief Table entry that bundles per flow state and its FlowEngine instance.
+ * @brief Table entry bundling per-flow state and its FlowEngine instance.
  */
 struct FlowEngineEntry {
     FlowEngine flow{};                         ///< Per flow Penny logic and statistics.

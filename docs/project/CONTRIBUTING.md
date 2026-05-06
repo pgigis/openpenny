@@ -1,8 +1,8 @@
 # Contributing to OpenPenny
 
-We welcome all contributions to OpenPenny. If you are unsure about anything, please feel free to open an issue or submit a pull request regardless. We value every contribution, and we do not want a long list of guidelines to discourage participation.
+Contributions are welcome. If you are unsure about anything, open an issue or submit a pull request anyway — a short list of guidelines should not stop a good change from landing.
 
-For contributors who prefer more structure, this document outlines practices that help us review and merge changes efficiently.
+The rest of this page outlines the practices that help us review and merge changes efficiently.
 
 ---
 

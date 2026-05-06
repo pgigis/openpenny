@@ -3,23 +3,16 @@
 #pragma once
 /**
  * @file PacketSink.h
- * @brief Egress abstraction for the openpenny pipeline.
+ * @brief Egress abstraction for the OpenPenny pipeline.
  *
- * Historically, the pipeline had a tangle of fields on PipelineOptions --
- * tun_fd, forward_fd, forward_to_tun, forward_raw_socket, forward_device --
- * that encoded a tri-state (TUN / IPPROTO_RAW / nothing) with the file
- * descriptor ownership left to the caller (CLI or worker). That made it
- * impossible to add new egress targets (e.g. raw AF_PACKET write to a NIC)
- * without touching every caller, and it leaked lifecycle bugs like the
- * "TUN never brought up" black hole that silently dropped forwarded
- * packets. Chunk 3 of the refactor removed those fields entirely; every
- * caller now populates Config::egress before driving the pipeline.
+ * Pipeline stages call PacketSink::write(packet); the concrete sink
+ * decides how the bytes leave the box. Ownership of any underlying
+ * file descriptor or handle stays inside the sink, which is opened via
+ * make_packet_sink() from a declarative EgressConfig parsed from YAML.
  *
- * The PacketSink interface replaces that tri-state with a single
- * polymorphic object. Pipeline stages call write(packet); the concrete
- * sink decides how the bytes leave the box. Ownership of any underlying
- * fd / handle is internal to the sink, which is opened via a factory from
- * a declarative EgressConfig (itself parsed from YAML).
+ * Adding a new egress target (e.g. UDP encap, GRE) means adding a new
+ * EgressKind, a new PacketSink subclass, and a branch in the factory —
+ * pipeline stages don't need to change.
  */
 
 #include <atomic>
@@ -35,13 +28,8 @@ struct PacketView;
 
 namespace egress {
 
-/**
- * @brief Enumerates the egress targets the pipeline knows how to drive.
- *
- * Additional kinds (GRE tunnel, UDP encap, etc.) can be added here
- * without touching the pipeline stages -- a new Kind just needs a new
- * concrete PacketSink implementation and a branch in make_packet_sink().
- */
+/// Egress targets the pipeline knows how to drive.
+
 enum class EgressKind {
     None,       ///< Drop matched packets; only increment counters.
     Tun,        ///< Write layer-3 bytes into a TUN device (IFF_TUN, IFF_NO_PI).
@@ -52,10 +40,9 @@ enum class EgressKind {
 /**
  * @brief Declarative egress configuration parsed from YAML.
  *
- * Fields are documented individually; only the subset relevant to the
- * selected kind is consulted by the factory. Invalid combinations
- * (e.g. Tun with empty device) are logged and cause factory failure
- * rather than silent fallback to a different kind.
+ * Only the subset of fields relevant to the selected kind is consulted
+ * by the factory. Invalid combinations (e.g. Tun with empty device)
+ * fail the factory rather than silently falling back to another kind.
  */
 struct EgressConfig {
     EgressKind kind = EgressKind::None;

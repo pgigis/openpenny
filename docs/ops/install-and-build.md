@@ -1,6 +1,6 @@
 # Install & Build Guide
 
-This guide explains how to install the required dependencies, build the OpenPenny CLI (`openpenny_cli`), and compile the gRPC daemon (`pennyd` + `penny_worker`). It includes distribution‑specific instructions, build options, and troubleshooting steps.
+How to install the dependencies, build `openpenny_cli`, and compile the gRPC daemon (`pennyd` + `penny_worker`). Distro-specific commands, build options, and troubleshooting are below.
 
 ---
 
@@ -126,8 +126,7 @@ Requirements:
 
 ## Run Examples
 
-- **CLI (active mode):** `docs/run/cli-guide.md`  
-- **CLI (passive mode):** `docs/run/cli-readme.md`  
+- **CLI (active and passive):** `docs/run/cli-guide.md`  
 - **gRPC usage:** `docs/run/grpc-guide.md` and Python examples in `examples/`  
 
 ---

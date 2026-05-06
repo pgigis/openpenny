@@ -1,4 +1,13 @@
 // SPDX-License-Identifier: BSD-2-Clause
+/**
+ * @file DpdkReader.cpp
+ * @brief DPDK-backed packet reader.
+ *
+ * The reader owns a single RX queue on a DPDK port and runs in promiscuous
+ * mode so it can observe all traffic reaching the NIC. EAL is initialized
+ * lazily on the first open(); subsequent readers share the same EAL and
+ * mbuf pool. All DPDK calls are isolated to this translation unit.
+ */
 
 #include "openpenny/ingress/dpdk/DpdkReader.h"
 
@@ -44,13 +53,13 @@ DpdkGlobalState& dpdk_state() {
     return state;
 }
 
+/// Initialize EAL and the shared mbuf pool exactly once per process.
 bool ensure_eal() {
     auto& st = dpdk_state();
     if (st.eal_ready || st.eal_failed) return st.eal_ready;
 
-    // rte_eal_init may scribble on argv entries (it has historically rewritten
-    // them when consuming flags). Pass mutable buffers backed by std::string
-    // instead of pointers to read-only literals.
+    // EAL parses argv in place and may rewrite entries, so we copy the
+    // arguments into mutable buffers rather than pass string literals.
     static const std::array<std::string, 5> kArgs{
         "openpenny_dpdk", "-l", "0", "-n", "4"};
     std::array<std::vector<char>, kArgs.size()> arg_storage;
@@ -61,23 +70,22 @@ bool ensure_eal() {
         argv[i] = arg_storage[i].data();
     }
     int argc = static_cast<int>(argv.size());
-    int rc = rte_eal_init(argc, argv.data());
-    if (rc < 0) {
+    if (rte_eal_init(argc, argv.data()) < 0) {
         TCPLOG_ERROR("rte_eal_init failed: %s", rte_strerror(rte_errno));
         st.eal_failed = true;
         return false;
     }
 
-    // Pool large enough to back a 4096-deep RX ring with headroom for the
-    // descriptors held by the application during burst processing.
+    // Sized to back a 4096-deep RX ring with headroom for in-flight bursts.
     st.pool = rte_pktmbuf_pool_create("penny_pool",
-                                      8192,
-                                      256,
-                                      0,
+                                      /*nb_mbufs=*/8192,
+                                      /*cache_size=*/256,
+                                      /*priv_size=*/0,
                                       RTE_MBUF_DEFAULT_BUF_SIZE,
                                       rte_socket_id());
     if (!st.pool) {
-        TCPLOG_ERROR("Failed to create DPDK mbuf pool: %s", rte_strerror(rte_errno));
+        TCPLOG_ERROR("rte_pktmbuf_pool_create failed: %s",
+                     rte_strerror(rte_errno));
         st.eal_failed = true;
         return false;
     }
@@ -128,10 +136,7 @@ bool DpdkReader::open(const std::string& ifname, unsigned queue) {
         return false;
     }
 
-    // We must configure at least (queue + 1) RX queues so that
-    // rte_eth_rx_queue_setup() with the requested queue index is valid. The
-    // previous version always asked for nb_rx_queue=1 which made any non-zero
-    // queue index fail with -EINVAL.
+    // Configure (queue + 1) RX queues so the requested queue index is valid.
     const uint16_t nb_rx_queues = static_cast<uint16_t>(queue + 1);
     if (rte_eth_dev_configure(port_id, nb_rx_queues, 0, &port_conf) != 0) {
         TCPLOG_ERROR("DPDK configure failed for port %u (nb_rx_queues=%u)",
@@ -139,8 +144,7 @@ bool DpdkReader::open(const std::string& ifname, unsigned queue) {
         return false;
     }
 
-    // Let the PMD clamp rx_desc into its valid range; otherwise some drivers
-    // (mlx5, ice, ...) reject the setup outright.
+    // Let the PMD clamp the descriptor count into its supported range.
     uint16_t rx_desc = 1024;
     uint16_t tx_desc = 0;
     if (rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &rx_desc, &tx_desc) != 0) {
@@ -164,14 +168,13 @@ bool DpdkReader::open(const std::string& ifname, unsigned queue) {
         return false;
     }
 
-    // Without promiscuous mode the NIC silently drops every frame whose dst
-    // MAC isn't ours, which makes a tap-style ingest see effectively nothing.
-    // Treat failure as a warning: some virtual PMDs (TAP, ring) don't support
-    // it, and we'd still receive locally addressed traffic.
+    // Promiscuous mode is required for tap-style observation; without it the
+    // NIC drops frames not addressed to its own MAC. Some virtual PMDs (TAP,
+    // ring) don't support it, so a failure is logged but not fatal.
     const int prom_rc = rte_eth_promiscuous_enable(port_id);
     if (prom_rc != 0) {
         TCPLOG_WARN("DPDK promiscuous_enable failed for port %u (rc=%d, %s); "
-                    "the reader will only see frames addressed to this port's MAC.",
+                    "only frames addressed to this port's MAC will be seen.",
                     port_id, prom_rc, rte_strerror(-prom_rc));
     }
 
@@ -203,8 +206,8 @@ bool DpdkReader::poll(const net::PacketHandler& handler, std::size_t budget) {
 #else
     if (!opened_) return false;
 
-    // Honour the IPipelineStrategy contract: a budget of 0 means "use the
-    // source's own default", matching AfPacketMirrorReader semantics.
+    // A budget of 0 means "use the reader's own default", matching the
+    // AfPacketMirrorReader semantics expected by the pipeline.
     const uint16_t configured_burst =
         opts_.burst > 0 ? static_cast<uint16_t>(opts_.burst) : uint16_t{32};
     const uint16_t burst = budget == 0
@@ -219,9 +222,8 @@ bool DpdkReader::poll(const net::PacketHandler& handler, std::size_t budget) {
     const uint16_t received =
         rte_eth_rx_burst(port_id_, queue_, bufs, capped_burst);
 
-    // Linearization buffer for chained mbufs. Most production NICs deliver
-    // single-segment buffers for typical MTUs, so this stays empty in the hot
-    // path; only jumbo / scattered RX hits the slow path.
+    // Scratch buffer for chained mbufs. Stays empty on the fast path; only
+    // jumbo / scattered RX triggers a copy.
     std::vector<uint8_t> linear;
 
     for (uint16_t i = 0; i < received; ++i) {
@@ -230,13 +232,11 @@ bool DpdkReader::poll(const net::PacketHandler& handler, std::size_t budget) {
         const uint8_t* data = nullptr;
         uint32_t len = 0;
         if (mbuf->nb_segs <= 1) {
-            // Fast path: single segment, mtod points at the whole frame.
+            // Single-segment: mtod points at the whole frame.
             data = rte_pktmbuf_mtod(mbuf, const uint8_t*);
             len  = rte_pktmbuf_data_len(mbuf);
         } else {
-            // Slow path: copy the chained segments into a contiguous buffer
-            // before handing it to PacketParser, otherwise the parser would
-            // walk past the first segment's data.
+            // Multi-segment: linearize so PacketParser sees a contiguous frame.
             const uint32_t total = rte_pktmbuf_pkt_len(mbuf);
             linear.resize(total);
             uint32_t off = 0;
@@ -260,8 +260,8 @@ bool DpdkReader::poll(const net::PacketHandler& handler, std::size_t budget) {
                 continue;
             }
             packet.timestamp_ns = now_ns();
-            // Surface the original L2 frame for L2-level egress paths
-            // (RawNicSink with SOCK_RAW needs the Ethernet header).
+            // Expose the L2 frame for sinks that forward at the Ethernet
+            // layer (e.g. RawNicSink over SOCK_RAW).
             packet.layer2_ptr = data;
             packet.layer2_length = len;
             if (handler) handler(packet);

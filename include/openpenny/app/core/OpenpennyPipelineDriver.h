@@ -30,14 +30,13 @@ class IFactory;
 }
 
 /**
- * @brief Configuration for a pipeline execution invocation.
+ * @brief Per-run pipeline parameters.
  *
- * After Chunk 3, this struct only carries information that is specific
- * to a single run of the pipeline: how many queues to drive, which mode
- * to run in, an optional cancellation callback, traffic selection, and
- * (for SDK users) an override egress sink. Everything else — TUN/raw
- * socket selection, NIC/queue binding, BPF/XDP tuning — lives on
- * Config and is read by the pipeline driver directly.
+ * Carries only what's specific to a single invocation: queue count,
+ * mode, optional cancellation callback, traffic selection, and (for SDK
+ * users) an egress-sink override. Everything else — egress kind, NIC
+ * and queue binding, BPF/XDP tuning — lives on Config and is read by
+ * the pipeline driver directly.
  */
 struct PipelineOptions {
     enum class Mode {

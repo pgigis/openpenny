@@ -52,7 +52,7 @@ and the packet is silently dropped. Capture `uname -a`,
 `ldconfig -p | grep xdp`, and the libxdp/libbpf versions and file an
 issue.
 
-### 3. Bind-mode heterogeneity
+### 2. Bind-mode heterogeneity
 
 Re-run with `--log-level debug` and look for:
 
@@ -79,7 +79,7 @@ sudo ethtool -L <iface> combined <queue_count>
 For Mellanox ConnectX (mlx5), `combined` channels are the right knob.
 For Intel ice/i40e the same command works.
 
-### 4. RSS coverage
+### 3. RSS coverage
 
 OpenPenny prints an `[rss_check]` line at startup. If RSS routes to
 queues you aren't serving, packets land where there is no AF_XDP
@@ -98,7 +98,7 @@ Fix: restrict RSS to the served queues.
 sudo ethtool -X <iface> weight 1 0 0 0 ...
 ```
 
-### 5. Stale BPF pins
+### 4. Stale BPF pins
 
 If `/sys/fs/bpf/openpenny_*` exists from a previous run (especially
 after a crash or `kill -9`), OpenPenny prints:
@@ -114,7 +114,7 @@ sudo python3 scripts/xdp_attach.py --iface <iface> --mode drv --detach
 sudo rm -rf /sys/fs/bpf/openpenny*
 ```
 
-### 6. Queue over-subscription
+### 5. Queue over-subscription
 
 If you ask for more queues than the NIC has, the CLI clamps and warns:
 
@@ -125,7 +125,7 @@ If you ask for more queues than the NIC has, the CLI clamps and warns:
 
 If you see the clamp, the actual `--queues` used is the clamped value.
 
-### 7. Use `--queues 1` with RSS as a known-good baseline
+### 6. Use `--queues 1` with RSS as a known-good baseline
 
 If a multi-queue run is misbehaving, fall back to single-queue + RSS
 steered at one queue to confirm the rest of the pipeline is healthy:

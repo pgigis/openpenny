@@ -17,14 +17,14 @@ retransmitted. Genuine TCP senders retransmit; spoofed sources do not.
 The tool supports two modes:
 
 - **Active.** Redirect a slice, drop a few packets, observe retransmissions.
-  Confirms if the redirected traffic slice contains closed-loop traffic.
+  Confirms whether the redirected slice contains closed-loop traffic.
 - **Passive.** Mirror traffic only. Track sequence coverage, gaps,
   duplicates, FIN/RST, and idle periods. Useful as a pre-filter before an
   active check.
 
-Capture runs over **AF_XDP** (default) or **DPDK**, with optional forwarding
-to a TUN device or raw socket. Interaction through **CLI** (`openpenny_cli`) or
-the **gRPC daemon** (`pennyd` + `penny_worker`).
+Capture runs over **AF_XDP** (default), **AF_PACKET** for copy-mode taps, or
+**DPDK**, with optional forwarding to a TUN device or raw socket. Interaction
+through **CLI** (`openpenny_cli`) or the **gRPC daemon** (`pennyd` + `penny_worker`).
 
 <p align="center">
   <img src="docs/images/slice-traffic-figure.png" alt="Traffic slicing and analysis" />

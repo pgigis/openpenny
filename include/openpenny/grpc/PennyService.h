@@ -15,12 +15,10 @@ namespace openpenny::grpc_service {
 /**
  * @brief Concrete implementation of the gRPC control service for Penny tests.
  *
- * Implements the server side of the :contentReference[oaicite:0]{index=0} service interface
- * defined in the generated protocol headers. Handles test start requests from the
- * orchestrator and translates them into pipeline driver options.
- *
- * The service is final and non-copyable, and owns no packet or flow state itself;
- * all test state is delegated to the pipeline driver.
+ * Server-side handler for the PennyService interface generated from
+ * `proto/penny.proto`. Translates RPC requests into pipeline driver
+ * options. The service owns no packet or flow state itself; all test
+ * state is delegated to the pipeline driver.
  */
 class PennyServiceImpl final :
     public openpenny::api::PennyService::Service {

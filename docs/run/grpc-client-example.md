@@ -1,6 +1,6 @@
 # gRPC Client Example (Python)
 
-This example demonstrates how to invoke `StartTest` from Python using an inline JSON configuration override, and how to parse the returned JSON summary. It assumes Python stubs (`penny_pb2.py`, `penny_pb2_grpc.py`) were generated from `proto/penny.proto`.
+How to call `StartTest` from Python with an inline JSON config override and read the returned summary. Assumes Python stubs (`penny_pb2.py`, `penny_pb2_grpc.py`) generated from `proto/penny.proto`.
 
 ## Minimal Python Client
 

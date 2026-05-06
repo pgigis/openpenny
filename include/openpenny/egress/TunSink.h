@@ -3,14 +3,11 @@
 #pragma once
 /**
  * @file TunSink.h
- * @brief PacketSink implementation that writes layer-3 packets into a
- *        TUN device (IFF_TUN | IFF_NO_PI), optionally multi-queue.
+ * @brief PacketSink that writes layer-3 packets into a TUN device
+ *        (IFF_TUN | IFF_NO_PI), optionally multi-queue.
  *
- * This consolidates the two copies of open_tun_device() that used to
- * live in penny_cli.cpp and penny_worker.cpp. The canonical version
- * here always brings the interface administratively UP -- the worker
- * variant used to skip that step, which silently black-holed every
- * forwarded packet because the TUN was DOWN.
+ * The sink always brings the device administratively UP at open time;
+ * leaving it DOWN black-holes every forwarded packet without warning.
  */
 
 #include "openpenny/egress/PacketSink.h"

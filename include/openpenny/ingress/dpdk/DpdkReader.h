@@ -8,105 +8,81 @@
 namespace openpenny {
 
 /**
- * @brief Packet reader using the DPDK data plane.
+ * @brief DPDK-backed implementation of the dataplane session interface.
  *
- * This class integrates with the Penny pipeline by implementing the
- * backend-neutral dataplane session interface. Its goal is to pull packets
- * from an interface using DPDK without exposing DPDK specifics to upper
- * layers.
+ * Polls an interface in promiscuous mode through a single RX queue and
+ * surfaces parsed packets to the pipeline via PacketHandler. DPDK
+ * specifics (EAL, mempools, mbufs) stay inside the .cpp.
+ *
+ * Lifecycle: configure() -> open() -> poll()... -> close().
  */
 class DpdkReader : public net::PacketSource {
 public:
-    // -------------------------------------------------------------------------
-    // Configuration options
-    // -------------------------------------------------------------------------
-
-    /// Controls whether the reader is enabled and how many packets to pull per burst.
+    /// Per-reader knobs. Defaults are safe for a single-queue setup.
     struct Options {
-        bool enable = false;     ///< If false, open()/poll() can be safely skipped.
-        unsigned burst = 32;    ///< Maximum number of packets pulled per DPDK burst.
-        net::TrafficMatchConfig match_config{};
+        bool enable = false;        ///< Set to true to actually open the port.
+        unsigned burst = 32;        ///< Max packets pulled per rte_eth_rx_burst().
+        net::TrafficMatchConfig match_config{}; ///< Userspace filter; empty matches all.
     };
 
     DpdkReader() = default;
     ~DpdkReader() override = default;
 
-    /**
-     * @brief Configure the reader using explicit options.
-     *
-     * Must be called before open(). Sets the configured flag so poll() can validate
-     * state without re-reading configuration.
-     */
+    /// Apply explicit options. Must be called before open().
     void configure(const Options& opts) {
         opts_ = opts;
         configured_ = true;
     }
 
-    /**
-     * @brief Configure options by reading them from a central Penny configuration.
-     *
-     * Convenience method that extracts DPDK options from the global Config object.
-     */
+    /// Populate Options from the parsed Config. Mirrors the other readers.
     void configure_from_config(const Config& cfg) {
         Options opts;
-        opts.enable = cfg.input.backend == PacketInputBackend::Dpdk;
-        opts.burst  = cfg.dpdk.burst;
+        opts.enable       = cfg.input.backend == PacketInputBackend::Dpdk;
+        opts.burst        = cfg.dpdk.burst;
         opts.match_config = cfg.traffic_match;
         configure(opts);
     }
 
-    // -------------------------------------------------------------------------
-    // PacketSource interface implementation
-    // -------------------------------------------------------------------------
-
     /**
-     * @brief Open the interface for packet polling using DPDK.
+     * Open a DPDK port and bring up RX.
      *
-     * @param ifname DPDK port name. Unlike Linux, DPDK identifies ports by
-     *               their bus address (e.g. "0000:01:00.0") or by a vdev
-     *               name (e.g. "net_tap0", "net_pcap0"); a kernel ifname
-     *               like "eth0" will fail unless a matching device has been
-     *               created in DPDK's device list.
-     * @param queue  Queue index, if multi-queue polling is used. open()
-     *               configures the port with (queue + 1) RX queues.
-     * @return true  if the interface was opened successfully.
+     * @param ifname DPDK port identifier: PCI bus address (e.g. "0000:01:00.0")
+     *               or vdev name (e.g. "net_tap0"). Linux ifnames like "eth0"
+     *               are not accepted unless EAL has registered a matching
+     *               device.
+     * @param queue  RX queue index. The port is configured with (queue + 1)
+     *               RX queues, so a single reader can target any queue.
+     * @return true on success, false on any DPDK setup failure (logged).
      */
     bool open(const std::string& ifname, unsigned queue) override;
 
-    /**
-     * @brief Close the packet reader and release interface resources.
-     *
-     * Safe to call even if open() was never successful.
-     */
+    /// Stop the port and disable promiscuous mode. Idempotent.
     void close() override;
 
     /**
-     * @brief Poll packets from the interface and hand them to the provided handler.
+     * Pull at most @p budget packets and dispatch them to @p handler.
      *
-     * @param handler  The callback that processes incoming packets.
-     * @param budget   Optional maximum packet count to process in one poll cycle.
-     * @return true    if polling succeeded (even if no packets were received).
+     * Multi-segment mbufs are linearized before parsing so PacketHandler
+     * always sees a contiguous frame. Packets that fail PacketParser or
+     * the match filter are silently dropped.
+     *
+     * @return true on success (even when zero packets were received).
      */
     bool poll(const net::PacketHandler& handler, std::size_t budget = 32) override;
 
+    /// Swap the userspace match filter; effective on the next poll().
     bool update_match_rules(const net::TrafficMatchConfig& config) override {
         opts_.match_config = config;
         return true;
     }
 
 private:
-    // -------------------------------------------------------------------------
-    // Internal state
-    // -------------------------------------------------------------------------
-
-    Options opts_{};           ///< Effective configuration for this reader.
-    bool configured_{false};   ///< Set once configure() or configure_from_config() is called.
-    bool opened_{false};       ///< Set once open() succeeds; cleared on close().
-    std::string ifname_{};     ///< Name of the interface currently opened.
-    unsigned queue_{0};        ///< Queue index used when open() was called.
-
-    /// DPDK port identifier corresponding to the opened interface.
-    std::uint16_t port_id_{0};
+    Options opts_{};
+    bool configured_{false};   ///< Set once configure*() has been called.
+    bool opened_{false};       ///< True between a successful open() and close().
+    std::string ifname_{};     ///< DPDK port name passed to open().
+    unsigned queue_{0};        ///< RX queue index passed to open().
+    std::uint16_t port_id_{0}; ///< Resolved DPDK port id; valid while opened_.
 };
 
 } // namespace openpenny

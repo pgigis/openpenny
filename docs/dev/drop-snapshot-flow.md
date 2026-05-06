@@ -1,6 +1,7 @@
 # Drop Snapshot Data Flow
 
-This notes how drop snapshots move through the system so it is clear which component owns what and when it updates.
+How drop snapshots move through the system: which component owns what,
+and when it updates.
 
 ## Components
 - **FlowEngine (per flow)**: owns `flow_drop_snapshots_` (vector of `{packet_id, PacketDropSnapshot}`) and the packet_id → index map. All mutations happen on the packet-processing thread or the timer callback thread.

@@ -1,6 +1,9 @@
 # Penny API Reference
 
-This document explains the Penny heuristics layer inside openpenny: the data structures that model TCP flows, how drops and retransmissions are tracked, and the knobs exposed through configuration. Use it as a guide when embedding the Penny components outside the demo CLI or when extending the packet-processing loop.
+The Penny heuristics layer: the types that model TCP flows, how drops and
+retransmissions are tracked, and the knobs exposed through configuration.
+Use this when embedding the Penny components outside the CLI or when
+extending the packet-processing loop.
 
 ## Scope and Responsibilities
 - **Per-flow modelling**: `penny::FlowEngine` maintains sequence coverage, duplicate detection, drop/retransmit bookkeeping, and exposes a decision status when thresholds are met.
@@ -90,7 +93,7 @@ if (result && result->penny_completed) {
 ```
 
 ## Penny Daemon (gRPC)
-`pennyd` is a long-running daemon that loads YAML defaults and exposes a gRPC API (industry-standard C++ gRPC) for external callers to launch Penny tests:
+`pennyd` is a long-running daemon that loads YAML defaults and exposes a gRPC API for external callers to launch Penny tests:
 - Proto: `proto/penny.proto` defines `StartTest(StartTestRequest) -> StartTestResponse`.
 - Request: provide `prefix` and `mask_bits` to scope the test (defaults come from YAML config).
 - Behaviour: `StartTest` applies the prefix/mask override, runs the pipeline synchronously until Penny completes, then returns the `ModeResult` counters in the response.

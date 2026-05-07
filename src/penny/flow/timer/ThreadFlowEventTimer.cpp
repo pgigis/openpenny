@@ -2,12 +2,20 @@
 
 /**
  * @file ThreadFlowEventTimer.cpp
- * @brief Thread safe timer manager for handling packet drop related events
- *        including expiration, retransmission, and duplicate detection.
+ * @brief Per-thread timer manager for packet drop expiration,
+ *        retransmission, and duplicate detection.
  *
  * Design principles:
  *   1. Expirations are prioritised to ensure snapshots age out promptly.
- *   2. Flow mutation never happens while holding internal locks.
+ *   2. The manager is strictly thread-local: every entry point goes
+ *      through the static thread_local instance() returned below, so all
+ *      members are touched by exactly one thread for the lifetime of that
+ *      thread. This is what lets us run lock-free on the per-packet path
+ *      — see the "Thread-local invariant" note in ThreadFlowEventTimer.h.
+ *      An earlier implementation guarded each method with std::mutex; the
+ *      mutex was uncontended by construction and was removed because the
+ *      uncontended futex acquire+release was measurable hot-path overhead
+ *      (~10-20ns per pair, multiplied by several calls per packet).
  *   3. All callbacks execute on the owning worker thread when it drains
  *      this manager, avoiding per-queue helper-thread context switches.
  *   4. Cancelled events are garbage collected lazily using a token heap.
@@ -41,16 +49,14 @@ ThreadFlowEventTimerManager::~ThreadFlowEventTimerManager() {
 // -----------------------------------------------------------------------------
 
 void ThreadFlowEventTimerManager::start(double timeout_sec) {
-    std::lock_guard<std::mutex> lock(mutex_);
     timeout_sec_ = timeout_sec;
     if (running_) return;
     running_ = true;
-    next_deadline_.store(kNoDeadline, std::memory_order_release);
-    queued_event_count_.store(0, std::memory_order_release);
+    next_deadline_ = kNoDeadline;
+    queued_event_count_ = 0;
 }
 
 void ThreadFlowEventTimerManager::stop() {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!running_) return;
     running_ = false;
     heap_ = {};
@@ -59,8 +65,8 @@ void ThreadFlowEventTimerManager::stop() {
     cancelled_.clear();
     retransmit_seen_.clear();
     events_.clear();
-    queued_event_count_.store(0, std::memory_order_release);
-    next_deadline_.store(kNoDeadline, std::memory_order_release);
+    queued_event_count_ = 0;
+    next_deadline_ = kNoDeadline;
     next_token_ = 1;
 }
 
@@ -74,8 +80,6 @@ void ThreadFlowEventTimerManager::register_drop(const ::openpenny::FlowKey& key,
                                          std::shared_ptr<bool> flow_alive,
                                          FlowEngine* flow,
                                          std::size_t snapshot_index) {
-    std::unique_lock<std::mutex> lock(mutex_);
-
     if (timeout_sec_ <= 0.0 || !flow) return; // Skip invalid registrations.
 
     // Prepare a new heap entry representing a packet snapshot timeout event.
@@ -94,28 +98,25 @@ void ThreadFlowEventTimerManager::register_drop(const ::openpenny::FlowKey& key,
     by_id_[PacketKey{flow, packet_id}] = e; // Register lookup by (flow, packet_id).
     by_flow_.emplace(flow, e.token); // Track token association to flow.
     const auto deadline = e.deadline.time_since_epoch().count();
-    const auto current = next_deadline_.load(std::memory_order_relaxed);
-    if (deadline < current) {
-        next_deadline_.store(deadline, std::memory_order_release);
+    if (deadline < next_deadline_) {
+        next_deadline_ = deadline;
     }
 }
 
 void ThreadFlowEventTimerManager::enqueue_retransmitted(PacketDropId packet_id, FlowEngine* flow) {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!flow) return;
 
     // Queue retransmission event for later servicing.
     events_.push_back(Event{Event::Kind::Retransmit, packet_id, flow, 0});
-    queued_event_count_.store(events_.size(), std::memory_order_release);
+    queued_event_count_ = events_.size();
 }
 
 void ThreadFlowEventTimerManager::enqueue_duplicate(FlowEngine* flow, std::uint32_t seq, std::uint32_t payload) {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!flow) return;
 
     // Queue duplicate detection event for later servicing.
     events_.push_back(Event{Event::Kind::Duplicate, {}, flow, seq, payload});
-    queued_event_count_.store(events_.size(), std::memory_order_release);
+    queued_event_count_ = events_.size();
 }
 
 // -----------------------------------------------------------------------------
@@ -123,7 +124,6 @@ void ThreadFlowEventTimerManager::enqueue_duplicate(FlowEngine* flow, std::uint3
 // -----------------------------------------------------------------------------
 
 void ThreadFlowEventTimerManager::purge_flow(FlowEngine* flow) {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!flow) return;
 
     // Cancel all pending expiry entries for this flow using their token IDs.
@@ -144,7 +144,7 @@ void ThreadFlowEventTimerManager::purge_flow(FlowEngine* flow) {
         std::remove_if(events_.begin(), events_.end(),
                        [flow](const Event& ev) { return ev.flow == flow; }),
         events_.end());
-    queued_event_count_.store(events_.size(), std::memory_order_release);
+    queued_event_count_ = events_.size();
     refresh_next_deadline_locked();
 }
 
@@ -172,6 +172,8 @@ void ThreadFlowEventTimerManager::run_callbacks(std::deque<Callback>& pending) {
     }
 }
 
+// Name retained as `_locked` for blame continuity / call-site readability,
+// but no lock is held — the manager is thread-local. See header.
 void ThreadFlowEventTimerManager::refresh_next_deadline_locked() {
     while (!heap_.empty() && cancelled_.count(heap_.top().token)) {
         cancelled_.erase(heap_.top().token);
@@ -179,11 +181,9 @@ void ThreadFlowEventTimerManager::refresh_next_deadline_locked() {
     }
 
     if (heap_.empty()) {
-        next_deadline_.store(kNoDeadline, std::memory_order_release);
+        next_deadline_ = kNoDeadline;
     } else {
-        next_deadline_.store(
-            heap_.top().deadline.time_since_epoch().count(),
-            std::memory_order_release);
+        next_deadline_ = heap_.top().deadline.time_since_epoch().count();
     }
 }
 
@@ -229,7 +229,7 @@ void ThreadFlowEventTimerManager::collect_ready_callbacks(
         } else if (!events_.empty()) {
             auto ev = events_.front();
             events_.pop_front();
-            queued_event_count_.store(events_.size(), std::memory_order_release);
+            queued_event_count_ = events_.size();
 
             if (ev.kind == Event::Kind::Retransmit && ev.flow) {
                 auto it = by_id_.find(PacketKey{ev.flow, ev.packet_id});
@@ -282,22 +282,21 @@ void ThreadFlowEventTimerManager::collect_ready_callbacks(
 
 void ThreadFlowEventTimerManager::drain_callbacks() {
     const auto now = std::chrono::steady_clock::now();
-    if (queued_event_count_.load(std::memory_order_acquire) == 0) {
-        const auto next_deadline = next_deadline_.load(std::memory_order_acquire);
-        if (next_deadline == kNoDeadline ||
-            now.time_since_epoch().count() < next_deadline) {
-            return;
-        }
+    // Fast-path early-exit: cheap plain reads (manager is thread-local; see
+    // header for the invariant). Used to be std::atomic loads back when this
+    // peeked while a different thread held the mutex — neither matters now.
+    if (queued_event_count_ == 0 &&
+        (next_deadline_ == kNoDeadline ||
+         now.time_since_epoch().count() < next_deadline_)) {
+        return;
+    }
+
+    if (!running_) {
+        return;
     }
 
     std::deque<Callback> pending;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!running_) {
-            return;
-        }
-        collect_ready_callbacks(pending, now);
-    }
+    collect_ready_callbacks(pending, now);
     run_callbacks(pending);
 }
 

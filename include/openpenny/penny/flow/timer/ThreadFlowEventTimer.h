@@ -5,13 +5,11 @@
 #include "openpenny/agg/FlowKey.h"
 #include "openpenny/penny/flow/state/PacketDropId.h"
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <deque>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <queue>
 #include <string>
 #include <unordered_map>
@@ -210,21 +208,40 @@ private:
     ThreadFlowEventTimerManager(const ThreadFlowEventTimerManager&) = delete;
     ThreadFlowEventTimerManager& operator=(const ThreadFlowEventTimerManager&) = delete;
 
-    // Run and clear the callbacks in @p pending, without holding mutex_.
+    // Run and clear the callbacks in @p pending. Always called from the
+    // owning worker thread (manager is thread-local).
     void run_callbacks(std::deque<Callback>& pending);
 
-    // Collect all due expirations and queued events into @p pending (mutex_ held).
+    // Collect all due expirations and queued events into @p pending.
+    // Same-thread access only, like every other private helper.
     void collect_ready_callbacks(std::deque<Callback>& pending,
                                  const std::chrono::steady_clock::time_point& now);
 
-    // Discard cancelled heap entries and refresh the lock-free earliest-deadline hint (mutex_ held).
+    // Discard cancelled heap entries and refresh the cached
+    // earliest-deadline hint. The "_locked" suffix is preserved for blame
+    // continuity / call-site readability — there is no actual lock; the
+    // manager is thread-local. See class invariant note below.
     void refresh_next_deadline_locked();
 
     // ---------------------------------------------------------------------
-    // Synchronisation / thread state
+    // Thread-local invariant
     // ---------------------------------------------------------------------
+    //
+    // The manager is exposed only via the static thread_local instance() in
+    // ThreadFlowEventTimer.cpp. There is no public constructor and no way
+    // to obtain a reference to another thread's instance — every member
+    // below is by-construction touched by exactly one thread for the
+    // lifetime of that thread.
+    //
+    // Earlier versions wrapped each entry point in std::lock_guard<std::mutex>
+    // and used std::atomic<> for the lock-free fast-path peek in
+    // drain_callbacks(). Both were pure overhead given the thread-local
+    // invariant: every lock acquisition was an uncontended futex op
+    // (~10-20ns each) on the per-packet path, multiplied by several calls
+    // per packet on the active pipeline. The lock and the atomics have
+    // been removed; do NOT add them back without first making the manager
+    // reachable from a thread other than its owner.
 
-    std::mutex mutex_;
     using DeadlineRep = std::chrono::steady_clock::duration::rep;
     static constexpr DeadlineRep kNoDeadline = std::numeric_limits<DeadlineRep>::max();
 
@@ -259,15 +276,17 @@ private:
     std::deque<Event> events_;
 
     /**
-     * @brief Lock-free fast-path size of `events_`.
-     *
-     * This lets drain_callbacks() skip taking mutex_ when there are no queued
-     * retransmit/duplicate events and no drop deadline has elapsed yet.
+     * @brief Cached size of `events_` for the drain_callbacks() fast-path
+     *        early-return. Plain integer because the manager is thread-local
+     *        (see "Thread-local invariant" comment above); was previously
+     *        std::atomic<std::size_t> back when access was cross-thread.
      */
-    std::atomic<std::size_t> queued_event_count_{0};
+    std::size_t queued_event_count_{0};
 
-    /// Lock-free hint for the earliest outstanding drop deadline.
-    std::atomic<DeadlineRep> next_deadline_{kNoDeadline};
+    /// Cached earliest outstanding drop deadline; same thread-local rationale
+    /// as `queued_event_count_`. drain_callbacks() reads this without taking
+    /// any lock and avoids touching the heap when no deadline has elapsed.
+    DeadlineRep next_deadline_{kNoDeadline};
 
 };
 

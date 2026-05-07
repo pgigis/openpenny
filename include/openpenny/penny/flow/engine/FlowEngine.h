@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "openpenny/agg/Stats.h"
+#include "openpenny/agg/FlowKey.h"
 #include "openpenny/config/Config.h"
 #include "openpenny/penny/flow/timer/ThreadFlowEventTimer.h"
 #include "openpenny/penny/flow/state/PennyStats.h"

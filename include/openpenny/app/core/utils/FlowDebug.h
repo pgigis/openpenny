@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "openpenny/agg/Stats.h"
+#include "openpenny/agg/FlowKey.h"
 
 #include <string>
 #include <cstdint>

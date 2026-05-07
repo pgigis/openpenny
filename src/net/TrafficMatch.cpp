@@ -2,7 +2,7 @@
 
 #include "openpenny/net/TrafficMatch.h"
 
-#include "openpenny/agg/Stats.h"
+#include "openpenny/agg/FlowKey.h"
 #include "openpenny/net/Packet.h"
 
 #include <sstream>

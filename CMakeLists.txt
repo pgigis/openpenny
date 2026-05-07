@@ -23,7 +23,6 @@ option(OPENPENNY_WITH_DPDK "Build DPDK reader" OFF)
 # --- Core library --------------------------------------------------------------
 
 set(openpenny_sources
-    src/agg/Stats.cpp
     src/config/Config.cpp
     src/control/Planner.cpp
     src/control/Policy.cpp

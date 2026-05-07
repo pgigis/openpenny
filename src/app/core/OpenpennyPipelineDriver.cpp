@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
 #include "openpenny/app/core/OpenpennyPipelineDriver.h"
-#include "openpenny/agg/Stats.h"
+#include "openpenny/agg/FlowKey.h"
 
 #include <algorithm>
 #include <utility>

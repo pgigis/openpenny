@@ -3,7 +3,7 @@
 #pragma once
 
 #include "openpenny/app/core/OpenpennyPipelineDriver.h"
-#include "openpenny/agg/Stats.h"
+#include "openpenny/agg/FlowKey.h"
 
 #include <string>
 #include <utility>

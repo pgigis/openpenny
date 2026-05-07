@@ -4,6 +4,8 @@
 
 #include "openpenny/log/Log.h"
 
+#include <arpa/inet.h>
+
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -28,16 +30,22 @@ constexpr std::uint32_t kMatchIpProto = 1u << 2;
 constexpr std::uint32_t kMatchSrcPort = 1u << 3;
 constexpr std::uint32_t kMatchDstPort = 1u << 4;
 
+// THROUGHPUT-CRITICAL CONTRACT (mirror of `struct match_rule` in
+// ebpf/af_xdp/xdp_redirect_openpenny.c): src/dst IPv4 prefix+mask and src/dst
+// ports are stored in NETWORK byte order so the BPF hot path can compare
+// directly against in-packet fields without per-packet bpf_ntohl/bpf_ntohs.
+// We do the host->network conversion exactly once here, at rule-write time.
+// If you change the on-the-wire field semantics, update the BPF program too.
 struct BpfMatchRule {
     std::uint32_t enabled;
     std::uint32_t match_fields;
-    std::uint32_t src_prefix;
-    std::uint32_t src_mask;
-    std::uint32_t dst_prefix;
-    std::uint32_t dst_mask;
-    std::uint32_t ip_proto;
-    std::uint32_t src_port;
-    std::uint32_t dst_port;
+    std::uint32_t src_prefix;   // network byte order (htonl)
+    std::uint32_t src_mask;     // network byte order (htonl)
+    std::uint32_t dst_prefix;   // network byte order (htonl)
+    std::uint32_t dst_mask;     // network byte order (htonl)
+    std::uint32_t ip_proto;     // single byte; no swap
+    std::uint32_t src_port;     // network byte order in low 16 bits (htons)
+    std::uint32_t dst_port;     // network byte order in low 16 bits (htons)
     std::uint32_t action;
     std::uint32_t qid;
     std::uint32_t use_qid;
@@ -101,18 +109,23 @@ std::string describe_kernel_rule(const BpfMatchRule& rule,
         add("proto", p ? std::string(p)
                        : std::to_string(rule.ip_proto));
     }
-    if (rule.match_fields & kMatchSrcPort) add("src_port", std::to_string(rule.src_port));
-    if (rule.match_fields & kMatchDstPort) add("dst_port", std::to_string(rule.dst_port));
+    // Rule fields are stored in network byte order in the BPF map; convert
+    // back to host order so the operator-facing log line keeps reading as a
+    // normal port number / hex IP rather than a byte-swapped surprise.
+    if (rule.match_fields & kMatchSrcPort)
+        add("src_port", std::to_string(::ntohs(static_cast<std::uint16_t>(rule.src_port))));
+    if (rule.match_fields & kMatchDstPort)
+        add("dst_port", std::to_string(::ntohs(static_cast<std::uint16_t>(rule.dst_port))));
     if (rule.match_fields & kMatchSrcIp) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "0x%08x/0x%08x",
-                      rule.src_prefix, rule.src_mask);
+                      ::ntohl(rule.src_prefix), ::ntohl(rule.src_mask));
         add("src", buf);
     }
     if (rule.match_fields & kMatchDstIp) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "0x%08x/0x%08x",
-                      rule.dst_prefix, rule.dst_mask);
+                      ::ntohl(rule.dst_prefix), ::ntohl(rule.dst_mask));
         add("dst", buf);
     }
     oss << " -> " << action_label(rule.action);
@@ -122,15 +135,19 @@ std::string describe_kernel_rule(const BpfMatchRule& rule,
 BpfMatchRule to_bpf_rule(const net::TrafficMatchRule& rule, unsigned /*queue*/) {
     BpfMatchRule out{};
     out.enabled = rule.enabled ? 1u : 0u;
+    // IPs and ports are converted host->network here so the kernel BPF program
+    // can compare them directly against in-packet fields (which are network
+    // order) without paying for a per-packet byte swap. See contract note on
+    // BpfMatchRule above.
     if (rule.src_ip) {
         out.match_fields |= kMatchSrcIp;
-        out.src_prefix = rule.src_ip->prefix_host;
-        out.src_mask = rule.src_ip->mask_host;
+        out.src_prefix = ::htonl(rule.src_ip->prefix_host);
+        out.src_mask = ::htonl(rule.src_ip->mask_host);
     }
     if (rule.dst_ip) {
         out.match_fields |= kMatchDstIp;
-        out.dst_prefix = rule.dst_ip->prefix_host;
-        out.dst_mask = rule.dst_ip->mask_host;
+        out.dst_prefix = ::htonl(rule.dst_ip->prefix_host);
+        out.dst_mask = ::htonl(rule.dst_ip->mask_host);
     }
     if (rule.ip_proto) {
         out.match_fields |= kMatchIpProto;
@@ -138,11 +155,11 @@ BpfMatchRule to_bpf_rule(const net::TrafficMatchRule& rule, unsigned /*queue*/) 
     }
     if (rule.src_port) {
         out.match_fields |= kMatchSrcPort;
-        out.src_port = static_cast<std::uint32_t>(*rule.src_port);
+        out.src_port = static_cast<std::uint32_t>(::htons(*rule.src_port));
     }
     if (rule.dst_port) {
         out.match_fields |= kMatchDstPort;
-        out.dst_port = static_cast<std::uint32_t>(*rule.dst_port);
+        out.dst_port = static_cast<std::uint32_t>(::htons(*rule.dst_port));
     }
     out.action = to_bpf_action(rule.action);
     out.qid = rule.target_queue;
@@ -235,11 +252,14 @@ bool write_xdp_rule_maps(const XdpRuleMapFds& fds,
         // Always emit the raw values at DEBUG so the bitfields are
         // available without recompiling when troubleshooting weird
         // map-mismatch bugs.
+        // Raw bitfield dump for map-mismatch debugging; ports/IPs are shown
+        // exactly as they sit in the kernel map (network byte order, per the
+        // BpfMatchRule contract above).
         TCPLOG_DEBUG(
             "[xdp_rule_live] rule_count=%u default_action=%u "
             "rule0: enabled=%u match_fields=0x%x ip_proto=%u "
-            "src_port=%u dst_port=%u src_prefix=0x%08x/0x%08x "
-            "dst_prefix=0x%08x/0x%08x action=%u qid=%u use_qid=%u",
+            "src_port_be=%u dst_port_be=%u src_prefix_be=0x%08x/0x%08x "
+            "dst_prefix_be=0x%08x/0x%08x action=%u qid=%u use_qid=%u",
             live_settings.rule_count,
             live_settings.default_action,
             live_rule.enabled,

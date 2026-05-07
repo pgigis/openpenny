@@ -1136,10 +1136,16 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
         // every 5s reflects the CURRENT run only. Without this, any pins
         // left over from a previous run carry their accumulated counter
         // values forward and the operator sees stale numbers that look
-        // suspiciously frozen. The map is BPF_MAP_TYPE_ARRAY with one
-        // entry at key 0, value = struct stats from the BPF program.
+        // suspiciously frozen.
+        //
+        // The map is BPF_MAP_TYPE_PERCPU_ARRAY (per-CPU storage was a
+        // throughput optimisation: it eliminates the cache-line bouncing
+        // that BPF_MAP_TYPE_ARRAY suffered from when XDP ran in parallel
+        // on every NIC queue). For per-CPU maps libbpf expects the value
+        // buffer to be value_size * num_possible_cpus(), so we send one
+        // zero struct per CPU.
         if (rs.stats_fd >= 0) {
-            struct {
+            struct KernelStats {
                 std::uint64_t seen;
                 std::uint64_t vlan;
                 std::uint64_t ipv4;
@@ -1151,13 +1157,20 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
                 std::uint64_t xsk_miss;
                 std::uint64_t redirect;
                 std::uint64_t pass;
-            } zero{};
-            const __u32 k0 = 0;
-            if (bpf_map_update_elem(rs.stats_fd, &k0, &zero, BPF_ANY) != 0) {
-                TCPLOG_WARN("[openpenny] failed to zero kernel stats map: %s "
-                            "(non-fatal; counters may carry over from a "
-                            "previous run)",
-                            std::strerror(errno));
+            };
+            const int ncpus = libbpf_num_possible_cpus();
+            if (ncpus > 0) {
+                std::vector<KernelStats> zero(static_cast<std::size_t>(ncpus));
+                const __u32 k0 = 0;
+                if (bpf_map_update_elem(rs.stats_fd, &k0, zero.data(), BPF_ANY) != 0) {
+                    TCPLOG_WARN("[openpenny] failed to zero kernel stats map: %s "
+                                "(non-fatal; counters may carry over from a "
+                                "previous run)",
+                                std::strerror(errno));
+                }
+            } else {
+                TCPLOG_WARN("[openpenny] libbpf_num_possible_cpus() returned %d; "
+                            "skipping stats reset", ncpus);
             }
         }
 
@@ -1359,9 +1372,14 @@ void XdpReader::log_xdp_counters_if_due() {
     }
     rs.last_counter_log = now;
 
-    // The counters map is BPF_MAP_TYPE_ARRAY with one entry, but its value is
-    // a set of __u64 counters. Matches the layout of `struct stats` in
-    // xdp_redirect_openpenny.c exactly.
+    // The counters map is BPF_MAP_TYPE_PERCPU_ARRAY with one entry per CPU.
+    // Each value is a set of __u64 counters whose layout matches `struct
+    // stats` in xdp_redirect_openpenny.c. We sum across CPUs here so the
+    // log line behaves like the previous global counter from the operator's
+    // point of view.
+    //
+    // This deliberately avoids any per-packet kernel-side atomic: each CPU
+    // increments its own cache line; the cost is paid here, once every 5s.
     struct KernelStats {
         std::uint64_t seen;
         std::uint64_t vlan;
@@ -1376,9 +1394,27 @@ void XdpReader::log_xdp_counters_if_due() {
         std::uint64_t pass;
     } stats{};
 
-    const __u32 key = 0;
-    if (bpf_map_lookup_elem(rs.stats_fd, &key, &stats) != 0) {
+    const int ncpus = libbpf_num_possible_cpus();
+    if (ncpus <= 0) {
         return;
+    }
+    std::vector<KernelStats> per_cpu(static_cast<std::size_t>(ncpus));
+    const __u32 key = 0;
+    if (bpf_map_lookup_elem(rs.stats_fd, &key, per_cpu.data()) != 0) {
+        return;
+    }
+    for (const auto& s : per_cpu) {
+        stats.seen           += s.seen;
+        stats.vlan           += s.vlan;
+        stats.ipv4           += s.ipv4;
+        stats.ssh_pass       += s.ssh_pass;
+        stats.match          += s.match;
+        stats.nomatch        += s.nomatch;
+        stats.queue_mismatch += s.queue_mismatch;
+        stats.xsk_hit        += s.xsk_hit;
+        stats.xsk_miss       += s.xsk_miss;
+        stats.redirect       += s.redirect;
+        stats.pass           += s.pass;
     }
 
     TCPLOG_INFO("[xdp_counters] seen=%llu ipv4=%llu match=%llu nomatch=%llu "

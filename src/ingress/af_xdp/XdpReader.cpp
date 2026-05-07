@@ -335,7 +335,10 @@ std::atomic<std::uint32_t> g_bind_mode_zerocopy{0};
 std::atomic<std::uint32_t> g_bind_mode_copy{0};
 
 // With XDP_USE_NEED_WAKEUP the kernel may require an explicit syscall before
-// it resumes RX processing for this AF_XDP socket.
+// it resumes RX processing for this AF_XDP socket. With SO_PREFER_BUSY_POLL
+// also enabled (see setup_socket), this same recvfrom() also drives the
+// driver's NAPI loop in this CPU's context — that's where most of the
+// throughput win from busy-poll AF_XDP actually lives.
 bool wake_rx_if_needed(xsk_socket* xsk, xsk_ring_prod& fq) {
     if (!xsk) return true;
     if (!xsk_ring_prod__needs_wakeup(&fq)) return true;
@@ -347,6 +350,12 @@ bool wake_rx_if_needed(xsk_socket* xsk, xsk_ring_prod& fq) {
     }
     TCPLOG_WARN("AF_XDP RX wakeup failed: %s", std::strerror(errno));
     return false;
+}
+
+// Cheap branch-only check (no syscall). Lets the hot path coalesce many
+// refill operations into a single wakeup at the end of a batch.
+inline bool fq_needs_wakeup(const xsk_ring_prod& fq) {
+    return xsk_ring_prod__needs_wakeup(&fq) != 0;
 }
 
 } // namespace
@@ -738,6 +747,63 @@ bool XdpReader::open(const std::string& ifname, unsigned queue) {
         rs.pfd.fd    = xsk_socket__fd(rs.xsk);
         rs.pfd.events = POLLIN;
         rs.ready     = true;
+
+        // Enable application-driven NAPI ("busy poll") whenever we're in
+        // non-blocking polling mode. This is the single biggest throughput
+        // lever available on modern (5.11+) kernels for AF_XDP:
+        //
+        //   * SO_PREFER_BUSY_POLL = 1 tells the kernel to prefer running
+        //     the NAPI loop directly in the recvfrom()/poll() syscall on
+        //     this socket instead of relying on the IRQ -> softirq path.
+        //     That removes a context switch per RX batch and lets the
+        //     consuming CPU keep its L1/L2 hot.
+        //   * SO_BUSY_POLL is the time budget (microseconds) the kernel
+        //     will spin in the NAPI loop before returning. 50us is the
+        //     value the kernel docs recommend for AF_XDP; smaller values
+        //     under-utilise the cycle and larger ones starve other work.
+        //   * SO_BUSY_POLL_BUDGET caps how many packets one NAPI cycle
+         //    will pull. Matching it to our peek batch size avoids
+        //     leaving frames stranded in the driver between cycles.
+        //
+        // Together with XDP_USE_NEED_WAKEUP (already enabled above) this
+        // gives the canonical "syscall == NAPI poke + drain" model that
+        // mlx5/i40e/ice all optimise for. We only enable it when the
+        // application is in non-blocking mode (poll_timeout_ms == 0); a
+        // blocking caller wants the kernel-IRQ path for power reasons.
+#ifndef SO_PREFER_BUSY_POLL
+#define SO_PREFER_BUSY_POLL 69
+#endif
+#ifndef SO_BUSY_POLL_BUDGET
+#define SO_BUSY_POLL_BUDGET 70
+#endif
+        if (impl.opts.poll_timeout_ms == 0) {
+            const int one = 1;
+            const int busy_us = 50;
+            const int busy_budget = static_cast<int>(
+                std::max<unsigned>(impl.opts.batch, 64u));
+            if (::setsockopt(rs.pfd.fd, SOL_SOCKET, SO_PREFER_BUSY_POLL,
+                             &one, sizeof(one)) != 0) {
+                TCPLOG_DEBUG("[xdp_busy_poll] queue=%u: SO_PREFER_BUSY_POLL "
+                             "not supported (%s); RX will use IRQ-driven NAPI",
+                             queue, std::strerror(errno));
+            } else {
+                if (::setsockopt(rs.pfd.fd, SOL_SOCKET, SO_BUSY_POLL,
+                                 &busy_us, sizeof(busy_us)) != 0) {
+                    TCPLOG_DEBUG("[xdp_busy_poll] queue=%u: SO_BUSY_POLL=%d "
+                                 "rejected (%s); continuing with prefer-only",
+                                 queue, busy_us, std::strerror(errno));
+                }
+                if (::setsockopt(rs.pfd.fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET,
+                                 &busy_budget, sizeof(busy_budget)) != 0) {
+                    TCPLOG_DEBUG("[xdp_busy_poll] queue=%u: SO_BUSY_POLL_BUDGET=%d "
+                                 "rejected (%s); kernel will use its default",
+                                 queue, busy_budget, std::strerror(errno));
+                }
+                TCPLOG_DEBUG("[xdp_busy_poll] queue=%u: enabled "
+                             "(prefer=1 us=%d budget=%d)",
+                             queue, busy_us, busy_budget);
+            }
+        }
 
         // Authoritative check: ask the kernel which (ifindex, queue_id)
         // the socket actually bound to via getsockname(). The kernel's
@@ -1509,11 +1575,35 @@ void XdpReader::log_xdp_counters_if_due() {
 // driver has buffers to fill with new RX.
 //
 // Polling model:
-//   * poll_timeout_ms == 0 -> non-blocking. We do one short poll() to give
-//     the kernel a chance to drain NAPI for us, but we never block. Caller
-//     is expected to spin.
-//   * poll_timeout_ms > 0  -> blocking with timeout. We wait up to N ms
-//     for POLLIN before peeking, which is more CPU-friendly.
+//   * poll_timeout_ms == 0 -> non-blocking. We never call ::poll() in this
+//     mode; the SO_PREFER_BUSY_POLL setup in setup_socket() routes NAPI
+//     work into the wake_rx_if_needed() recvfrom() instead, which is far
+//     cheaper than a full ::poll() syscall on every iteration. Caller
+//     spins.
+//   * poll_timeout_ms > 0  -> blocking with timeout. We call ::poll() only
+//     when the RX ring is empty, then peek again. Avoids the per-iteration
+//     syscall the previous version paid even when frames were ready.
+//
+// Throughput-critical hot-path notes (don't undo lightly):
+//   * No syscall before a successful peek. The old code called ::poll() at
+//     the top of every iteration, which is ~1us of pure waste at line rate.
+//   * Per-batch atomic flushes, not per-iteration. The g_userspace_*
+//     atomics bounce a cache line across every worker CPU and used to be
+//     hit on every inner iteration; we accumulate locally and flush once
+//     at the end of poll().
+//   * One timestamp per batch. now_ns() is a vDSO call (~20ns); per-packet
+//     stamping at 10Mpps burns ~200ms/sec of CPU. Frames inside a single
+//     batch share an arrival window of well under a microsecond — finer
+//     resolution costs more than it's worth for this pipeline.
+//   * One wake_rx_if_needed() per refill batch, not per refilled frame.
+//     The old per-frame fallback path issued recvfrom() per packet on
+//     fill-ring contention.
+//   * Aligned UMEM (umem_cfg.flags == 0): use xsk_umem__get_data which is
+//     just `umem_area + addr` with no mask. The old XSK_UNALIGNED_BUF_ADDR_MASK
+//     was misleading (it's an unaligned-mode helper) and the AND was wasted
+//     work on the hot path.
+//   * Prefetch the next descriptor and the next packet's first cacheline
+//     so the CPU has them by the time the handler() call returns.
 bool XdpReader::poll(const net::PacketHandler& handler, std::size_t budget) {
 #ifndef OPENPENNY_WITH_LIBBPF
     (void)handler;
@@ -1528,54 +1618,109 @@ bool XdpReader::poll(const net::PacketHandler& handler, std::size_t budget) {
     const std::size_t max_batch = budget ? std::max<std::size_t>(budget, impl_->opts.batch)
                                          : impl_->opts.batch;
     const int poll_timeout = static_cast<int>(impl_->opts.poll_timeout_ms);
+    const bool blocking_mode = (poll_timeout > 0);
     std::size_t processed = 0;
 
     g_userspace_poll_calls.fetch_add(1, std::memory_order_relaxed);
 
-    while (processed < max_batch) {
-        // Give the driver a chance to run NAPI and move frames into our RX
-        // ring. In busy-poll mode (timeout == 0) this is effectively a
-        // yield; with a positive timeout it's a proper block.
-        (void)::poll(&rs.pfd, 1, poll_timeout);
+    // Per-call accumulators. Flushed to global atomics ONCE at the end of
+    // poll() instead of on every inner iteration.
+    std::uint64_t local_rx_packets      = 0;
+    std::uint64_t local_decode_failures = 0;
+    std::uint32_t local_peek_zero       = 0;
 
+    // Hard cap per peek: matches the deferred-refill scratch buffer below
+    // so the slow path can never bleed FQ slots even if a caller configures
+    // an unusually large Options::batch. Bulk_refill (the fast path) is
+    // unaffected.
+    constexpr uint32_t kMaxPeekPerCall = 1024;
+
+    while (processed < max_batch) {
+        // Peek FIRST. Only fall through to wakeup/poll() when the RX ring
+        // is empty — the common case at line rate is "we already have
+        // frames waiting" and we don't want to pay a syscall to discover
+        // that.
         uint32_t idx_rx = 0;
-        const uint32_t want = static_cast<uint32_t>(max_batch - processed);
+        uint32_t want = static_cast<uint32_t>(max_batch - processed);
+        if (want > kMaxPeekPerCall) want = kMaxPeekPerCall;
         uint32_t rcvd = xsk_ring_cons__peek(&rs.rx, want, &idx_rx);
 
         if (!rcvd) {
-            // No frames yet. If NEED_WAKEUP is set and the driver is idle,
-            // poke it via recvfrom() so it starts servicing the rings. Then
-            // peek one more time before deciding to bail.
+            // Empty ring. With SO_PREFER_BUSY_POLL + XDP_USE_NEED_WAKEUP
+            // the recvfrom() inside wake_rx_if_needed() drives the driver's
+            // NAPI loop in this CPU's context, so it doubles as both the
+            // "wake the driver" poke and the "drain a NAPI cycle" call.
             wake_rx_if_needed(rs.xsk, rs.fq);
+
+            if (blocking_mode) {
+                // Blocking mode: wait for POLLIN with the configured timeout
+                // before retrying the peek. We only spend the ::poll()
+                // syscall here — never on the hot per-iteration path.
+                (void)::poll(&rs.pfd, 1, poll_timeout);
+            }
+
             rcvd = xsk_ring_cons__peek(&rs.rx, want, &idx_rx);
             if (!rcvd) {
-                g_userspace_peek_zero.fetch_add(1, std::memory_order_relaxed);
+                ++local_peek_zero;
                 break;
             }
         }
 
-        g_userspace_rx_packets.fetch_add(rcvd, std::memory_order_relaxed);
-        const std::uint64_t decode_failures_before = rs.decode_failures;
+        local_rx_packets += rcvd;
+
+        // Single batch timestamp. See note at function header.
+        const std::uint64_t batch_ts_ns = now_ns();
 
         // Reserve slots in the fill ring up front so we can return each
-        // consumed frame address after dispatching its packet. If we can't
-        // get the whole batch at once we fall back to one-at-a-time refills.
+        // consumed frame address after dispatching its packet. With our
+        // sizing (fill_size == num_frames, num_frames >> rx_ring) this
+        // reservation effectively always succeeds in bulk. The deferred
+        // fallback below stages frame addresses and resubmits them once,
+        // outside the hot loop, so even fill-ring contention can't turn
+        // into a syscall storm.
         uint32_t refill_idx = 0;
         const uint32_t reserved = xsk_ring_prod__reserve(&rs.fq, rcvd, &refill_idx);
         const bool bulk_refill = (reserved == rcvd);
 
+        // Deferred-refill scratch: only used when bulk reservation came
+        // up short. Sized to the largest possible batch so we avoid heap
+        // allocation on the hot path.
+        uint64_t deferred_addrs[1024];
+        uint32_t deferred_count = 0;
+        const uint32_t deferred_cap =
+            static_cast<uint32_t>(sizeof(deferred_addrs) / sizeof(deferred_addrs[0]));
+
         for (uint32_t i = 0; i < rcvd; ++i) {
             const xdp_desc* desc = xsk_ring_cons__rx_desc(&rs.rx, idx_rx + i);
+
+            // Prefetch the next descriptor's metadata and the next packet's
+            // first cacheline. The handler() call below is large enough that
+            // by the time control returns, these prefetches will have
+            // resolved. Skipped on the last iteration where there's no
+            // "next".
+            if (i + 1 < rcvd) {
+                const xdp_desc* next_desc =
+                    xsk_ring_cons__rx_desc(&rs.rx, idx_rx + i + 1);
+                __builtin_prefetch(next_desc, 0 /*read*/, 3 /*hi locality*/);
+                const uint8_t* next_pkt =
+                    static_cast<const uint8_t*>(
+                        xsk_umem__get_data(rs.umem_area, next_desc->addr));
+                __builtin_prefetch(next_pkt,        0, 0);
+                __builtin_prefetch(next_pkt + 64,   0, 0);
+            }
+
             const uint64_t addr = desc->addr;
             const uint32_t len  = desc->len;
 
-            const uint8_t* pkt = static_cast<const uint8_t*>(rs.umem_area) +
-                                 (addr & XSK_UNALIGNED_BUF_ADDR_MASK);
+            // Aligned UMEM: descriptor address is a direct offset into the
+            // UMEM region. xsk_umem__get_data is just `umem_area + addr`.
+            const uint8_t* pkt = static_cast<const uint8_t*>(
+                xsk_umem__get_data(rs.umem_area, addr));
             ++rs.rx_packets;
 
             net::PacketView packet{};
             if (net::PacketParser::decode(pkt, len, packet)) {
-                packet.timestamp_ns = now_ns();
+                packet.timestamp_ns = batch_ts_ns;
                 // Publish the L2 frame so egress sinks that need to
                 // forward via the NIC (e.g. RawNicSink with SOCK_RAW)
                 // can replay the original Ethernet header.
@@ -1584,35 +1729,43 @@ bool XdpReader::poll(const net::PacketHandler& handler, std::size_t budget) {
                 handler(packet);
             } else {
                 ++rs.decode_failures;
+                ++local_decode_failures;
             }
 
             // Return the frame to the kernel so it can refill it.
             if (bulk_refill) {
                 *xsk_ring_prod__fill_addr(&rs.fq, refill_idx + i) = addr;
-            } else {
-                uint32_t single_idx = 0;
-                if (xsk_ring_prod__reserve(&rs.fq, 1, &single_idx) == 1) {
-                    *xsk_ring_prod__fill_addr(&rs.fq, single_idx) = addr;
-                    xsk_ring_prod__submit(&rs.fq, 1);
-                    wake_rx_if_needed(rs.xsk, rs.fq);
-                }
+            } else if (deferred_count < deferred_cap) {
+                deferred_addrs[deferred_count++] = addr;
             }
+            // If deferred_addrs overflows (rcvd > deferred_cap, which the
+            // current rx_ring sizing makes impossible) we drop those
+            // refills — the fill ring will be topped up on the next batch.
         }
 
+        // Single submit + single conditional wake per batch — the old code
+        // could fire one wake per refilled frame in the slow path.
         if (bulk_refill) {
             xsk_ring_prod__submit(&rs.fq, rcvd);
+        } else if (deferred_count > 0) {
+            uint32_t deferred_idx = 0;
+            const uint32_t got = xsk_ring_prod__reserve(&rs.fq,
+                                                        deferred_count,
+                                                        &deferred_idx);
+            for (uint32_t i = 0; i < got; ++i) {
+                *xsk_ring_prod__fill_addr(&rs.fq, deferred_idx + i) =
+                    deferred_addrs[i];
+            }
+            if (got > 0) {
+                xsk_ring_prod__submit(&rs.fq, got);
+            }
+        }
+        if (fq_needs_wakeup(rs.fq)) {
             wake_rx_if_needed(rs.xsk, rs.fq);
         }
 
         xsk_ring_cons__release(&rs.rx, rcvd);
         processed += rcvd;
-
-        const std::uint64_t decode_failures_delta =
-            rs.decode_failures - decode_failures_before;
-        if (decode_failures_delta) {
-            g_userspace_decode_failures.fetch_add(
-                decode_failures_delta, std::memory_order_relaxed);
-        }
 
         // When caller passes budget==0 we only poll once per call.
         if (!budget) break;
@@ -1639,6 +1792,24 @@ bool XdpReader::poll(const net::PacketHandler& handler, std::size_t budget) {
                     rs.num_frames);
             }
         }
+    }
+
+    // Flush the per-call accumulators to the cross-worker atomics ONCE.
+    // The previous implementation hit these on every inner iteration, which
+    // bounced the counter cache lines across every CPU running a queue
+    // worker. With per-call flushing, the bus traffic is proportional to
+    // poll() invocations, not RX batches.
+    if (local_rx_packets) {
+        g_userspace_rx_packets.fetch_add(local_rx_packets,
+                                         std::memory_order_relaxed);
+    }
+    if (local_decode_failures) {
+        g_userspace_decode_failures.fetch_add(local_decode_failures,
+                                              std::memory_order_relaxed);
+    }
+    if (local_peek_zero) {
+        g_userspace_peek_zero.fetch_add(local_peek_zero,
+                                        std::memory_order_relaxed);
     }
 
     // Sample this socket's per-queue kernel-side XDP statistics no more than

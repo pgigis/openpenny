@@ -20,7 +20,7 @@ want a tweak that applies to one run only.
       "max_duplicate_ratio": 0.15,
       "max_reordering_ratio": 0.8,
       "retransmission_observation_miss_rate": 0.05,
-      "retransmission_timeout_multiplier": 3.0,
+      "retransmission_timeout_in_seconds": 3.0,
       "max_packet_drops_per_flow": 6,
       "max_packet_drops_global_aggregate": 12
     },

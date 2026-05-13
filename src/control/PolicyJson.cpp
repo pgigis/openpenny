@@ -40,7 +40,7 @@ nlohmann::json threshold_json(const TestThresholds& t) {
         {"max_duplicate_ratio", t.max_duplicate_ratio},
         {"max_reordering_ratio", t.max_reordering_ratio},
         {"retransmission_observation_miss_rate", t.retransmission_observation_miss_rate},
-        {"retransmission_timeout_multiplier", t.retransmission_timeout_multiplier},
+        {"retransmission_timeout_in_seconds", t.retransmission_timeout_in_seconds},
         {"admission_grace_period_seconds", t.admission_grace_period_seconds},
         {"monitored_flow_idle_expiry_seconds", t.monitored_flow_idle_expiry_seconds},
         {"drop_state_seconds", t.drop_state_seconds},

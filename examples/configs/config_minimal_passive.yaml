@@ -1,44 +1,21 @@
-# Minimal passive-mode configuration — single file, no includes.
-#
-# The shortest config that observes traffic without touching it. No
-# packets are dropped. Stops on the first of the configured passive
-# conditions.
-#
-# Use this as a teaching / first-read reference. The production-shaped
-# example with includes is `config_passive.yaml`.
+# Smallest passive-mode config. Observes only, never drops.
 #
 # Run:
-#   sudo ./build/openpenny_cli \
-#       --config examples/configs/config_minimal_passive.yaml \
-#       --mode passive --iface <ifname> --queue 0
-
-log:
-  mode: console
-  level: info
+#   sudo ./build/openpenny_cli --config $0 --mode passive --iface <ifname>
 
 traffic_policy:
   default: exclude
   rules:
-    - name: example-tcp-5201
-      decision: include
-      protocol: tcp
-      dst_port: 5201
+    - { decision: include, protocol: tcp, dst_port: 5201 }
 
 runtime_policy:
   mode: passive
-  safety:
-    allow_ssh_bypass: true
-  aggregates:
-    enabled: false
   thresholds:
     passive_min_flows_to_finish: 10
-    passive_max_parallel_flows: 10
     passive_max_execution_time_seconds: 150
 
 platform:
   backend: af_xdp
-  ingress_mode: auto
-  # interface / queue / queue_count come from the CLI flags above.
 
 egress:
   kind: none

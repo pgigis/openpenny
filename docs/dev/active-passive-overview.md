@@ -33,7 +33,7 @@ NIC -> {AF_XDP redirect | AF_PACKET copy | DPDK} -> PacketSource -> PacketParser
 - Injects controlled drops to elicit retransmissions (Penny heuristic).
 - Key config (`runtime_policy.thresholds`):
   - `packet_drop_probability`, `max_duplicate_ratio`, `max_reordering_ratio`.
-  - `retransmission_timeout_multiplier`, `admission_grace_period_seconds`, `monitored_flow_idle_expiry_seconds`.
+  - `retransmission_timeout_in_seconds`, `admission_grace_period_seconds`, `monitored_flow_idle_expiry_seconds`.
   - `max_packet_drops_per_flow`, `max_packet_drops_global_aggregate`, `stop_after_individual_flows`.
 - Flow lifecycle:
   - `ThreadFlowManager` admits flows, binds drop sinks, and hands packets to `FlowEngine`.

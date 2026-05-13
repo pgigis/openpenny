@@ -76,14 +76,6 @@ std::string lower_copy(std::string value) {
 // "select", "redirect_to_userspace") will now fail validation; map
 // them to the canonical spelling shown below.
 
-std::optional<PacketInputBackend> parse_backend(const std::string& value) {
-    const auto normalized = lower_copy(value);
-    if (normalized == "af_xdp")           return PacketInputBackend::XdpAfXdp;
-    if (normalized == "dpdk")             return PacketInputBackend::Dpdk;
-    if (normalized == "af_packet_mirror") return PacketInputBackend::AfPacketMirror;
-    return std::nullopt;
-}
-
 std::optional<IngressMode> parse_ingress_mode(const std::string& value) {
     const auto normalized = lower_copy(value);
     if (normalized == "auto" || normalized.empty()) return IngressMode::Auto;
@@ -601,6 +593,14 @@ std::optional<Config> Config::from_file(const std::string& path) {
         if (auto platform = root["platform"]) {
             apply_platform_config(platform, cfg.desired_config.platform);
             has_platform_config = true;
+            // Ingress semantics live on the legacy InputConfig today.
+            // Carry `platform.ingress_mode` across to it so the pipeline
+            // driver sees the operator's choice.
+            if (auto mode_node = platform["ingress_mode"]) {
+                if (auto parsed = parse_ingress_mode(mode_node.as<std::string>())) {
+                    cfg.input.mode = *parsed;
+                }
+            }
         }
 
         // Egress block: declarative configuration of the PacketSink used

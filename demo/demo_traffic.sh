@@ -6,11 +6,16 @@
 # single command so a live walkthrough doesn't have to remember every
 # flag, and tears the children down cleanly when you're done.
 #
+# Each scenario opens with a framed banner that names what's being sent
+# and the verdict openpenny should reach, so the audience can score the
+# other pane in real time. `walkthrough` chains all four with pauses;
+# `dry-run` prints the same banners so it doubles as a run-of-show.
+#
 # Doesn't touch openpenny and doesn't reimplement anything from
 # tools/traffic_generator/ -- it only shells out to run.sh, which
 # already knows about sudo, the venv, and the Python scripts.
 #
-# Modes:
+# Scenarios:
 #
 #   legitimate  Real TCP client against the receiver. Full handshake +
 #               steady payload + clean FIN. openpenny should observe
@@ -29,19 +34,27 @@
 #               Hammers identical SEQ/ACK pairs at openpenny so the
 #               aggregate duplicate-fraction threshold trips.
 #
+# Control commands:
+#
+#   walkthrough Run all four scenarios in order with banners and a
+#               pause between them. Defaults to press-Enter; pass
+#               --auto N (or AUTO_PAUSE_SECS=N) for an N-second sleep
+#               so an unattended recording can run end-to-end.
+#
 #   stop        Terminate every background generator the demo started.
 #               Idempotent.
 #
-#   dry-run     Print the commands that would run, in order, without
-#               actually running anything. Optionally takes a mode name
-#               to limit the dump to one scenario.
+#   dry-run     Print the banners and commands that would run, in
+#               order, without actually running anything. Optionally
+#               takes a scenario name to limit the dump.
 #
 # Usage:
 #   ./demo_traffic.sh legitimate
 #   ./demo_traffic.sh spoofed
 #   ./demo_traffic.sh mixed
 #   ./demo_traffic.sh duplicates
-#   ./demo_traffic.sh dry-run [legitimate|spoofed|mixed|duplicates]
+#   ./demo_traffic.sh walkthrough [--auto N]
+#   ./demo_traffic.sh dry-run [legitimate|spoofed|mixed|duplicates|walkthrough]
 #   ./demo_traffic.sh stop
 #
 # All knobs in the CONFIG block below can be overridden via env vars,
@@ -88,6 +101,11 @@ DUPLICATE_RATE="${DUPLICATE_RATE:-0.5}"
 # so the legit flow is established before spoofed background appears.
 MIXED_STAGGER_SECS="${MIXED_STAGGER_SECS:-3}"
 
+# Walkthrough pacing.
+#   ""  -> press-Enter prompt between scenarios.
+#   N   -> sleep N seconds instead. Also set by `walkthrough --auto N`.
+AUTO_PAUSE_SECS="${AUTO_PAUSE_SECS:-}"
+
 # -----------------------------------------------------------------------------
 # Internal state
 # -----------------------------------------------------------------------------
@@ -99,8 +117,17 @@ RUN_SH="${TG_DIR}/run.sh"
 
 PID_FILE="${PID_FILE:-/tmp/openpenny-demo-traffic.pids}"
 LOG_FILE="${LOG_FILE:-/tmp/openpenny-demo-traffic.log}"
+# Markers file: one line per scenario boundary. A tailer on the
+# openpenny pane can follow this to line up verdicts with scenario
+# starts/ends when scrubbing back through a recording.
+MARKERS_FILE="${MARKERS_FILE:-/tmp/openpenny-demo-traffic.markers}"
 
 DRY_RUN="${DRY_RUN:-0}"
+
+# Banner counters. `walkthrough` sets SCENARIO_TOTAL to 4; single-mode
+# runs leave it at 1 so the banner reads "[1/1]".
+SCENARIO_TOTAL="${SCENARIO_TOTAL:-1}"
+SCENARIO_INDEX=0
 
 # ANSI prefixes for the demo prompts. Stripped automatically when the
 # shell isn't a TTY (so logs and tee'd output stay clean).
@@ -111,15 +138,92 @@ if [[ -t 1 ]]; then
     C_MIX="\033[35m"     # magenta
     C_DUP="\033[31m"     # red
     C_CLEAN="\033[34m"   # blue
+    C_BOLD="\033[1m"
+    C_DIM="\033[2m"
     C_RST="\033[0m"
 else
-    C_SETUP=""; C_LEGIT=""; C_SPOOF=""; C_MIX=""; C_DUP=""; C_CLEAN=""; C_RST=""
+    C_SETUP=""; C_LEGIT=""; C_SPOOF=""; C_MIX=""; C_DUP=""; C_CLEAN=""
+    C_BOLD=""; C_DIM=""; C_RST=""
 fi
+
+# 72-char rule used at the top and bottom of every scenario banner.
+RULE="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 say() {
     # say <prefix-color> <prefix-tag> <message...>
     local color="$1" tag="$2"; shift 2
     printf "${color}[%s]${C_RST} %s\n" "${tag}" "$*"
+}
+
+# -----------------------------------------------------------------------------
+# Banner / recap / markers
+# -----------------------------------------------------------------------------
+
+# Stamp a scenario boundary into the main log and the sidecar markers
+# file. The receiver/openpenny pane can `tail -F` MARKERS_FILE to line
+# its verdicts up with scenario boundaries after the fact.
+mark_scenario() {
+    # mark_scenario <BEGIN|END> <tag> <note...>
+    local phase="$1" tag="$2"; shift 2
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local line="=== SCENARIO ${tag} ${phase} ts=${ts} :: $* ==="
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        printf "%s\n" "${line}"
+        return 0
+    fi
+    mkdir -p "$(dirname "${LOG_FILE}")" "$(dirname "${MARKERS_FILE}")"
+    printf "%s\n" "${line}" >> "${LOG_FILE}"
+    printf "%s\n" "${line}" >> "${MARKERS_FILE}"
+}
+
+# Banner block printed before each scenario runs. Names the scenario,
+# what's about to be sent, and the openpenny verdict the audience
+# should look for on the other pane.
+banner() {
+    # banner <color> <tag> <title> <send-line> <expect-line>
+    local color="$1" tag="$2" title="$3" send="$4" expect="$5"
+    SCENARIO_INDEX=$((SCENARIO_INDEX + 1))
+    local progress="[${SCENARIO_INDEX}/${SCENARIO_TOTAL}]"
+    printf "\n${color}%s${C_RST}\n" "${RULE}"
+    printf "${color}┃${C_RST} ${C_BOLD}%s SCENARIO: %s${C_RST}\n" "${progress}" "${title}"
+    printf "${color}┃${C_RST} ${C_DIM}sending:${C_RST} %s\n" "${send}"
+    printf "${color}┃${C_RST} ${C_DIM}expect: ${C_RST} %s ${C_DIM}(watch openpenny pane)${C_RST}\n" "${expect}"
+    printf "${color}%s${C_RST}\n" "${RULE}"
+    mark_scenario "BEGIN" "${tag}" "${title}"
+}
+
+# One-line recap printed after each scenario finishes. Mirrors the
+# `expect` line on the banner so a recording reviewer can see the
+# hypothesis and the close-out next to each other.
+recap() {
+    # recap <color> <tag> <recap-line...>
+    local color="$1" tag="$2"; shift 2
+    printf "${color}└─${C_RST} ${C_BOLD}recap${C_RST} ${color}─${C_RST} %s\n" "$*"
+    mark_scenario "END" "${tag}" "$*"
+}
+
+# Walkthrough pause: wait for Enter, or sleep AUTO_PAUSE_SECS if set,
+# or no-op if no TTY (so piped/recorded runs don't hang forever).
+walkthrough_pause() {
+    # walkthrough_pause <next-scenario-name>
+    local next="$1"
+    if [[ -n "${AUTO_PAUSE_SECS}" ]]; then
+        say "${C_SETUP}" "pause" "auto-pause ${AUTO_PAUSE_SECS}s before: ${next}"
+        if [[ "${DRY_RUN}" != "1" ]]; then
+            sleep "${AUTO_PAUSE_SECS}"
+        fi
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        say "${C_SETUP}" "pause" "no TTY for prompt; continuing to: ${next}"
+        return 0
+    fi
+    say "${C_SETUP}" "pause" "press Enter to continue with: ${next}"
+    if [[ "${DRY_RUN}" != "1" ]]; then
+        # shellcheck disable=SC2034
+        read -r _ || true
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -243,13 +347,15 @@ trap on_signal INT TERM
 mode_legitimate() {
     # Real SYN, real ACKs from the receiver, payload, clean FIN.
     # openpenny should reach a CLOSED_LOOP verdict on this flow.
-    say "${C_LEGIT}" "legitimate" "starting TCP traffic"
-    say "${C_LEGIT}" "legitimate" "src=${LEGIT_SRC_HOST} dst=${LEGIT_DST_HOST}:${LEGIT_DST_PORT} interval=${LEGIT_INTERVAL_SECS}s duration=${DURATION_SECONDS}s"
+    banner "${C_LEGIT}" "legitimate" \
+        "legitimate (closed-loop control)" \
+        "real TCP client ${LEGIT_SRC_HOST} -> ${LEGIT_DST_HOST}:${LEGIT_DST_PORT}, ${DURATION_SECONDS}s" \
+        "CLOSED_LOOP verdict on the flow"
     launch_fg "legitimate" "${DURATION_SECONDS}" \
         "${RUN_SH}" client "${LEGIT_DST_HOST}" "${LEGIT_DST_PORT}" \
             --interval "${LEGIT_INTERVAL_SECS}"
-    say "${C_LEGIT}" "legitimate" "traffic running"
-    say "${C_LEGIT}" "legitimate" "done"
+    recap "${C_LEGIT}" "legitimate" \
+        "real handshake to ${LEGIT_DST_HOST}:${LEGIT_DST_PORT} for ${DURATION_SECONDS}s; openpenny pane should show CLOSED_LOOP."
 }
 
 # Internal: spoofed launcher shared by spoofed/mixed/duplicates so all
@@ -279,19 +385,26 @@ mode_spoofed() {
     # Forged source IP means the receiver's ACKs (if any) go nowhere,
     # the conversation never closes, and openpenny's flow engine sees
     # an open-loop flow -- the closed-loop check fails.
-    say "${C_SPOOF}" "spoofed" "sending spoofed packets"
-    say "${C_SPOOF}" "spoofed" "source=${SPOOFED_SRC_IP}"
-    say "${C_SPOOF}" "spoofed" "destination=${SPOOFED_DST_IP}:${SPOOFED_DST_PORT}"
-    say "${C_SPOOF}" "spoofed" "rate=${PACKET_RATE} pps  duration=${DURATION_SECONDS}s  iface=${SPOOFED_IFACE}"
+    local count
+    count="$(spoof_count_for_duration "${DURATION_SECONDS}" "${PACKET_RATE}")"
+    banner "${C_SPOOF}" "spoofed" \
+        "spoofed (forged source IP)" \
+        "~${count} pkts @ ${PACKET_RATE}pps src=${SPOOFED_SRC_IP} dst=${SPOOFED_DST_IP}:${SPOOFED_DST_PORT}" \
+        "closed-loop check FAILS (no return path)"
     _launch_spoof "spoofed" fg 0.0
-    say "${C_SPOOF}" "spoofed" "done"
+    recap "${C_SPOOF}" "spoofed" \
+        "sent ~${count} forged-source pkts to ${SPOOFED_DST_IP}:${SPOOFED_DST_PORT}; openpenny pane should show closed-loop failed."
 }
 
 mode_mixed() {
     # Both flows on the same wire, same destination. openpenny should
     # still reach the CLOSED_LOOP verdict for the legit flow while
     # flagging the spoofed background.
-    say "${C_MIX}" "mixed" "starting legitimate traffic first"
+    banner "${C_MIX}" "mixed" \
+        "mixed (legit + spoofed on the same wire)" \
+        "legit ${LEGIT_DST_HOST}:${LEGIT_DST_PORT} + spoofed ${SPOOFED_SRC_IP} -> ${SPOOFED_DST_IP} @ ${PACKET_RATE}pps" \
+        "CLOSED_LOOP for legit flow; spoofed flow fails closed-loop check"
+    say "${C_MIX}" "mixed" "starting legitimate flow first"
     launch_bg "legitimate" "${DURATION_SECONDS}" \
         "${RUN_SH}" client "${LEGIT_DST_HOST}" "${LEGIT_DST_PORT}" \
             --interval "${LEGIT_INTERVAL_SECS}"
@@ -305,19 +418,46 @@ mode_mixed() {
     if [[ "${DRY_RUN}" != "1" ]]; then
         wait
     fi
-    say "${C_MIX}" "mixed" "summary: legitimate dst=${LEGIT_DST_HOST}:${LEGIT_DST_PORT}, spoofed src=${SPOOFED_SRC_IP} dst=${SPOOFED_DST_IP}:${SPOOFED_DST_PORT} rate=${PACKET_RATE}pps"
-    say "${C_MIX}" "mixed" "done"
+    recap "${C_MIX}" "mixed" \
+        "ran legit + spoofed concurrently for ${DURATION_SECONDS}s; openpenny pane should show CLOSED_LOOP only for the legit flow."
 }
 
 mode_duplicates() {
     # Stresses aggregate analysis: the flow engine's
     # duplicate-fraction threshold is the relevant knob to watch on
     # openpenny's side.
-    say "${C_DUP}" "duplicates" "starting duplicate-heavy traffic"
-    say "${C_DUP}" "duplicates" "duplicate_rate=${DUPLICATE_RATE}"
-    say "${C_DUP}" "duplicates" "duration=${DURATION_SECONDS}s rate=${PACKET_RATE}pps iface=${SPOOFED_IFACE}"
+    local count
+    count="$(spoof_count_for_duration "${DURATION_SECONDS}" "${PACKET_RATE}")"
+    banner "${C_DUP}" "duplicates" \
+        "duplicates (duplicate-heavy spoofed flow)" \
+        "~${count} pkts @ ${PACKET_RATE}pps, dup-prob=${DUPLICATE_RATE} on ${SPOOFED_IFACE}" \
+        "duplicate-fraction threshold trips on the aggregate"
     _launch_spoof "duplicates" fg "${DUPLICATE_RATE}"
-    say "${C_DUP}" "duplicates" "done"
+    recap "${C_DUP}" "duplicates" \
+        "sent duplicate-heavy spoofed flow (dup-prob=${DUPLICATE_RATE}); openpenny pane should show duplicate-fraction threshold tripped."
+}
+
+mode_walkthrough() {
+    # Run all four scenarios in order with banners and a pause between
+    # them. Updates SCENARIO_TOTAL so the banner counter shows progress.
+    SCENARIO_TOTAL=4
+    SCENARIO_INDEX=0
+    local pause_desc
+    if [[ -n "${AUTO_PAUSE_SECS}" ]]; then
+        pause_desc="${AUTO_PAUSE_SECS}s auto"
+    else
+        pause_desc="press Enter"
+    fi
+    say "${C_SETUP}" "walkthrough" "running all 4 scenarios. Pause between each: ${pause_desc}."
+    say "${C_SETUP}" "walkthrough" "markers will land in ${MARKERS_FILE}"
+    mode_legitimate
+    walkthrough_pause "spoofed"
+    mode_spoofed
+    walkthrough_pause "mixed"
+    mode_mixed
+    walkthrough_pause "duplicates"
+    mode_duplicates
+    say "${C_SETUP}" "walkthrough" "all scenarios complete."
 }
 
 mode_stop() {
@@ -326,14 +466,21 @@ mode_stop() {
 }
 
 mode_dry_run() {
-    # Dry-run dispatch: with no arg, print every mode. Otherwise print
-    # only the requested one. Re-enters the mode_* functions with
-    # DRY_RUN=1 set so the same code path produces the announcement.
+    # Dry-run dispatch: with no arg (or `walkthrough`/`all`), print
+    # every scenario with banners. Otherwise print only the requested
+    # one. Re-enters the mode_* functions with DRY_RUN=1 set so the
+    # same code path produces the announcement.
     DRY_RUN=1
     local target="${1:-all}"
     case "${target}" in
-        legitimate|spoofed|mixed|duplicates) "mode_${target}" ;;
-        all)
+        legitimate|spoofed|mixed|duplicates)
+            SCENARIO_TOTAL=1
+            SCENARIO_INDEX=0
+            "mode_${target}"
+            ;;
+        all|walkthrough)
+            SCENARIO_TOTAL=4
+            SCENARIO_INDEX=0
             mode_legitimate
             echo
             mode_spoofed
@@ -354,26 +501,34 @@ mode_dry_run() {
 # -----------------------------------------------------------------------------
 
 usage() {
-    cat <<'EOF'
+    cat <<EOF
 openpenny demo traffic orchestrator.
 
-Usage:
+Scenarios:
   ./demo_traffic.sh legitimate
   ./demo_traffic.sh spoofed
   ./demo_traffic.sh mixed
   ./demo_traffic.sh duplicates
-  ./demo_traffic.sh dry-run [legitimate|spoofed|mixed|duplicates]
+
+Control commands:
+  ./demo_traffic.sh walkthrough [--auto N]
+  ./demo_traffic.sh dry-run [legitimate|spoofed|mixed|duplicates|walkthrough]
   ./demo_traffic.sh stop
+
+Each scenario prints a framed banner with the expected openpenny
+verdict and a one-line recap when it finishes. Scenario boundary
+markers land in ${MARKERS_FILE}.
 
 All knobs are env-overridable. Most useful:
   DURATION_SECONDS=60 ./demo_traffic.sh mixed
   PACKET_RATE=200     ./demo_traffic.sh spoofed
   DUPLICATE_RATE=0.8  ./demo_traffic.sh duplicates
+  AUTO_PAUSE_SECS=5   ./demo_traffic.sh walkthrough
   SPOOFED_IFACE=eth1 SPOOFED_SRC_IP=198.51.100.42 ./demo_traffic.sh spoofed
 
 Defaults intentionally use RFC 5737 (198.51.100.0/24, TEST-NET-2) so
 an unconfigured run can't aim spoofed traffic at production.
-See demo/README.md for the full per-mode setup.
+See demo/README.md for the full per-scenario setup.
 EOF
 }
 
@@ -385,6 +540,32 @@ main() {
         spoofed)    ensure_environment; mode_spoofed ;;
         mixed)      ensure_environment; mode_mixed ;;
         duplicates) ensure_environment; mode_duplicates ;;
+        walkthrough)
+            # Parse --auto N / --auto=N.
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --auto)
+                        shift
+                        AUTO_PAUSE_SECS="${1:-}"
+                        if [[ -z "${AUTO_PAUSE_SECS}" ]]; then
+                            say "${C_SETUP}" "setup" "--auto requires N seconds"
+                            exit 2
+                        fi
+                        shift
+                        ;;
+                    --auto=*)
+                        AUTO_PAUSE_SECS="${1#--auto=}"
+                        shift
+                        ;;
+                    *)
+                        say "${C_SETUP}" "setup" "unknown walkthrough arg: $1"
+                        exit 2
+                        ;;
+                esac
+            done
+            ensure_environment
+            mode_walkthrough
+            ;;
         stop)       mode_stop ;;
         dry-run)    ensure_environment; mode_dry_run "$@" ;;
         help|-h|--help) usage ;;

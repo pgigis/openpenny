@@ -66,8 +66,6 @@ thresholds:
   stop_after_individual_flows: 10 # stop once N flows have terminated
   min_closed_loop_flows: 5        # see comment on `aggregates` above
 
-  # --- Passive-mode thresholds (used if you switch mode to passive) ----
-
-  passive_min_flows_to_finish: 10
-  passive_max_parallel_flows: 10
-  passive_max_execution_time_seconds: 150
+# Passive-mode knobs (passive_*) live in policies/runtime_passive.yaml.
+# If you switch mode to passive, point the root config at that file
+# instead of this one.

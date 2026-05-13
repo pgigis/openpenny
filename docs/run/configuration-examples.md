@@ -9,6 +9,26 @@ Copy-paste YAML for common setups. Two ideas to know:
 Platform settings (interface, backend, queues) are kept separate so that
 daily policy changes don't disturb host setup.
 
+## Quickest read: one-file examples
+
+If you just want a working config to read top-to-bottom, start with the
+single-file examples — no `includes:`, everything inline:
+
+- [`examples/configs/config_minimal_active.yaml`](../../examples/configs/config_minimal_active.yaml) — ~25 lines, runs an active Penny test on TCP/5201.
+- [`examples/configs/config_minimal_passive.yaml`](../../examples/configs/config_minimal_passive.yaml) — ~20 lines, observes TCP/5201 without dropping anything.
+
+The production-shaped examples below use `includes:` to keep platform and
+policy in separate files, which is better once the config grows.
+
+## Canonical names only
+
+Earlier releases accepted several aliases for the same enum value
+(`xdp` / `af_xdp` / `xdp_af_xdp` for the backend, `mirror` / `observe` /
+`tap` for `ingress_mode: copy`, `select` / `redirect` for traffic
+`include`, etc.). Aliases have been retired. The schema and parser now
+accept only the canonical spelling shown in the examples below. Migrate
+any older configs to the canonical names.
+
 ## Watch HTTP traffic, no drops
 
 ```yaml

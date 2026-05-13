@@ -19,14 +19,14 @@
           "retransmission_observation_miss_rate": 0.05
         },
         "timeouts": {
-          "retransmission_timeout_seconds": 3.0,
+          "retransmission_timeout_multiplier": 3.0,
           "admission_grace_period_seconds": 3.0,
           "monitored_flow_idle_expiry_seconds": 30.0
         },
         "execution": {
           "max_packet_drops_per_flow": 6,
           "max_packet_drops_global_aggregate": 12,
-          "max_number_of_individual_flows": 10,
+          "max_monitored_flows": 10,
           "stop_after_individual_flows": 10
         }
       },

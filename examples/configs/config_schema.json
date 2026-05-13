@@ -52,8 +52,6 @@
       "additionalProperties": false,
       "properties": {
         "default": { "type": "string", "enum": ["include", "exclude"] },
-        "default_policy": { "type": "string", "enum": ["include", "exclude"] },
-        "default_action": { "type": "string", "enum": ["include", "exclude"] },
         "rules": {
           "type": "array",
           "items": {
@@ -65,11 +63,8 @@
               "label": { "type": "string" },
               "priority": { "type": "integer" },
               "decision": { "type": "string", "enum": ["include", "exclude"] },
-              "action": { "type": "string", "enum": ["include", "exclude"] },
               "src_prefix": { "type": "string", "description": "Source IPv4 CIDR prefix; bare IP means /32." },
               "dst_prefix": { "type": "string", "description": "Destination IPv4 CIDR prefix; bare IP means /32." },
-              "src_ip": { "type": "string", "description": "Source IPv4 CIDR prefix; bare IP means /32." },
-              "dst_ip": { "type": "string", "description": "Destination IPv4 CIDR prefix; bare IP means /32." },
               "protocol": {
                 "oneOf": [
                   { "type": "integer", "minimum": 0, "maximum": 255 },
@@ -135,14 +130,12 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "backend": { "type": "string", "enum": ["xdp", "af_xdp", "xdp_af_xdp", "dpdk", "af_packet", "af_packet_mirror", "mirror", "tap", "pcap"] },
-        "ingress_mode": { "type": "string", "enum": ["auto", "copy", "redirect", "mirror", "observe", "tap", "xdp", "af_xdp", "steal"] },
-        "mode": { "type": "string", "enum": ["auto", "copy", "redirect", "mirror", "observe", "tap", "xdp", "af_xdp", "steal"] },
+        "backend": { "type": "string", "enum": ["af_xdp", "af_packet_mirror", "dpdk"] },
+        "ingress_mode": { "type": "string", "enum": ["auto", "copy", "redirect"] },
         "interface": { "type": "string" },
         "ifname": { "type": "string" },
         "queue": { "type": "integer", "minimum": 0 },
         "queue_count": { "type": "integer", "minimum": 1 },
-        "worker_count": { "type": "integer", "minimum": 1 },
         "worker_cpus": {
           "type": "array",
           "items": { "type": "integer", "minimum": 0 }
@@ -202,14 +195,13 @@
       "required": ["xdp", "dpdk"],
       "additionalProperties": false,
       "properties": {
-        "backend": { "type": "string", "enum": ["xdp", "af_xdp", "xdp_af_xdp", "dpdk", "af_packet", "af_packet_mirror", "mirror", "tap", "pcap"] },
-        "ingress_mode": { "type": "string", "enum": ["auto", "copy", "redirect", "mirror", "observe", "tap", "xdp", "af_xdp", "steal"] },
-        "mode": { "type": "string", "enum": ["auto", "copy", "redirect", "mirror", "observe", "tap", "xdp", "af_xdp", "steal"] },
+        "backend": { "type": "string", "enum": ["af_xdp", "af_packet_mirror", "dpdk"] },
+        "ingress_mode": { "type": "string", "enum": ["auto", "copy", "redirect"] },
         "traffic_match": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "default_action": { "type": "string", "enum": ["pass", "redirect", "redirect_xsk", "redirect_to_userspace", "drop"] },
+            "default_action": { "type": "string", "enum": ["pass", "redirect", "drop"] },
             "rules": {
               "type": "array",
               "items": {
@@ -228,7 +220,7 @@
                   },
                   "src_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
                   "dst_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
-                  "action": { "type": "string", "enum": ["pass", "redirect", "redirect_xsk", "redirect_to_userspace", "drop"] },
+                  "action": { "type": "string", "enum": ["pass", "redirect", "drop"] },
                   "target_queue": { "type": "integer", "minimum": 0 }
                 }
               }
@@ -449,8 +441,7 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["none", "tun", "xdp-tun", "raw_socket", "raw-socket", "ipproto_raw",
-                    "raw_nic", "raw-nic", "af_packet", "nic"]
+          "enum": ["none", "tun", "raw_socket", "raw_nic"]
         },
         "device":    { "type": "string" },
         "interface": { "type": "string" },

@@ -1,0 +1,25 @@
+# Smallest active-mode config. Drops a few packets, watches for retransmits.
+#
+# Run:
+#   sudo ./build/openpenny_cli --config $0 --iface <ifname> --tun xdp-tun
+
+traffic_policy:
+  default: exclude
+  rules:
+    - { decision: include, protocol: tcp, dst_port: 5201 }
+
+runtime_policy:
+  mode: active
+  aggregates: { enabled: true }
+  thresholds:
+    packet_drop_probability: 0.05
+    max_packet_drops_per_flow: 6
+    max_packet_drops_global_aggregate: 12
+    stop_after_individual_flows: 10
+
+platform:
+  backend: af_xdp
+
+egress:
+  kind: tun
+  device: xdp-tun

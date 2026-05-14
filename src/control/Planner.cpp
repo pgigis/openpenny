@@ -151,7 +151,7 @@ DesiredConfig desired_from_legacy_config(const Config& cfg) {
     desired.runtime.thresholds.max_reordering_ratio = cfg.active.max_out_of_order_fraction;
     desired.runtime.thresholds.retransmission_observation_miss_rate =
         cfg.active.retransmission_miss_probability;
-    desired.runtime.thresholds.retransmission_timeout_multiplier = cfg.active.rtt_timeout_factor;
+    desired.runtime.thresholds.retransmission_timeout_in_seconds = cfg.active.rtt_timeout_factor;
     desired.runtime.thresholds.admission_grace_period_seconds = cfg.active.flow_grace_period_seconds;
     desired.runtime.thresholds.monitored_flow_idle_expiry_seconds = cfg.active.flow_idle_timeout_seconds;
     desired.runtime.thresholds.drop_state_seconds = cfg.active.drop_state_seconds;
@@ -208,7 +208,7 @@ void apply_desired_config_to_legacy(Config& cfg, const DesiredConfig& desired) {
     cfg.active.max_duplicate_fraction = t.max_duplicate_ratio;
     cfg.active.max_out_of_order_fraction = t.max_reordering_ratio;
     cfg.active.retransmission_miss_probability = t.retransmission_observation_miss_rate;
-    cfg.active.rtt_timeout_factor = t.retransmission_timeout_multiplier;
+    cfg.active.rtt_timeout_factor = t.retransmission_timeout_in_seconds;
     cfg.active.flow_grace_period_seconds = t.admission_grace_period_seconds;
     cfg.active.flow_idle_timeout_seconds = t.monitored_flow_idle_expiry_seconds;
     cfg.active.drop_state_seconds = t.drop_state_seconds;

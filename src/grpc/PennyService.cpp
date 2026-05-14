@@ -222,8 +222,8 @@ void fill_proto_runtime_policy(const control::RuntimePolicy& src,
     thresholds->set_max_reordering_ratio(src.thresholds.max_reordering_ratio);
     thresholds->set_retransmission_observation_miss_rate(
         src.thresholds.retransmission_observation_miss_rate);
-    thresholds->set_retransmission_timeout_multiplier(
-        src.thresholds.retransmission_timeout_multiplier);
+    thresholds->set_retransmission_timeout_in_seconds(
+        src.thresholds.retransmission_timeout_in_seconds);
     thresholds->set_admission_grace_period_seconds(
         src.thresholds.admission_grace_period_seconds);
     thresholds->set_monitored_flow_idle_expiry_seconds(
@@ -347,9 +347,9 @@ std::optional<control::RuntimePolicy> runtime_policy_from_proto(
             t.retransmission_observation_miss_rate =
                 thresholds.retransmission_observation_miss_rate();
         }
-        if (thresholds.has_retransmission_timeout_multiplier()) {
-            t.retransmission_timeout_multiplier =
-                thresholds.retransmission_timeout_multiplier();
+        if (thresholds.has_retransmission_timeout_in_seconds()) {
+            t.retransmission_timeout_in_seconds =
+                thresholds.retransmission_timeout_in_seconds();
         }
         if (thresholds.has_admission_grace_period_seconds()) {
             t.admission_grace_period_seconds = thresholds.admission_grace_period_seconds();
@@ -408,8 +408,8 @@ std::optional<control::RuntimePolicy> runtime_policy_from_proto(
         error = "probability thresholds must be between 0 and 1";
         return std::nullopt;
     }
-    if (out.thresholds.retransmission_timeout_multiplier <= 0.0) {
-        error = "retransmission_timeout_multiplier must be positive";
+    if (out.thresholds.retransmission_timeout_in_seconds <= 0.0) {
+        error = "retransmission_timeout_in_seconds must be positive";
         return std::nullopt;
     }
     return out;
@@ -808,53 +808,70 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
                 if (override_json.contains("platform")) {
                     merged["platform"] = override_json["platform"];
                 }
-                if (override_json.contains("monitoring") && override_json["monitoring"].is_object()) {
-                    auto& mon = override_json["monitoring"];
-                    if (use_active && mon.contains("active")) {
-                        merged["monitoring"]["active"] = mon["active"];
-                    } else if (!use_active && mon.contains("passive")) {
-                        merged["monitoring"]["passive"] = mon["passive"];
-                    }
-                }
-                // Propagate request prefix/mask into the legacy XDP runtime if provided.
+                // The retired `monitoring.{active,passive}` / `input_sources.*`
+                // / `traffic_forwarding.*` override paths have been removed.
+                // Clients send overrides using the modern shapes:
+                //   runtime_policy:  thresholds / safety / aggregates / mode
+                //   platform:        backend / interface / queue / xdp / dpdk
+                //   egress:          kind / device / tun / raw_nic
+
+                // Propagate request prefix/mask into a single-rule
+                // traffic_policy if no traffic_policy override was given
+                // (legacy clients still rely on prefix/mask_bits).
                 if (!request->prefix().empty() &&
                     request->mask_bits() > 0 &&
                     request->mask_bits() <= 32 &&
-                    merged.contains("input_sources") &&
-                    merged["input_sources"].contains("xdp")) {
-                    merged["input_sources"]["xdp"]["runtime"]["prefix"] = request->prefix();
-                    merged["input_sources"]["xdp"]["runtime"]["mask_bits"] = request->mask_bits();
-                }
-                // Global forward overrides (if provided).
-                if (override_json.contains("traffic_forwarding")) {
-                    merged["traffic_forwarding"] = override_json["traffic_forwarding"];
-                }
-                // Interface/queue overrides.
-                if (override_json.contains("ifname")) merged["ifname"] = override_json["ifname"];
-                if (override_json.contains("queue")) merged["queue"] = override_json["queue"];
-                if (override_json.contains("queue_count")) merged["queue_count"] = override_json["queue_count"];
-                if (override_json.contains("tun_multi_queue")) {
-                    merged["traffic_forwarding"]["tun"]["multi_queue"] = override_json["tun_multi_queue"];
-                }
-                if (override_json.contains("tun_mtu")) {
-                    merged["traffic_forwarding"]["tun"]["mtu"] = override_json["tun_mtu"];
-                }
-                if (override_json.contains("forward_to_tun")) {
-                    merged["traffic_forwarding"]["tun"]["enable"] = override_json["forward_to_tun"];
+                    !override_json.contains("traffic_policy")) {
+                    nlohmann::json policy{
+                        {"default", "exclude"},
+                        {"rules", nlohmann::json::array({
+                            {{"name", "start_test_request_prefix"},
+                             {"decision", "include"},
+                             {"dst_prefix", request->prefix() + "/" +
+                                            std::to_string(request->mask_bits())}}
+                        })}
+                    };
+                    merged["traffic_policy"] = std::move(policy);
                 }
 
-                // Resolve relative bpf_object path against base_dir only if the file exists there;
-                // otherwise keep the original relative path so it can be found in the worker CWD.
+                // Egress overrides — modern shape only.
+                if (override_json.contains("egress")) {
+                    merged["egress"] = override_json["egress"];
+                }
+                // Shorthand request-level overrides → egress / platform.
+                if (override_json.contains("tun_multi_queue")) {
+                    merged["egress"]["tun"]["multi_queue"] = override_json["tun_multi_queue"];
+                }
+                if (override_json.contains("tun_mtu")) {
+                    merged["egress"]["tun"]["mtu"] = override_json["tun_mtu"];
+                }
+                if (override_json.contains("forward_to_tun")) {
+                    merged["egress"]["kind"] =
+                        override_json["forward_to_tun"].get<bool>() ? "tun" : "none";
+                }
+                if (override_json.contains("ifname")) {
+                    merged["platform"]["interface"] = override_json["ifname"];
+                }
+                if (override_json.contains("queue")) {
+                    merged["platform"]["queue"] = override_json["queue"];
+                }
+                if (override_json.contains("queue_count")) {
+                    merged["platform"]["queue_count"] = override_json["queue_count"];
+                }
+
+                // Resolve relative bpf_object path against base_dir if the
+                // file is there; otherwise leave it for the worker CWD.
                 try {
-                    if (merged.contains("input_sources") && merged["input_sources"].contains("xdp") &&
-                        merged["input_sources"]["xdp"].contains("runtime") &&
-                        merged["input_sources"]["xdp"]["runtime"].contains("bpf_object")) {
-                        std::string bpf_obj = merged["input_sources"]["xdp"]["runtime"]["bpf_object"].get<std::string>();
+                    if (merged.contains("platform") &&
+                        merged["platform"].contains("xdp") &&
+                        merged["platform"]["xdp"].contains("bpf_object")) {
+                        std::string bpf_obj =
+                            merged["platform"]["xdp"]["bpf_object"].get<std::string>();
                         std::filesystem::path p(bpf_obj);
                         if (p.is_relative()) {
                             std::filesystem::path candidate = base_dir / p;
                             if (std::filesystem::exists(candidate)) {
-                                merged["input_sources"]["xdp"]["runtime"]["bpf_object"] = candidate.string();
+                                merged["platform"]["xdp"]["bpf_object"] = candidate.string();
                             }
                         }
                     }
@@ -866,39 +883,35 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
             }
         }
 
-        // Fill forwarding defaults (TUN) from merged config unless overridden by request.
-        auto bool_from_json = [](const nlohmann::json& j, bool fallback) {
-            if (j.is_boolean()) return j.get<bool>();
-            if (j.is_number_integer()) return j.get<int>() != 0;
-            return fallback;
-        };
-        auto str_from_json = [](const nlohmann::json& j, const std::string& fallback) {
-            if (j.is_string()) return j.get<std::string>();
-            return fallback;
-        };
+        // Reflect any final egress selection from `merged` into the worker
+        // launch config so the daemon's process-launch path agrees with
+        // what the worker will read from the YAML.
         try {
-            if (merged.contains("traffic_forwarding") && merged["traffic_forwarding"].contains("tun")) {
-                auto& tun = merged["traffic_forwarding"]["tun"];
-                bool tun_enable_cfg = bool_from_json(tun["enable"], true);
-                // Request flag wins if present.
-                if (request->has_forward_to_tun()) {
-                    tun_enable_cfg = request->forward_to_tun();
+            if (merged.contains("egress") && merged["egress"].contains("kind")) {
+                const auto kind = merged["egress"]["kind"].get<std::string>();
+                if (kind == "tun") {
+                    if (worker_cfg.egress.kind != openpenny::egress::EgressKind::RawSocket) {
+                        worker_cfg.egress.kind = openpenny::egress::EgressKind::Tun;
+                    }
+                    if (merged["egress"].contains("device") &&
+                        merged["egress"]["device"].is_string()) {
+                        worker_cfg.egress.device =
+                            merged["egress"]["device"].get<std::string>();
+                    }
+                } else if (kind == "none") {
+                    if (worker_cfg.egress.kind != openpenny::egress::EgressKind::RawSocket) {
+                        worker_cfg.egress.kind = openpenny::egress::EgressKind::None;
+                    }
                 }
-                merged["traffic_forwarding"]["tun"]["enable"] = tun_enable_cfg;
-                // Reflect the effective TUN selection into the worker
-                // launch config's egress block. If the request did not
-                // already select a raw-socket sink, TUN wins (or None if
-                // the config disables forwarding entirely).
+            }
+            // Request-level forward_to_tun still wins if present.
+            if (request->has_forward_to_tun()) {
                 if (worker_cfg.egress.kind != openpenny::egress::EgressKind::RawSocket) {
-                    worker_cfg.egress.kind = tun_enable_cfg
+                    worker_cfg.egress.kind = request->forward_to_tun()
                                                  ? openpenny::egress::EgressKind::Tun
                                                  : openpenny::egress::EgressKind::None;
                 }
-                const std::string tun_name_cfg = str_from_json(tun["name"], "");
-                if (!tun_name_cfg.empty() &&
-                    worker_cfg.egress.kind == openpenny::egress::EgressKind::Tun) {
-                    worker_cfg.egress.device = tun_name_cfg;
-                }
+                merged["egress"]["kind"] = request->forward_to_tun() ? "tun" : "none";
             }
         } catch (...) {}
 

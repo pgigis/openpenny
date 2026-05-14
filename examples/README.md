@@ -63,7 +63,7 @@ This blocks until the test completes and returns counters from `ModeResult`.
 A second root config, `examples/configs/config_passive.yaml`, is provided for passive observation. It pulls in:
   - `policies/runtime_passive.yaml` — passive mode, ratio thresholds, and stop conditions (`passive_min_flows_to_finish`, `passive_max_execution_time_seconds`).
   - `platform/af_packet_mirror.yaml` — copy-mode ingress; the kernel still delivers packets to the final app.
-  - `platform/forwarding_disabled.yaml` and `platform/egress_none.yaml` — no TUN, no reinjection.
+  - `platform/egress_none.yaml` — no TUN, no reinjection.
 
 Run with:
 ```bash
@@ -78,7 +78,7 @@ sudo ./build/openpenny_cli \
   - `examples/configs/policies/traffic_default.yaml` for include/exclude 5-tuple traffic selection.
   - `examples/configs/policies/runtime_active.yaml` for active/passive mode, thresholds, timers, budgets, and safety controls.
   - `examples/configs/platform/af_xdp.yaml` for deployment/admin dataplane settings such as AF_XDP/DPDK backend, interface, and queue topology.
-  - `examples/configs/platform/forwarding_tun.yaml` for TUN forwarding.
+  - `examples/configs/platform/egress_tun.yaml` for TUN forwarding (replaces the deprecated `forwarding_*.yaml` files).
   - `examples/configs/platform/grpc.yaml` for daemon listener settings.
 - Normal operator changes should usually stay in `traffic_policy` and `runtime_policy`.
 - Include paths are resolved relative to the root config file.

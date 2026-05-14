@@ -66,16 +66,15 @@ parsing also treats a bare IPv4 address as `/32`.
 Example:
 
 ```yaml
-input_sources:
-  traffic_match:
-    default_action: pass
-    rules:
-      - label: web-slice
-        src_ip: 10.0.0.0/24
-        dst_ip: 192.0.2.20/32
-        protocol: tcp
-        dst_port: 443
-        action: redirect
+traffic_policy:
+  default: exclude
+  rules:
+    - name: web-slice
+      src_prefix: 10.0.0.0/24
+      dst_prefix: 192.0.2.20/32
+      protocol: tcp
+      dst_port: 443
+      decision: include
 ```
 
 The userspace encoder for these rules is

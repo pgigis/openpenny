@@ -1,44 +1,15 @@
-# User-facing Penny behaviour and thresholds for passive mode.
-#
-# Passive mode mirrors traffic without interfering: no drops are
-# injected and no aggregate drop verdict is computed. The pipeline
-# observes sequence coverage, gaps, duplication, FIN/RST events, and
-# idle periods, and stops on whichever of the configured passive
-# stop conditions fires first.
-#
-# Recommended pairing on the platform side:
-#   platform.backend:      af_packet_mirror   (or af_xdp + ingress_mode: copy)
-#   platform.ingress_mode: copy               (auto picks copy in passive)
-#   egress.kind:           none               (passive should not forward)
+# Passive-mode runtime policy: observe, never drop.
+# Tuning details: docs/run/tuning-reference.md.
+
 mode: passive
+
 safety:
   allow_ssh_bypass: true
 
-# Passive mode never evaluates an aggregate drop verdict; leave it off.
 aggregates:
   enabled: false
 
 thresholds:
-  # Per-flow heuristics that still apply in passive mode are ratio-based:
-  # they bound when a flow is treated as suspicious based on the share of
-  # duplicated or reordered packets observed.
-  max_duplicate_ratio: 0.15
-  max_reordering_ratio: 0.80
-
-  # Timing controls shared with active mode.
-  admission_grace_period_seconds: 3.0
-  monitored_flow_idle_expiry_seconds: 30.0
-
-  # Passive stop conditions.
-  #
-  # The pipeline finishes when ANY of the following triggers:
-  #   - `passive_min_flows_to_finish` flows have terminated naturally
-  #     (FIN/RST or idle expiry), OR
-  #   - `passive_max_execution_time_seconds` of wall-clock time has
-  #     elapsed since the run started.
-  #
-  # `passive_max_parallel_flows` caps how many flows the pipeline tracks
-  # concurrently across all worker threads (0 = unlimited).
   passive_min_flows_to_finish: 10
   passive_max_parallel_flows: 10
   passive_max_execution_time_seconds: 150

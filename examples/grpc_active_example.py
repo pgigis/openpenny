@@ -15,33 +15,22 @@ def main():
     stub = penny_pb2_grpc.PennyServiceStub(channel)
 
     override = {
-        "monitoring": {
-            "active": {
-                "enabled": True,
-                "aggregates": {
-                    "enabled": True,
-                    "max_monitored_flows": 100,
-                    "fallback_to_individual": True,
-                    "min_individual_flows_for_closed_loop": 2,
-                },
-                "drop_policy": {
-                    "packet_drop_probability": 0.05,
-                    "max_duplicate_ratio": 0.15,
-                    "max_reordering_ratio": 0.8,
-                    "retransmission_observation_miss_rate": 0.05,
-                },
-                "timeouts": {
-                    "retransmission_timeout_seconds": 3.0,
-                    "admission_grace_period_seconds": 3.0,
-                    "monitored_flow_idle_expiry_seconds": 30.0,
-                },
-                "execution": {
-                    "max_packet_drops_per_flow": 6,
-                    "max_packet_drops_global_aggregate": 12,
-                    "stop_after_individual_flows": 10,
-                },
+        "runtime_policy": {
+            "mode": "active",
+            "aggregates": {"enabled": True},
+            "safety": {"allow_ssh_bypass": True},
+            "thresholds": {
+                "packet_drop_probability": 0.05,
+                "max_duplicate_ratio": 0.15,
+                "max_reordering_ratio": 0.8,
+                "retransmission_observation_miss_rate": 0.05,
+                "retransmission_timeout_in_seconds": 3.0,
+                "admission_grace_period_seconds": 3.0,
+                "monitored_flow_idle_expiry_seconds": 30.0,
+                "max_packet_drops_per_flow": 6,
+                "max_packet_drops_global_aggregate": 12,
+                "stop_after_individual_flows": 10,
             },
-            "passive": {"enabled": False, "aggregates": {"enabled": False}}
         }
     }
 

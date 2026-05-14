@@ -70,74 +70,38 @@ std::string lower_copy(std::string value) {
     return value;
 }
 
-std::optional<PacketInputBackend> parse_backend(const std::string& value) {
-    const auto normalized = lower_copy(value);
-    if (normalized == "xdp" || normalized == "af_xdp" || normalized == "xdp_af_xdp") {
-        return PacketInputBackend::XdpAfXdp;
-    }
-    if (normalized == "dpdk") {
-        return PacketInputBackend::Dpdk;
-    }
-    if (normalized == "af_packet" || normalized == "af_packet_mirror" ||
-        normalized == "mirror" || normalized == "tap" || normalized == "pcap") {
-        return PacketInputBackend::AfPacketMirror;
-    }
-    return std::nullopt;
-}
+// One canonical spelling per enum value. Aliases have been retired to
+// keep the YAML one obvious thing to learn and let the schema enforce
+// the set. The previous aliases (e.g. "xdp", "mirror", "steal",
+// "select", "redirect_to_userspace") will now fail validation; map
+// them to the canonical spelling shown below.
 
 std::optional<IngressMode> parse_ingress_mode(const std::string& value) {
     const auto normalized = lower_copy(value);
     if (normalized == "auto" || normalized.empty()) return IngressMode::Auto;
-    if (normalized == "copy" || normalized == "mirror" || normalized == "observe" ||
-        normalized == "tap") {
-        return IngressMode::Copy;
-    }
-    if (normalized == "redirect" || normalized == "xdp" || normalized == "af_xdp" ||
-        normalized == "steal") {
-        return IngressMode::Redirect;
-    }
+    if (normalized == "copy")     return IngressMode::Copy;
+    if (normalized == "redirect") return IngressMode::Redirect;
     return std::nullopt;
 }
 
 std::optional<control::PlatformBackend> parse_platform_backend(const std::string& value) {
     const auto normalized = lower_copy(value);
-    if (normalized == "xdp" || normalized == "af_xdp" || normalized == "xdp_af_xdp") {
-        return control::PlatformBackend::AfXdp;
-    }
-    if (normalized == "dpdk") {
-        return control::PlatformBackend::Dpdk;
-    }
+    if (normalized == "af_xdp") return control::PlatformBackend::AfXdp;
+    if (normalized == "dpdk")   return control::PlatformBackend::Dpdk;
     return std::nullopt;
 }
 
 std::optional<control::TrafficDecision> parse_traffic_decision(const std::string& value) {
     const auto normalized = lower_copy(value);
-    if (normalized == "include" || normalized == "select" ||
-        normalized == "redirect" || normalized == "redirect_to_userspace") {
-        return control::TrafficDecision::Include;
-    }
-    if (normalized == "exclude" || normalized == "ignore" || normalized == "pass" ||
-        normalized == "drop") {
-        return control::TrafficDecision::Exclude;
-    }
+    if (normalized == "include") return control::TrafficDecision::Include;
+    if (normalized == "exclude") return control::TrafficDecision::Exclude;
     return std::nullopt;
 }
 
 std::optional<control::RuntimeMode> parse_runtime_mode(const std::string& value) {
     const auto normalized = lower_copy(value);
-    if (normalized == "active") return control::RuntimeMode::Active;
+    if (normalized == "active")  return control::RuntimeMode::Active;
     if (normalized == "passive") return control::RuntimeMode::Passive;
-    return std::nullopt;
-}
-
-std::optional<net::TrafficRuleAction> parse_match_action(const std::string& value) {
-    const auto normalized = lower_copy(value);
-    if (normalized == "pass") return net::TrafficRuleAction::Pass;
-    if (normalized == "redirect" || normalized == "redirect_xsk" ||
-        normalized == "redirect_to_userspace" || normalized == "userspace") {
-        return net::TrafficRuleAction::RedirectToUserspace;
-    }
-    if (normalized == "drop") return net::TrafficRuleAction::Drop;
     return std::nullopt;
 }
 
@@ -176,22 +140,6 @@ void set_uint_vector_if_present(const YAML::Node& node,
             values.push_back(item.as<unsigned>());
         }
         target = std::move(values);
-    }
-}
-
-/**
- * @brief Iterate across alternative keys and copy the first match into @p target.
- */
-template <typename T>
-void set_if_present_any(const YAML::Node& node,
-                        T& target,
-                        std::initializer_list<const char*> keys) {
-    if (!node) return;
-    for (auto key : keys) {
-        if (auto child = node[key]) {
-            target = child.as<T>();
-            return;
-        }
     }
 }
 
@@ -360,262 +308,17 @@ static bool resolve_yaml_includes(YAML::Node& root,
 
 } // namespace
 
-static void apply_xdp_config(const YAML::Node& xdp, Config& cfg) {
-    if (!xdp) return;
-    // Allow overriding interface/queue from within the xdp block.
-    set_if_present(xdp, "ifname", cfg.ifname);
-    set_if_present(xdp, "queue", cfg.queue);
-    set_if_present(xdp, "interface", cfg.ifname);   // alternate naming
-    set_if_present(xdp, "rx_queue", cfg.queue);      // alternate naming
-    set_if_present(xdp, "drv_mode", cfg.xdp_drv_mode);
-    set_if_present(xdp, "zerocopy", cfg.zerocopy);
-    set_if_present(xdp, "frame_size", cfg.frame_size);
-    set_if_present(xdp, "num_frames", cfg.num_frames);
-    set_if_present(xdp, "rx_ring", cfg.rx_ring);
-
-    if (auto runtime = xdp["runtime"]) {
-        auto& rt = cfg.xdp_runtime;
-        set_if_present(runtime, "enable", rt.enable);
-        set_if_present_any(runtime, rt.attach_program, {"attach_program", "attach"});
-        set_if_present(runtime, "detach_on_close", rt.detach_on_close);
-        set_if_present(runtime, "reuse_pins", rt.reuse_pins);
-        set_if_present(runtime, "pin_maps", rt.pin_maps);
-        set_if_present(runtime, "update_conf_map", rt.update_conf_map);
-        set_if_present(runtime, "verbose", rt.verbose);
-        set_if_present(runtime, "drop_unmatched", rt.drop_unmatched);
-        set_if_present(runtime, "allow_ssh_bypass", rt.allow_ssh_bypass);
-        set_if_present(runtime, "allow_skb_fallback", rt.allow_skb_fallback);
-        set_if_present(runtime, "force_copy_mode", rt.force_copy_mode);
-        set_if_present(runtime, "require_zerocopy", rt.require_zerocopy);
-        set_if_present(runtime, "allow_copy_fallback", rt.allow_copy_fallback);
-        set_if_present(runtime, "batch", rt.batch);
-        set_if_present(runtime, "poll_timeout_ms", rt.poll_timeout_ms);
-        set_if_present(runtime, "ifname", cfg.ifname);
-        set_if_present(runtime, "queue", cfg.queue);
-        set_if_present(runtime, "interface", cfg.ifname);
-        set_if_present(runtime, "rx_queue", cfg.queue);
-        set_if_present(runtime, "bpf_object", rt.bpf_object);
-        set_if_present_any(runtime, rt.bpf_program, {"program", "bpf_program"});
-        set_if_present(runtime, "map_conf_name", rt.map_conf_name);
-        set_if_present(runtime, "map_xsks_name", rt.map_xsks_name);
-        set_if_present(runtime, "map_stats_name", rt.map_stats_name);
-        set_if_present(runtime, "map_settings_name", rt.map_settings_name);
-        set_if_present(runtime, "pin_conf_path", rt.pin_conf_path);
-        set_if_present(runtime, "pin_xsks_path", rt.pin_xsks_path);
-        set_if_present(runtime, "pin_stats_path", rt.pin_stats_path);
-        set_if_present(runtime, "pin_settings_path", rt.pin_settings_path);
-        set_if_present(runtime, "prefix", rt.prefix_text);
-        set_if_present(runtime, "mask", rt.mask_text);
-        set_if_present(runtime, "mask_bits", rt.mask_bits);
-
-        if (auto parsed = parse_ipv4_host(rt.prefix_text)) {
-            rt.prefix_host = *parsed;
-        }
-        if (auto parsed = parse_ipv4_host(rt.mask_text)) {
-            rt.mask_host = *parsed;
-        }
-        if (rt.mask_host == 0 && rt.mask_bits > 0) {
-            rt.mask_host = mask_from_bits(rt.mask_bits);
-        }
-    }
-}
-
-static void apply_dpdk_config(const YAML::Node& dpdk, Config& cfg) {
-    if (!dpdk) return;
-    set_if_present(dpdk, "enable", cfg.dpdk.enable);
-    set_if_present(dpdk, "burst", cfg.dpdk.burst);
-    set_if_present(dpdk, "ifname", cfg.ifname);
-    set_if_present(dpdk, "interface", cfg.ifname);
-    set_if_present(dpdk, "device", cfg.ifname);
-    set_if_present(dpdk, "queue", cfg.queue);
-}
-
-static void apply_traffic_match_config(const YAML::Node& match, Config& cfg) {
-    if (!match) return;
-
-    if (auto default_action = match["default_action"]) {
-        if (auto action = parse_match_action(default_action.as<std::string>())) {
-            cfg.traffic_match.default_action = *action;
-        }
-    }
-
-    const auto rules = match["rules"];
-    if (!rules || !rules.IsSequence()) return;
-
-    cfg.traffic_match.rules.clear();
-    for (const auto& rule_node : rules) {
-        net::TrafficMatchRule rule{};
-
-        set_if_present(rule_node, "enabled", rule.enabled);
-        set_if_present(rule_node, "label", rule.label);
-
-        if (auto src_ip = rule_node["src_ip"]) {
-            if (auto parsed = parse_ipv4_prefix_host(src_ip.as<std::string>())) {
-                rule.src_ip = *parsed;
-            }
-        }
-        if (auto dst_ip = rule_node["dst_ip"]) {
-            if (auto parsed = parse_ipv4_prefix_host(dst_ip.as<std::string>())) {
-                rule.dst_ip = *parsed;
-            }
-        }
-
-        if (auto proto = parse_ip_proto_scalar(rule_node["protocol"])) {
-            rule.ip_proto = *proto;
-        }
-
-        if (auto src_port = rule_node["src_port"]) {
-            rule.src_port = static_cast<std::uint16_t>(src_port.as<unsigned>());
-        }
-        if (auto dst_port = rule_node["dst_port"]) {
-            rule.dst_port = static_cast<std::uint16_t>(dst_port.as<unsigned>());
-        }
-
-        if (auto action_node = rule_node["action"]) {
-            if (auto action = parse_match_action(action_node.as<std::string>())) {
-                rule.action = *action;
-            }
-        }
-        if (auto queue_node = rule_node["target_queue"]) {
-            rule.target_queue = queue_node.as<unsigned>();
-            rule.use_target_queue = true;
-        }
-
-        cfg.traffic_match.rules.push_back(std::move(rule));
-    }
-}
-
-static void apply_active_config(const YAML::Node& active, Config::ActiveConfig& cfg) {
-    if (!active) return;
-    set_if_present(active, "enabled", cfg.enabled);
-
-    // New nested layout (preferred).
-    if (auto aggregates = active["aggregates"]) {
-        set_if_present(aggregates, "enabled", cfg.aggregates_enabled);
-        set_if_present(aggregates, "max_monitored_flows", cfg.max_tracked_flows);
-    }
-    if (auto drop_policy = active["drop_policy"]) {
-        set_if_present(drop_policy, "packet_drop_probability", cfg.drop_probability);
-        set_if_present(drop_policy, "max_duplicate_ratio", cfg.max_duplicate_fraction);
-        set_if_present(drop_policy, "max_reordering_ratio", cfg.max_out_of_order_fraction);
-        set_if_present(drop_policy,
-                       "retransmission_observation_miss_rate",
-                       cfg.retransmission_miss_probability);
-    }
-    if (auto timeouts = active["timeouts"]) {
-        set_if_present(timeouts,
-                       "retransmission_timeout_multiplier",
-                       cfg.rtt_timeout_factor);
-        set_if_present(timeouts,
-                       "retransmission_timeout_seconds",
-                       cfg.rtt_timeout_factor);
-        set_if_present(timeouts,
-                       "retransmission_timeout_threshold",
-                       cfg.rtt_timeout_factor);
-        set_if_present(timeouts,
-                       "admission_grace_period_seconds",
-                       cfg.flow_grace_period_seconds);
-        set_if_present(timeouts,
-                       "idle_flow_timeout_seconds",
-                       cfg.flow_idle_timeout_seconds);
-        set_if_present(timeouts,
-                       "monitored_flow_idle_expiry_seconds",
-                       cfg.flow_idle_timeout_seconds);
-        set_if_present(timeouts, "drop_state_seconds", cfg.drop_state_seconds);
-        set_if_present(timeouts, "drop_expiration", cfg.drop_state_seconds); // legacy
-    }
-    if (auto execution = active["execution"]) {
-        set_if_present(execution, "min_drops_per_flow", cfg.min_drops_per_flow);
-        set_if_present(execution, "max_drops_per_indiv_flow", cfg.max_drops_per_indiv_flow);
-        set_if_present(execution, "max_drops_aggregates", cfg.max_drops_aggregates);
-        set_if_present(execution, "max_packet_drops_per_flow", cfg.max_drops_per_indiv_flow);
-        set_if_present(execution,
-                       "max_packet_drops_global_aggregate",
-                       cfg.max_drops_aggregates);
-        set_if_present(execution,
-                       "max_number_of_individual_flows",
-                       cfg.max_tracked_flows);
-        set_if_present(execution,
-                       "stop_after_individual_flows",
-                       cfg.stop_after_individual_flows);
-        set_if_present(execution,
-                       "min_closed_loop_flows",
-                       cfg.min_closed_loop_flows);
-        // Backward compatibility with legacy names.
-        set_if_present(execution, "min_packet_drops", cfg.min_drops_per_flow);
-        set_if_present(execution, "max_packet_drops", cfg.max_drops_per_indiv_flow);
-        set_if_present(execution, "max_drops_per_flow", cfg.max_drops_per_indiv_flow);
-    }
-
-    // Backward-compatible flat keys.
-    set_if_present(active, "drop_probability", cfg.drop_probability);
-    set_if_present(active, "max_duplicate_fraction", cfg.max_duplicate_fraction);
-    set_if_present(active, "max_duplicates", cfg.max_duplicate_fraction); // legacy
-    set_if_present(active,
-                   "retransmission_miss_probability",
-                   cfg.retransmission_miss_probability);
-    set_if_present(active,
-                   "probability_not_observe_retransmission",
-                   cfg.retransmission_miss_probability); // legacy
-    set_if_present(active, "rtt_timeout_factor", cfg.rtt_timeout_factor);
-    set_if_present(active, "rtt_timeout_seconds", cfg.rtt_timeout_factor);
-    set_if_present(active, "retransmission_timeout_seconds", cfg.rtt_timeout_factor);
-    set_if_present(active, "retransmission_timeout_threshold", cfg.rtt_timeout_factor);
-    set_if_present(active, "tmax_rt_x", cfg.rtt_timeout_factor); // legacy
-    set_if_present(active,
-                   "flow_grace_period_seconds",
-                   cfg.flow_grace_period_seconds);
-    set_if_present(active,
-                   "time_to_wait_to_monitor_flow",
-                   cfg.flow_grace_period_seconds); // legacy
-    set_if_present(active,
-                   "idle_flow_timeout_seconds",
-                   cfg.flow_idle_timeout_seconds);
-    set_if_present(active, "max_tracked_flows", cfg.max_tracked_flows);
-    set_if_present(active,
-                   "max_number_of_monitored_flows",
-                   cfg.max_tracked_flows); // legacy
-    set_if_present(active,
-                   "max_number_of_individual_flows",
-                   cfg.max_tracked_flows);
-    set_if_present(active,
-                   "stop_after_individual_flows",
-                   cfg.stop_after_individual_flows);
-    set_if_present(active,
-                   "min_closed_loop_flows",
-                   cfg.min_closed_loop_flows);
-    set_if_present(active,
-                   "max_out_of_order_fraction",
-                   cfg.max_out_of_order_fraction);
-    set_if_present(active,
-                   "max_out_of_order_ratio",
-                   cfg.max_out_of_order_fraction); // legacy
-}
-
-static void apply_passive_config(const YAML::Node& passive, Config::PassiveConfig& cfg) {
-    if (!passive) return;
-    set_if_present(passive, "enabled", cfg.enabled);
-    set_if_present(passive, "min_number_of_flows_to_finish", cfg.min_number_of_flows_to_finish);
-    set_if_present(passive, "max_parallel_flows", cfg.max_parallel_flows);
-    set_if_present(passive, "max_execution_time", cfg.max_execution_time_seconds);
-
-    if (auto timeouts = passive["timeouts"]) {
-        set_if_present(timeouts,
-                       "admission_grace_period_seconds",
-                       cfg.flow_grace_period_seconds);
-        set_if_present(timeouts,
-                       "monitored_flow_idle_expiry_seconds",
-                       cfg.flow_idle_timeout_seconds);
-    }
-
-    // Allow flat passive keys.
-    set_if_present(passive,
-                   "admission_grace_period_seconds",
-                   cfg.flow_grace_period_seconds);
-    set_if_present(passive,
-                   "monitored_flow_idle_expiry_seconds",
-                   cfg.flow_idle_timeout_seconds);
-}
+// Legacy YAML helpers (apply_xdp_config, apply_dpdk_config,
+// apply_active_config, apply_passive_config, apply_traffic_match_config)
+// have been removed. Configs go through the modern entry points only:
+//   traffic_policy: -> apply_traffic_policy_config
+//   runtime_policy: -> apply_runtime_policy_config
+//   platform:       -> apply_platform_config
+//   egress:         -> apply_egress_config
+// The legacy fields (cfg.input.*, cfg.active.*, cfg.passive.*,
+// cfg.xdp_runtime.*, cfg.traffic_match) are populated from the modern
+// shape via control::apply_desired_config_to_legacy() at the end of
+// from_file().
 
 /**
  * @brief Parse the top-level `egress:` block.
@@ -664,13 +367,10 @@ static void apply_traffic_policy_config(const YAML::Node& policy,
                                         control::TrafficPolicy& cfg) {
     if (!policy) return;
 
-    if (auto default_node = policy["default_policy"] ? policy["default_policy"] : policy["default"]) {
+    // Canonical spelling: `default`. The earlier `default_policy` and
+    // `default_action` aliases have been retired.
+    if (auto default_node = policy["default"]) {
         if (auto decision = parse_traffic_decision(default_node.as<std::string>())) {
-            cfg.default_decision = *decision;
-        }
-    }
-    if (auto default_action = policy["default_action"]) {
-        if (auto decision = parse_traffic_decision(default_action.as<std::string>())) {
             cfg.default_decision = *decision;
         }
     }
@@ -685,21 +385,23 @@ static void apply_traffic_policy_config(const YAML::Node& policy,
         rule.priority = implicit_priority++;
         set_if_present(rule_node, "enabled", rule.enabled);
         set_if_present(rule_node, "name", rule.name);
-        set_if_present(rule_node, "label", rule.name);
         set_if_present(rule_node, "priority", rule.priority);
 
-        if (auto decision_node = rule_node["decision"] ? rule_node["decision"] : rule_node["action"]) {
+        // Canonical: `decision`. The `action` alias has been retired.
+        if (auto decision_node = rule_node["decision"]) {
             if (auto decision = parse_traffic_decision(decision_node.as<std::string>())) {
                 rule.decision = *decision;
             }
         }
 
-        if (auto src = rule_node["src_prefix"] ? rule_node["src_prefix"] : rule_node["src_ip"]) {
+        // Canonical: `src_prefix` / `dst_prefix`. The `src_ip` / `dst_ip`
+        // aliases have been retired; use a /32 prefix for a single host.
+        if (auto src = rule_node["src_prefix"]) {
             if (auto parsed = parse_ipv4_prefix_host(src.as<std::string>())) {
                 rule.src_ip = *parsed;
             }
         }
-        if (auto dst = rule_node["dst_prefix"] ? rule_node["dst_prefix"] : rule_node["dst_ip"]) {
+        if (auto dst = rule_node["dst_prefix"]) {
             if (auto parsed = parse_ipv4_prefix_host(dst.as<std::string>())) {
                 rule.dst_ip = *parsed;
             }
@@ -733,13 +435,11 @@ static void apply_runtime_policy_config(const YAML::Node& policy,
     }
     set_if_present(policy, "allow_ssh_bypass", cfg.safety.allow_ssh_bypass);
 
-    // Accept either a nested aggregates block (matches the legacy
-    // monitoring.active.aggregates layout) or a flat aggregates_enabled
-    // shortcut at the runtime_policy root.
+    // Canonical: nested `aggregates: { enabled: ... }`. The flat
+    // `aggregates_enabled` shortcut has been retired.
     if (auto aggregates = policy["aggregates"]) {
         set_if_present(aggregates, "enabled", cfg.aggregates_enabled);
     }
-    set_if_present(policy, "aggregates_enabled", cfg.aggregates_enabled);
 
     const auto thresholds = policy["thresholds"] ? policy["thresholds"] : policy;
     auto& t = cfg.thresholds;
@@ -750,8 +450,8 @@ static void apply_runtime_policy_config(const YAML::Node& policy,
                    "retransmission_observation_miss_rate",
                    t.retransmission_observation_miss_rate);
     set_if_present(thresholds,
-                   "retransmission_timeout_multiplier",
-                   t.retransmission_timeout_multiplier);
+                   "retransmission_timeout_in_seconds",
+                   t.retransmission_timeout_in_seconds);
     set_if_present(thresholds,
                    "admission_grace_period_seconds",
                    t.admission_grace_period_seconds);
@@ -793,15 +493,18 @@ static void apply_platform_config(const YAML::Node& platform,
     }
 
     set_if_present(platform, "interface", cfg.interface_name);
-    set_if_present(platform, "ifname", cfg.interface_name);
+    set_if_present(platform, "ifname", cfg.interface_name);   // ifname kept as convenience alias for `interface`
     set_if_present(platform, "queue", cfg.queue);
     set_if_present(platform, "queue_count", cfg.queue_count);
-    set_if_present(platform, "worker_count", cfg.queue_count);
     set_uint_vector_if_present(platform, "worker_cpus", cfg.worker_cpus);
     set_if_present(platform, "batch", cfg.batch);
     set_if_present(platform, "poll_timeout_ms", cfg.poll_timeout_ms);
 
-    if (auto xdp = platform["af_xdp"] ? platform["af_xdp"] : platform["xdp"]) {
+    // Canonical: nested `xdp:` block (inside `platform:`, so the path
+    // is `platform.xdp.*`). The earlier `af_xdp:` alias here has been
+    // retired; the `backend: af_xdp` value (used at the platform root)
+    // is unchanged.
+    if (auto xdp = platform["xdp"]) {
         set_if_present(xdp, "interface", cfg.interface_name);
         set_if_present(xdp, "ifname", cfg.interface_name);
         set_if_present(xdp, "queue", cfg.queue);
@@ -890,83 +593,30 @@ std::optional<Config> Config::from_file(const std::string& path) {
         if (auto platform = root["platform"]) {
             apply_platform_config(platform, cfg.desired_config.platform);
             has_platform_config = true;
-        }
-
-        // Prefer grouped input source config under input_sources; fall back to legacy top-level keys.
-        bool backend_explicit = false;
-        if (auto inputs = root["input_sources"]) {
-            if (auto backend = inputs["backend"]) {
-                if (auto parsed = parse_backend(backend.as<std::string>())) {
-                    cfg.input.backend = *parsed;
-                    backend_explicit = true;
-                }
-            }
-            // Ingress semantics: "auto" (default), "copy", or "redirect".
-            // Resolved at pipeline start based on active/passive mode.
-            for (const char* key : {"ingress_mode", "mode"}) {
-                if (auto mode_node = inputs[key]) {
-                    if (auto parsed = parse_ingress_mode(mode_node.as<std::string>())) {
-                        cfg.input.mode = *parsed;
-                    }
-                    break;
-                }
-            }
-            if (auto match = inputs["traffic_match"]) {
-                apply_traffic_match_config(match, cfg);
-            }
-            if (auto xdp_inline = inputs["xdp"]) {
-                apply_xdp_config(xdp_inline, cfg);
-            }
-            if (auto dpdk_inline = inputs["dpdk"]) {
-                apply_dpdk_config(dpdk_inline, cfg);
-            }
-        } else {
-            if (auto xdp_inline = root["xdp"]) {
-                apply_xdp_config(xdp_inline, cfg);
-            }
-            if (auto dpdk_inline = root["dpdk"]) {
-                apply_dpdk_config(dpdk_inline, cfg);
-            }
-            if (auto backend = root["input_backend"]) {
-                if (auto parsed = parse_backend(backend.as<std::string>())) {
-                    cfg.input.backend = *parsed;
-                    backend_explicit = true;
-                }
-            }
-            if (auto ingress_mode = root["ingress_mode"]) {
-                if (auto parsed = parse_ingress_mode(ingress_mode.as<std::string>())) {
+            // Ingress semantics live on the legacy InputConfig today.
+            // Carry `platform.ingress_mode` across to it so the pipeline
+            // driver sees the operator's choice.
+            if (auto mode_node = platform["ingress_mode"]) {
+                if (auto parsed = parse_ingress_mode(mode_node.as<std::string>())) {
                     cfg.input.mode = *parsed;
                 }
             }
-            if (auto match = root["traffic_match"]) {
-                apply_traffic_match_config(match, cfg);
-            }
         }
-        if (!backend_explicit) {
-            cfg.input.backend = cfg.dpdk.enable ? PacketInputBackend::Dpdk
-                                                : PacketInputBackend::XdpAfXdp;
-        }
+
         // Egress block: declarative configuration of the PacketSink used
         // to re-inject matched packets. Absent => EgressKind::None.
         if (auto egress_node = root["egress"]) {
             apply_egress_config(egress_node, cfg.egress);
         }
 
-        // Active-mode config: prefer monitoring.active, then active, then penny (legacy).
-        if (auto monitoring = root["monitoring"]) {
-            if (auto active = monitoring["active"]) {
-                apply_active_config(active, cfg.active);
-            } else if (auto penny_inline = monitoring["penny"]) {
-                apply_active_config(penny_inline, cfg.active);
-            }
-            if (auto passive = monitoring["passive"]) {
-                apply_passive_config(passive, cfg.passive);
-            }
-        } else if (auto active = root["active"]) {
-            apply_active_config(active, cfg.active);
-        } else if (auto penny_inline = root["penny"]) {
-            apply_active_config(penny_inline, cfg.active);
-        }
+        // The retired legacy entry points -- `input_sources:`,
+        // `monitoring.active`/`monitoring.penny`, root-level `active:` /
+        // `penny:` / `xdp:` / `dpdk:` / `input_backend:` / `ingress_mode:` /
+        // `traffic_match:` -- have been removed. Use the modern shape:
+        //   traffic_policy:  ...   (5-tuple include/exclude rules)
+        //   runtime_policy:  ...   (mode, thresholds, aggregates, safety)
+        //   platform:        ...   (backend, interface, queue, xdp/dpdk tuning)
+        //   egress:          ...   (where matched packets go)
 
         auto legacy_desired = control::desired_from_legacy_config(cfg);
         if (!has_traffic_policy) {

@@ -1,0 +1,21 @@
+# Smallest passive-mode config. Observes only, never drops.
+#
+# Run:
+#   sudo ./build/openpenny_cli --config $0 --mode passive --iface <ifname>
+
+traffic_policy:
+  default: exclude
+  rules:
+    - { decision: include, protocol: tcp, dst_port: 5201 }
+
+runtime_policy:
+  mode: passive
+  thresholds:
+    passive_min_flows_to_finish: 10
+    passive_max_execution_time_seconds: 150
+
+platform:
+  backend: af_xdp
+
+egress:
+  kind: none

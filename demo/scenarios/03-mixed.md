@@ -22,13 +22,17 @@ decision.
         aggregate forged_src  → reeves3  →  not closed-loop
 ```
 
-## Run it
+## Run it (CLI)
 
 ```bash
 # reeves3 (start once, leave running)
 iperf3 -s -p 5201
 
-# reeves2 — penny in active mode against both prefixes
+# reeves2 — penny
+sudo ./build/openpenny_cli \
+  -c examples/configs/config_default.yaml \
+  --source xdp --iface ens5f0np0 --queues 1
+
 # reeves1
 sudo -v                              # cache sudo for scapy
 cd demo
@@ -36,6 +40,19 @@ SPOOFED_DST_IP=<reeves3-ip> \
 SPOOFED_IFACE=<egress-iface> \
 IPERF_SERVER=<reeves3> \
 ./demo_traffic.sh mixed
+```
+
+## Run it (gRPC)
+
+```bash
+# reeves2
+sudo ./build/pennyd \
+  --config examples/configs/config_default.yaml \
+  --listen 0.0.0.0:50051 \
+  --worker-bin ./build/penny_worker
+
+# reeves2 (separately) — runs the legit and spoofed tests back to back
+python3 demo/scenarios/grpc/03_mixed.py
 ```
 
 ## Expected

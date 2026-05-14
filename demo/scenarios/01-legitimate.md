@@ -22,18 +22,36 @@ the link for the full duration.
           ◀── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
 ```
 
-## Run it
+## Run it (CLI)
 
 ```bash
 # reeves3 (start once, leave running)
 iperf3 -s -p 5201
 
-# reeves2 — penny in active mode against the reeves1 aggregate
-# (see tools/traffic_generator/README.md § Using with openpenny CLI)
+# reeves2 — penny
+sudo ./build/openpenny_cli \
+  -c examples/configs/config_default.yaml \
+  --source xdp --iface ens5f0np0 --queues 1
 
 # reeves1
 cd demo
 ./demo_traffic.sh legitimate
+```
+
+## Run it (gRPC)
+
+Replace the CLI invocation on reeves2 with the daemon plus a one-shot
+client:
+
+```bash
+# reeves2
+sudo ./build/pennyd \
+  --config examples/configs/config_default.yaml \
+  --listen 0.0.0.0:50051 \
+  --worker-bin ./build/penny_worker
+
+# reeves2 (separately)
+python3 demo/scenarios/grpc/01_legitimate.py
 ```
 
 ## Expected

@@ -22,17 +22,35 @@ Scapy-injected packets from **reeves1** with a **forged source IP**
          no reverse path: forged src can't respond
 ```
 
-## Run it
+## Run it (CLI)
 
 ```bash
 # reeves3 — nothing to start (packets land and die)
-# reeves2 — penny in active mode against the spoofed prefix
+
+# reeves2 — penny
+sudo ./build/openpenny_cli \
+  -c examples/configs/config_default.yaml \
+  --source xdp --iface ens5f0np0 --queues 1
+
 # reeves1
 sudo -v                              # cache sudo for scapy
 cd demo
 SPOOFED_DST_IP=<reeves3-ip> \
 SPOOFED_IFACE=<egress-iface> \
 ./demo_traffic.sh spoofed
+```
+
+## Run it (gRPC)
+
+```bash
+# reeves2
+sudo ./build/pennyd \
+  --config examples/configs/config_default.yaml \
+  --listen 0.0.0.0:50051 \
+  --worker-bin ./build/penny_worker
+
+# reeves2 (separately)
+python3 demo/scenarios/grpc/02_spoofed.py
 ```
 
 ## Expected

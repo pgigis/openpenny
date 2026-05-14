@@ -82,16 +82,28 @@ int main() {
     {
         std::cout << "scenario: compile_effective_config mirrors desired into runtime + dataplane\n";
 
-        // Build a small desired config and ensure the compiled effective
-        // config reflects mode/interface/queues correctly. The mismatch
-        // between passive mode and the AfXdp backend should emit a
-        // warning rather than silently picking one.
+        // Re-use the two-rule https/ssh shape from scenario 1 so the
+        // compile_effective_config() output matches what the planner
+        // sees from a typical policy. The combination here (passive +
+        // AfXdp + queue_count=2 with two worker_cpus) is expected to
+        // produce non-empty warnings.
         TrafficPolicy policy{};
-        TrafficPolicyRule rule{};
-        rule.name     = "https";
-        rule.dst_port = 443;
-        rule.decision = TrafficDecision::Include;
-        policy.rules.push_back(rule);
+        policy.default_decision = TrafficDecision::Exclude;
+
+        TrafficPolicyRule https{};
+        https.name     = "https";
+        https.priority = 20;
+        https.dst_port = 443;
+        https.decision = TrafficDecision::Include;
+
+        TrafficPolicyRule ssh{};
+        ssh.name     = "ssh";
+        ssh.priority = 10;
+        ssh.dst_port = 22;
+        ssh.decision = TrafficDecision::Exclude;
+
+        policy.rules.push_back(https);
+        policy.rules.push_back(ssh);
 
         DesiredConfig desired{};
         desired.traffic                       = policy;

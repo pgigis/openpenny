@@ -4,8 +4,9 @@
 Scenario 4 — duplicates: drive penny via gRPC instead of the CLI.
 
 reeves1 injects a spoofed flow with a high duplicate probability
-(see demo/scenarios/04-duplicates.md). This client tightens the
-duplicate threshold so the aggregate exits via the duplicate path
+(see demo/scenarios/04-duplicates.md). The daemon's traffic_policy
+(`tcp dst_port 5201`) catches the traffic; this script tightens
+max_duplicate_ratio so the aggregate exits via the duplicate path
 rather than the closed-loop check.
 
 Expected: aggregate forged_src -> reeves3 reaches "duplicate exceeded".
@@ -17,11 +18,9 @@ import penny_pb2
 import penny_pb2_grpc
 
 
-FORGED_SRC_PREFIX = "198.51.100.10"   # matches SPOOFED_SRC_IP default
-MASK_BITS         = 32
-IFACE             = "ens5f0np0"
-QUEUE             = 0
-QUEUE_COUNT       = 1
+IFACE       = "ens5f0np0"
+QUEUE       = 0
+QUEUE_COUNT = 1
 
 
 def main():
@@ -54,8 +53,6 @@ def main():
     }
 
     req = penny_pb2.StartTestRequest(
-        prefix=FORGED_SRC_PREFIX,
-        mask_bits=MASK_BITS,
         mode="active",
         test_id="duplicates",
         config_override_json=json.dumps(override),

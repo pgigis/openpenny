@@ -8,8 +8,10 @@ Equivalent to:
         -c examples/configs/config_default.yaml \\
         --source xdp --iface ens5f0np0 --queues 1
 
-with reeves1 generating the 16-way iperf3 stream
-(see demo/scenarios/01-legitimate.md).
+The daemon's traffic_policy (`tcp dst_port 5201` from
+examples/configs/policies/traffic_default.yaml) picks up the iperf3
+flows; this script only overrides the platform/runtime knobs so
+pennyd opens the right NIC.
 
 Expected: aggregate reeves1 -> reeves3 reaches "legitimate closed-loop".
 """
@@ -20,14 +22,11 @@ import penny_pb2
 import penny_pb2_grpc
 
 
-# Per-host knobs. The platform override replaces the YAML's `CHANGE_ME`
-# placeholder so pennyd opens the right NIC without editing the config
-# file on every host.
-REEVES1_PREFIX = "10.0.0.1"      # set to reeves1's actual address
-MASK_BITS      = 32
-IFACE          = "ens5f0np0"
-QUEUE          = 0
-QUEUE_COUNT    = 1
+# Per-host knobs. Replaces the YAML's `CHANGE_ME` placeholder without
+# hand-editing platform/af_xdp.yaml.
+IFACE       = "ens5f0np0"
+QUEUE       = 0
+QUEUE_COUNT = 1
 
 
 def main():
@@ -58,9 +57,8 @@ def main():
         },
     }
 
+    # No prefix/mask_bits: let the config's traffic_policy decide.
     req = penny_pb2.StartTestRequest(
-        prefix=REEVES1_PREFIX,
-        mask_bits=MASK_BITS,
         mode="active",
         test_id="legitimate",
         config_override_json=json.dumps(override),

@@ -4,8 +4,9 @@
 Scenario 2 — spoofed: drive penny via gRPC instead of the CLI.
 
 reeves1 injects forged-source packets toward reeves3 (see
-demo/scenarios/02-spoofed.md). This client narrows the run to the
-forged source prefix so penny only evaluates that aggregate.
+demo/scenarios/02-spoofed.md). The daemon's traffic_policy
+(`tcp dst_port 5201` from examples/configs/policies/traffic_default.yaml)
+catches them.
 
 Expected: aggregate forged_src -> reeves3 reaches "not closed-loop".
 """
@@ -16,11 +17,9 @@ import penny_pb2
 import penny_pb2_grpc
 
 
-FORGED_SRC_PREFIX = "198.51.100.10"   # matches SPOOFED_SRC_IP default
-MASK_BITS         = 32
-IFACE             = "ens5f0np0"
-QUEUE             = 0
-QUEUE_COUNT       = 1
+IFACE       = "ens5f0np0"
+QUEUE       = 0
+QUEUE_COUNT = 1
 
 
 def main():
@@ -52,8 +51,6 @@ def main():
     }
 
     req = penny_pb2.StartTestRequest(
-        prefix=FORGED_SRC_PREFIX,
-        mask_bits=MASK_BITS,
         mode="active",
         test_id="spoofed",
         config_override_json=json.dumps(override),

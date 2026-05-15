@@ -18,6 +18,9 @@ import penny_pb2_grpc
 
 FORGED_SRC_PREFIX = "198.51.100.10"   # matches SPOOFED_SRC_IP default
 MASK_BITS         = 32
+IFACE             = "ens5f0np0"
+QUEUE             = 0
+QUEUE_COUNT       = 1
 
 
 def main():
@@ -25,21 +28,27 @@ def main():
     stub    = penny_pb2_grpc.PennyServiceStub(channel)
 
     override = {
+        "platform": {
+            "backend":     "af_xdp",
+            "interface":   IFACE,
+            "queue":       QUEUE,
+            "queue_count": QUEUE_COUNT,
+        },
         "runtime_policy": {
             "mode": "active",
             "safety":     {"allow_ssh_bypass": True},
             "aggregates": {"enabled": True},
             "thresholds": {
-                "packet_drop_probability":            0.05,
-                "max_duplicate_ratio":                0.15,
-                "max_reordering_ratio":               0.8,
+                "packet_drop_probability":              0.05,
+                "max_duplicate_ratio":                  0.15,
+                "max_reordering_ratio":                 0.8,
                 "retransmission_observation_miss_rate": 0.05,
-                "retransmission_timeout_in_seconds":  3.0,
-                "max_packet_drops_per_flow":          6,
-                "max_packet_drops_global_aggregate":  12,
-                "stop_after_individual_flows":        10,
+                "retransmission_timeout_in_seconds":    3.0,
+                "max_packet_drops_per_flow":            6,
+                "max_packet_drops_global_aggregate":    12,
+                "stop_after_individual_flows":          10,
             },
-        }
+        },
     }
 
     req = penny_pb2.StartTestRequest(

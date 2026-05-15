@@ -22,6 +22,9 @@ import penny_pb2_grpc
 REEVES1_PREFIX    = "10.0.0.1"        # set to reeves1's actual address
 FORGED_SRC_PREFIX = "198.51.100.10"   # matches SPOOFED_SRC_IP default
 MASK_BITS         = 32
+IFACE             = "ens5f0np0"
+QUEUE             = 0
+QUEUE_COUNT       = 1
 
 THRESHOLDS = {
     "packet_drop_probability":              0.05,
@@ -34,15 +37,23 @@ THRESHOLDS = {
     "stop_after_individual_flows":          10,
 }
 
+PLATFORM = {
+    "backend":     "af_xdp",
+    "interface":   IFACE,
+    "queue":       QUEUE,
+    "queue_count": QUEUE_COUNT,
+}
+
 
 def run_one(stub, label, prefix):
     override = {
+        "platform": PLATFORM,
         "runtime_policy": {
             "mode":       "active",
             "safety":     {"allow_ssh_bypass": True},
             "aggregates": {"enabled": True},
             "thresholds": THRESHOLDS,
-        }
+        },
     }
     req = penny_pb2.StartTestRequest(
         prefix=prefix,

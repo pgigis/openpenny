@@ -20,11 +20,14 @@ import penny_pb2
 import penny_pb2_grpc
 
 
-# Override only what's specific to this scenario. The daemon loads its
-# base config from --config; this just narrows the run to the reeves1
-# prefix on a known port.
-REEVES1_PREFIX = "10.0.0.1"   # set to reeves1's actual address
+# Per-host knobs. The platform override replaces the YAML's `CHANGE_ME`
+# placeholder so pennyd opens the right NIC without editing the config
+# file on every host.
+REEVES1_PREFIX = "10.0.0.1"      # set to reeves1's actual address
 MASK_BITS      = 32
+IFACE          = "ens5f0np0"
+QUEUE          = 0
+QUEUE_COUNT    = 1
 
 
 def main():
@@ -32,21 +35,27 @@ def main():
     stub    = penny_pb2_grpc.PennyServiceStub(channel)
 
     override = {
+        "platform": {
+            "backend":     "af_xdp",
+            "interface":   IFACE,
+            "queue":       QUEUE,
+            "queue_count": QUEUE_COUNT,
+        },
         "runtime_policy": {
             "mode": "active",
             "safety":     {"allow_ssh_bypass": True},
             "aggregates": {"enabled": True},
             "thresholds": {
-                "packet_drop_probability":          0.05,
-                "max_duplicate_ratio":              0.15,
-                "max_reordering_ratio":             0.8,
+                "packet_drop_probability":              0.05,
+                "max_duplicate_ratio":                  0.15,
+                "max_reordering_ratio":                 0.8,
                 "retransmission_observation_miss_rate": 0.05,
-                "retransmission_timeout_in_seconds":  3.0,
-                "max_packet_drops_per_flow":          6,
-                "max_packet_drops_global_aggregate":  12,
-                "stop_after_individual_flows":        10,
+                "retransmission_timeout_in_seconds":    3.0,
+                "max_packet_drops_per_flow":            6,
+                "max_packet_drops_global_aggregate":    12,
+                "stop_after_individual_flows":          10,
             },
-        }
+        },
     }
 
     req = penny_pb2.StartTestRequest(

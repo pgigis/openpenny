@@ -4,9 +4,8 @@
 Scenario 2 — spoofed: drive penny via gRPC instead of the CLI.
 
 reeves1 injects forged-source packets toward reeves3 (see
-demo/scenarios/02-spoofed.md). The daemon's traffic_policy
-(`tcp dst_port 5201` from examples/configs/policies/traffic_default.yaml)
-catches them.
+demo/scenarios/02-spoofed.md). The override below sets the
+traffic_policy, platform, and runtime_policy in a single StartTest call.
 
 Expected: aggregate forged_src -> reeves3 reaches "not closed-loop".
 """
@@ -20,6 +19,7 @@ import penny_pb2_grpc
 IFACE       = "ens5f0np0"
 QUEUE       = 0
 QUEUE_COUNT = 1
+DST_PORT    = 5201
 
 
 def main():
@@ -27,6 +27,15 @@ def main():
     stub    = penny_pb2_grpc.PennyServiceStub(channel)
 
     override = {
+        "traffic_policy": {
+            "default": "exclude",
+            "rules": [{
+                "name":     "iperf3-server",
+                "decision": "include",
+                "protocol": "tcp",
+                "dst_port": DST_PORT,
+            }],
+        },
         "platform": {
             "backend":     "af_xdp",
             "interface":   IFACE,

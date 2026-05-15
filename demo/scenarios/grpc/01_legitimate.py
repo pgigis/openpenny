@@ -8,10 +8,12 @@ Equivalent to:
         -c examples/configs/config_default.yaml \\
         --source xdp --iface ens5f0np0 --queues 1
 
-The daemon's traffic_policy (`tcp dst_port 5201` from
-examples/configs/policies/traffic_default.yaml) picks up the iperf3
-flows; this script only overrides the platform/runtime knobs so
-pennyd opens the right NIC.
+with reeves1 generating the 16-way iperf3 stream
+(see demo/scenarios/01-legitimate.md).
+
+The override JSON below is self-contained: it sets the traffic_policy,
+platform, and runtime_policy in one StartTest call. The daemon's
+on-disk YAML only supplies defaults that this override doesn't touch.
 
 Expected: aggregate reeves1 -> reeves3 reaches "legitimate closed-loop".
 """
@@ -27,6 +29,7 @@ import penny_pb2_grpc
 IFACE       = "ens5f0np0"
 QUEUE       = 0
 QUEUE_COUNT = 1
+DST_PORT    = 5201          # iperf3 server port on reeves3
 
 
 def main():
@@ -34,6 +37,15 @@ def main():
     stub    = penny_pb2_grpc.PennyServiceStub(channel)
 
     override = {
+        "traffic_policy": {
+            "default": "exclude",
+            "rules": [{
+                "name":     "iperf3-server",
+                "decision": "include",
+                "protocol": "tcp",
+                "dst_port": DST_PORT,
+            }],
+        },
         "platform": {
             "backend":     "af_xdp",
             "interface":   IFACE,
@@ -57,7 +69,6 @@ def main():
         },
     }
 
-    # No prefix/mask_bits: let the config's traffic_policy decide.
     req = penny_pb2.StartTestRequest(
         mode="active",
         test_id="legitimate",

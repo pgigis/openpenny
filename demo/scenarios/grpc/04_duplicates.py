@@ -4,8 +4,7 @@
 Scenario 4 — duplicates: drive penny via gRPC instead of the CLI.
 
 reeves1 injects a spoofed flow with a high duplicate probability
-(see demo/scenarios/04-duplicates.md). The daemon's traffic_policy
-(`tcp dst_port 5201`) catches the traffic; this script tightens
+(see demo/scenarios/04-duplicates.md). This client tightens
 max_duplicate_ratio so the aggregate exits via the duplicate path
 rather than the closed-loop check.
 
@@ -21,6 +20,7 @@ import penny_pb2_grpc
 IFACE       = "ens5f0np0"
 QUEUE       = 0
 QUEUE_COUNT = 1
+DST_PORT    = 5201
 
 
 def main():
@@ -28,6 +28,15 @@ def main():
     stub    = penny_pb2_grpc.PennyServiceStub(channel)
 
     override = {
+        "traffic_policy": {
+            "default": "exclude",
+            "rules": [{
+                "name":     "iperf3-server",
+                "decision": "include",
+                "protocol": "tcp",
+                "dst_port": DST_PORT,
+            }],
+        },
         "platform": {
             "backend":     "af_xdp",
             "interface":   IFACE,

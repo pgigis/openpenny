@@ -4,8 +4,7 @@
 Scenario 3 — mixed: drive penny via gRPC instead of the CLI.
 
 reeves1 generates both a legitimate iperf3 stream and a spoofed flow
-toward reeves3 (see demo/scenarios/03-mixed.md). Penny watches the
-TCP dst_port 5201 rule from the config and tracks the two
+toward reeves3 (see demo/scenarios/03-mixed.md). Penny tracks both
 aggregates (reeves1 -> reeves3, forged_src -> reeves3) concurrently
 in one run.
 
@@ -23,6 +22,7 @@ import penny_pb2_grpc
 IFACE       = "ens5f0np0"
 QUEUE       = 0
 QUEUE_COUNT = 1
+DST_PORT    = 5201
 
 
 def main():
@@ -30,6 +30,15 @@ def main():
     stub    = penny_pb2_grpc.PennyServiceStub(channel)
 
     override = {
+        "traffic_policy": {
+            "default": "exclude",
+            "rules": [{
+                "name":     "iperf3-server",
+                "decision": "include",
+                "protocol": "tcp",
+                "dst_port": DST_PORT,
+            }],
+        },
         "platform": {
             "backend":     "af_xdp",
             "interface":   IFACE,

@@ -169,6 +169,7 @@ struct ModeResult {
     std::size_t passive_open_gaps = 0;
     std::vector<std::string> passive_gap_summaries;
     std::vector<std::string> closed_loop_flow_summaries;
+    std::vector<std::string> not_closed_loop_flow_summaries;
     std::vector<std::string> duplicate_exceeded_flow_summaries;
     std::size_t passive_flows_rst = 0;
     std::size_t passive_flows_syn_only = 0;

@@ -399,6 +399,12 @@ PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts
                 r->closed_loop_flow_summaries.begin(),
                 r->closed_loop_flow_summaries.end());
         }
+        if (!r->not_closed_loop_flow_summaries.empty()) {
+            aggregate.not_closed_loop_flow_summaries.insert(
+                aggregate.not_closed_loop_flow_summaries.end(),
+                r->not_closed_loop_flow_summaries.begin(),
+                r->not_closed_loop_flow_summaries.end());
+        }
         if (!r->duplicate_exceeded_flow_summaries.empty()) {
             aggregate.duplicate_exceeded_flow_summaries.insert(
                 aggregate.duplicate_exceeded_flow_summaries.end(),
@@ -435,6 +441,8 @@ PipelineSummary drive_pipeline(const Config& cfg_in, const PipelineOptions& opts
     }
     std::sort(aggregate.closed_loop_flow_summaries.begin(),
               aggregate.closed_loop_flow_summaries.end());
+    std::sort(aggregate.not_closed_loop_flow_summaries.begin(),
+              aggregate.not_closed_loop_flow_summaries.end());
     std::sort(aggregate.duplicate_exceeded_flow_summaries.begin(),
               aggregate.duplicate_exceeded_flow_summaries.end());
 

@@ -1,46 +1,66 @@
 {
-    "test_id": "demo-test",
-    "status": "ok",
-    "packets":
-    {
-        "processed": 12345,
-        "forwarded": 12345,
-        "errors": 0,
-        "pure_ack": 10,
-        "data": 12000,
-        "duplicate": 15,
-        "in_order": 11850,
-        "out_of_order": 150,
-        "retransmitted": 5,
-        "non_retransmitted": 2
-    },
-    "flows":
-    {
-        "tracked_syn": 8,
-        "tracked_data": 12
-    },
-    "penny_completed": true,
-    "aggregates_completed": false,
-    "aggregates_enabled": true,
-    "aggregates_status": "pending",
-    "aggregates_decision_complete": false,
-    "aggregates_decision_state": "running",
-    "aggregates_has_eval": false,
-    "aggregates_snapshots": 1,
-    "aggregates_eval":
-    {
-        "data": 0,
-        "duplicate": 0,
-        "retransmitted": 0,
-        "non_retransmitted": 0
-    },
-    "aggregate_flows":
-    {
-        "monitored": 25,
-        "finished": 4,
-        "closed_loop": 0,
-        "not_closed_loop": 4,
-        "rst": 0,
-        "duplicates_exceeded": 0
+    "test": {
+        "id": "demo-test",
+        "status": "ok",
+        "end_state": "Aggregates completed (not_closed_loop), found 1 closed-loop flow",
+        "penny_completed": true,
+        "aggregates": {
+            "enabled": true,
+            "completed": false,
+            "status": "not_closed_loop",
+            "decision_complete": true,
+            "decision_state": "completed",
+            "has_eval": true,
+            "snapshots": 12,
+            "eval": {
+                "data": 251,
+                "duplicate": 0,
+                "retransmitted": 0,
+                "non_retransmitted": 12
+            },
+            "flows": {
+                "monitored": 36,
+                "finished": 30,
+                "closed_loop": 1,
+                "not_closed_loop": 20,
+                "rst": 0,
+                "duplicates_exceeded": 0
+            }
+        },
+        "individual_flows": {
+            "tracked_syn": 30,
+            "tracked_data": 21,
+            "closed_loop": {
+                "count": 1,
+                "flows": [
+                    "10.0.0.1:5000 -> 10.0.0.2:80 data=4000 dropped=0 rtx=0 non_rtx=4000 dup=0 in_order=3950 out_of_order=50"
+                ]
+            },
+            "not_closed_loop": {
+                "count": 20,
+                "flows": [
+                    "10.0.0.1:5100 -> 10.0.0.2:80 data=10 dropped=0 rtx=0 non_rtx=10 dup=0 in_order=10 out_of_order=0",
+                    "...19 more..."
+                ]
+            },
+            "duplicates_exceeded": {
+                "count": 0,
+                "flows": []
+            }
+        },
+        "overall": {
+            "packets": {
+                "processed": 10263,
+                "forwarded": 10069,
+                "errors": 0,
+                "pure_ack": 9,
+                "data": 10171,
+                "duplicate": 4,
+                "in_order": 10148,
+                "out_of_order": 23,
+                "retransmitted": 19,
+                "non_retransmitted": 78
+            }
+        }
     }
 }

@@ -481,6 +481,104 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
     }
     return nullptr;
 }
+
+// Recursive YAML map merge. Mirrors merge_yaml_nodes() in Config.cpp:
+// when both nodes are maps, keys from `overlay` win over `base` and
+// nested maps merge recursively. Used by resolve_includes_in_place().
+YAML::Node merge_yaml_overlay(const YAML::Node& base, const YAML::Node& overlay) {
+    if (!base)    return YAML::Clone(overlay);
+    if (!overlay) return YAML::Clone(base);
+    if (!base.IsMap() || !overlay.IsMap()) {
+        return YAML::Clone(overlay);
+    }
+    YAML::Node out(YAML::NodeType::Map);
+    for (auto it = base.begin(); it != base.end(); ++it) {
+        out[it->first.as<std::string>()] = YAML::Clone(it->second);
+    }
+    for (auto it = overlay.begin(); it != overlay.end(); ++it) {
+        const auto key = it->first.as<std::string>();
+        out[key] = merge_yaml_overlay(out[key], it->second);
+    }
+    return out;
+}
+
+// Expand a YAML config's `includes:` block in place, loading each
+// referenced file relative to @p config_path's directory and merging
+// the loaded content into root[section]. Existing root[section]
+// entries (e.g. from gRPC override JSON applied earlier) win on
+// conflicts -- same precedence as Config::from_file's own resolver.
+//
+// After resolution `includes:` is removed from the root so the worker
+// does not re-resolve includes that would re-clobber the explicit
+// sections written here.
+//
+// Without this, the daemon's override-merge path wrote `merged` with
+// only the literal `includes:` map (no explicit `egress`, etc.),
+// leaving the gRPC client unable to control egress without sending its
+// own `egress:` block.
+bool resolve_includes_in_place(YAML::Node& root, const std::string& config_path) {
+    if (!root || !root.IsMap()) return true;
+    auto includes = root["includes"];
+    if (!includes) return true;
+    if (!includes.IsMap()) return false;
+
+    namespace fs = std::filesystem;
+    const fs::path base_dir = fs::path(config_path).parent_path();
+
+    for (auto it = includes.begin(); it != includes.end(); ++it) {
+        // One bad include shouldn't tank the whole resolution. Each
+        // iteration is wrapped so we skip the offender and continue.
+        try {
+            const auto section = it->first.as<std::string>();
+            const auto& spec   = it->second;
+
+            std::string path_str;
+            std::string explicit_section = section;
+            bool        section_explicit = false;
+
+            if (spec.IsScalar()) {
+                path_str = spec.as<std::string>();
+            } else if (spec.IsMap()) {
+                if (!spec["path"]) continue;
+                path_str = spec["path"].as<std::string>();
+                if (auto s = spec["section"]) {
+                    explicit_section = s.as<std::string>();
+                    section_explicit = true;
+                }
+            } else {
+                continue;
+            }
+
+            fs::path inc_path = path_str;
+            if (inc_path.is_relative()) inc_path = base_dir / inc_path;
+
+            YAML::Node loaded = YAML::LoadFile(inc_path.string());
+
+            YAML::Node section_node;
+            if (loaded[explicit_section]) section_node = loaded[explicit_section];
+            else if (!section_explicit)   section_node = loaded;
+            else                          continue;
+
+            root[section] = root[section]
+                ? merge_yaml_overlay(section_node, root[section])
+                : YAML::Clone(section_node);
+        } catch (...) {
+            // Skip this include; the merge below will not re-resolve it,
+            // so the worker's own resolver gets a chance later if the
+            // includes block survives (we still remove it below, so the
+            // bad section may just stay empty -- acceptable for now).
+            continue;
+        }
+    }
+
+    try {
+        root.remove("includes");
+    } catch (...) {
+        // Not fatal -- worker's own resolver tolerates an absent or
+        // unusual includes block.
+    }
+    return true;
+}
 } // namespace
 
 ::grpc::Status PennyServiceImpl::ApplyConfig(::grpc::ServerContext*,
@@ -687,12 +785,28 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
         return ::grpc::Status(::grpc::StatusCode::INVALID_ARGUMENT, "missing request");
     }
 
-    TCPLOG_INFO("[grpc_start] mode=%s prefix=%s/%u test_id=%s override_bytes=%zu",
-                (request->has_mode() ? request->mode().c_str() : "active"),
+    // Defensive: wipe any data the response object may already carry
+    // (gRPC normally hands us a fresh proto, but Clear() is cheap and
+    // guarantees no field from a prior test leaks into this one).
+    response->Clear();
+
+    const std::string test_id_for_log =
+        request->test_id().empty() ? std::string{"default"} : request->test_id();
+    const char* mode_for_log =
+        request->has_mode() ? request->mode().c_str() : "active";
+
+    // Loud, framed start banner so the server log clearly delimits each
+    // gRPC test's lifecycle. The end banner below mirrors this shape.
+    TCPLOG_INFO("════════════════════════════════════════════════════════════════════");
+    TCPLOG_INFO("  >>> gRPC StartTest RECEIVED");
+    TCPLOG_INFO("      test_id=%s", test_id_for_log.c_str());
+    TCPLOG_INFO("      mode=%s prefix=%s/%u",
+                mode_for_log,
                 request->prefix().c_str(),
-                static_cast<unsigned>(request->mask_bits()),
-                request->test_id().c_str(),
+                static_cast<unsigned>(request->mask_bits()));
+    TCPLOG_INFO("      config_override_bytes=%zu",
                 request->has_config_override_json() ? request->config_override_json().size() : 0);
+    TCPLOG_INFO("════════════════════════════════════════════════════════════════════");
 
     // Prepare worker-launch configuration.
     openpenny::app::WorkerLaunchConfig worker_cfg{};
@@ -704,35 +818,54 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
     worker_cfg.config_path = config_path_.empty() ? "openpenny.yaml" : config_path_;
     worker_cfg.test_id = request->test_id().empty() ? "default" : request->test_id();
 
+    // Start from the daemon bootstrap config. Legacy request-level
+    // forwarding fields are overrides only when explicitly present.
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        worker_cfg.egress = defaults_.egress;
+    }
+
     // Translate the legacy-shaped proto fields into the declarative
     // EgressConfig consumed downstream. We keep the proto as-is because
     // external clients still send these flags; this block is the only
     // place they're reshaped.
     //
     //   forward_raw_socket=true            -> RawSocket egress on forward_device
-    //   forward_to_tun=true (default)      -> TUN egress on tun_name / forward_device
+    //   forward_to_tun=true                -> TUN egress on tun_name / forward_device
     //   forward_to_tun=false, !raw_socket  -> None (drop matched packets)
-    const bool req_raw_socket = request->has_forward_raw_socket() && request->forward_raw_socket();
-    const bool req_tun_enabled = !request->has_forward_to_tun() || request->forward_to_tun();
-
-    if (req_raw_socket) {
+    if (request->has_forward_raw_socket() && request->forward_raw_socket()) {
         worker_cfg.egress.kind = openpenny::egress::EgressKind::RawSocket;
-        worker_cfg.egress.device =
-            (request->has_forward_device() && !request->forward_device().empty())
-                ? request->forward_device()
-                : (request->has_tun_name() ? request->tun_name() : std::string{});
-    } else if (req_tun_enabled) {
-        worker_cfg.egress.kind = openpenny::egress::EgressKind::Tun;
-        worker_cfg.egress.device =
-            (request->has_tun_name() && !request->tun_name().empty())
-                ? request->tun_name()
-                : (request->has_forward_device() ? request->forward_device() : std::string{"xdp-tu"});
+    } else if (request->has_forward_to_tun()) {
+        worker_cfg.egress.kind = request->forward_to_tun()
+                                     ? openpenny::egress::EgressKind::Tun
+                                     : openpenny::egress::EgressKind::None;
+    }
+
+    if (worker_cfg.egress.kind == openpenny::egress::EgressKind::RawSocket) {
+        if (request->has_forward_device() && !request->forward_device().empty()) {
+            worker_cfg.egress.device = request->forward_device();
+        } else if (worker_cfg.egress.device.empty() &&
+                   request->has_tun_name() &&
+                   !request->tun_name().empty()) {
+            worker_cfg.egress.device = request->tun_name();
+        }
+    } else if (worker_cfg.egress.kind == openpenny::egress::EgressKind::Tun) {
+        if (request->has_tun_name() && !request->tun_name().empty()) {
+            worker_cfg.egress.device = request->tun_name();
+        } else if (worker_cfg.egress.device.empty() &&
+                   request->has_forward_device() &&
+                   !request->forward_device().empty()) {
+            worker_cfg.egress.device = request->forward_device();
+        } else if (worker_cfg.egress.device.empty()) {
+            worker_cfg.egress.device = "xdp-tu";
+        }
     } else {
-        worker_cfg.egress.kind = openpenny::egress::EgressKind::None;
         worker_cfg.egress.device.clear();
     }
 
-    worker_cfg.egress.tun_multi_queue = !request->has_tun_multi_queue() || request->tun_multi_queue();
+    if (request->has_tun_multi_queue()) {
+        worker_cfg.egress.tun_multi_queue = request->tun_multi_queue();
+    }
     if (request->has_tun_mtu() && request->tun_mtu() > 0) {
         worker_cfg.egress.tun_mtu = request->tun_mtu();
     }
@@ -771,6 +904,28 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
             base_cfg = YAML::LoadFile(worker_cfg.config_path);
         } catch (const std::exception& e) {
             TCPLOG_ERROR("Failed to load base config %s: %s", worker_cfg.config_path.c_str(), e.what());
+        }
+        // Expand `includes:` in place so the merged JSON carries explicit
+        // top-level sections (egress, traffic_policy, runtime_policy,
+        // platform, ...) and the worker reads them directly instead of
+        // re-resolving includes against the temp file's directory.
+        //
+        // Defensive: any yaml-cpp exception here would otherwise bubble
+        // out of StartTest and surface as a generic
+        // "Unexpected error in RPC handling" to the gRPC client. Log
+        // and fall back to the unresolved YAML; the worker will still
+        // run its own resolver at load time, so the only regression is
+        // that overrides may not interact correctly with includes
+        // (which is exactly what we wanted to fix, but graceful
+        // degradation beats a 500-style RPC failure).
+        try {
+            resolve_includes_in_place(base_cfg, worker_cfg.config_path);
+        } catch (const std::exception& e) {
+            TCPLOG_ERROR("resolve_includes_in_place failed for %s: %s",
+                         worker_cfg.config_path.c_str(), e.what());
+        } catch (...) {
+            TCPLOG_ERROR("resolve_includes_in_place threw an unknown exception for %s",
+                         worker_cfg.config_path.c_str());
         }
         nlohmann::json base_json = yaml_to_json(base_cfg);
         nlohmann::json merged = base_json;
@@ -898,9 +1053,24 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
                         worker_cfg.egress.device =
                             merged["egress"]["device"].get<std::string>();
                     }
+                } else if (kind == "raw_socket") {
+                    worker_cfg.egress.kind = openpenny::egress::EgressKind::RawSocket;
+                    if (merged["egress"].contains("device") &&
+                        merged["egress"]["device"].is_string()) {
+                        worker_cfg.egress.device =
+                            merged["egress"]["device"].get<std::string>();
+                    }
+                } else if (kind == "raw_nic") {
+                    worker_cfg.egress.kind = openpenny::egress::EgressKind::RawNic;
+                    if (merged["egress"].contains("device") &&
+                        merged["egress"]["device"].is_string()) {
+                        worker_cfg.egress.device =
+                            merged["egress"]["device"].get<std::string>();
+                    }
                 } else if (kind == "none") {
                     if (worker_cfg.egress.kind != openpenny::egress::EgressKind::RawSocket) {
                         worker_cfg.egress.kind = openpenny::egress::EgressKind::None;
+                        worker_cfg.egress.device.clear();
                     }
                 }
             }
@@ -937,7 +1107,8 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
     const auto spawned = openpenny::app::spawn_worker_process(worker_cfg, opts);
     const std::string& output = spawned.output;
     if (spawned.status != 0) {
-        TCPLOG_ERROR("[grpc_start] worker exited with status=%d", spawned.status);
+        TCPLOG_ERROR("[grpc_worker] worker exited with non-zero status=%d (test_id=%s)",
+                     spawned.status, test_id_for_log.c_str());
     }
     if (!temp_config_path.empty()) {
         std::error_code ec;
@@ -1004,11 +1175,8 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
         response->set_status("error");
     }
 
-    TCPLOG_INFO("[grpc_end] test_id=%s status=%s packets_processed=%llu forwarded=%llu",
-                response->test_id().c_str(),
-                response->status().c_str(),
-                static_cast<unsigned long long>(response->packets_processed()),
-                static_cast<unsigned long long>(response->packets_forwarded()));
+    // (End banner deferred until after the JSON summary is built, so
+    // the log line reflects the response we're actually sending back.)
 
     const bool aggregates_enabled = response->aggregates_enabled();
     std::string aggregates_status = response->aggregates_status();
@@ -1054,56 +1222,167 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
                                                       ? (aggregates_decision_complete ? "completed" : "running")
                                                       : "n/a";
 
-    // Build a JSON summary akin to the CLI output, preserving any
-    // worker-emitted detail sections that do not have dedicated proto fields.
-    nlohmann::json summary = nlohmann::json::object();
+    // Parse the worker's JSON to extract the bits that don't have
+    // dedicated proto fields: end_state, the closed-loop /
+    // duplicate-exceeded flow-summary arrays, and any passive-mode
+    // detail block. Everything else is rebuilt from response fields
+    // below so the gRPC service stays the authority on the schema.
+    nlohmann::json worker_test = nlohmann::json::object();
     if (!response->json_summary().empty()) {
         auto parsed = nlohmann::json::parse(response->json_summary(), nullptr, false);
-        if (parsed.is_object()) {
-            summary = std::move(parsed);
+        if (parsed.is_object() && parsed.contains("test") && parsed["test"].is_object()) {
+            worker_test = std::move(parsed["test"]);
         }
     }
-    summary["test_id"] = response->test_id();
-    summary["status"] = response->status();
-    summary["packets"] = {
-        {"processed", response->packets_processed()},
-        {"forwarded", response->packets_forwarded()},
-        {"errors", response->forward_errors()},
-        {"pure_ack", response->pure_ack_packets()},
-        {"data", response->data_packets()},
-        {"duplicate", response->duplicate_packets()},
-        {"in_order", response->in_order_packets()},
-        {"out_of_order", response->out_of_order_packets()},
-        {"retransmitted", response->retransmitted_packets()},
-        {"non_retransmitted", response->non_retransmitted_packets()}
+    const std::string end_state = worker_test.value("end_state", std::string{});
+
+    // Pull the per-flow summary arrays out of the worker's
+    // individual_flows.{closed_loop,not_closed_loop,duplicates_exceeded}.flows
+    // nodes -- these don't have dedicated proto fields, so the worker
+    // JSON is the only source.
+    nlohmann::json closed_loop_array = nlohmann::json::array();
+    nlohmann::json not_closed_loop_array = nlohmann::json::array();
+    nlohmann::json dup_exceeded_array = nlohmann::json::array();
+    auto pull_category = [&](const char* key) -> nlohmann::json {
+        if (!worker_test.contains("individual_flows")) return nlohmann::json::array();
+        const auto& worker_indiv = worker_test["individual_flows"];
+        if (!worker_indiv.is_object() || !worker_indiv.contains(key)) return nlohmann::json::array();
+        const auto& bucket = worker_indiv[key];
+        if (bucket.is_object() && bucket.contains("flows") && bucket["flows"].is_array()) {
+            return bucket["flows"];
+        }
+        return nlohmann::json::array();
     };
-    summary["flows"] = {
+    closed_loop_array     = pull_category("closed_loop");
+    not_closed_loop_array = pull_category("not_closed_loop");
+    dup_exceeded_array    = pull_category("duplicates_exceeded");
+    nlohmann::json passive_block;
+    if (worker_test.contains("passive") && worker_test["passive"].is_object()) {
+        passive_block = worker_test["passive"];
+    }
+
+    // Build the structured summary:
+    //   test -> { aggregates, individual_flows, overall }
+    // individual_flows collapses to the string "N/A" once the
+    // aggregate phase has reached a decision -- per-flow detail is
+    // not the deciding signal at that point.
+    nlohmann::json test_obj;
+    test_obj["id"] = response->test_id();
+    test_obj["status"] = response->status();
+    test_obj["end_state"] = end_state;
+    test_obj["penny_completed"] = response->penny_completed();
+
+    test_obj["aggregates"] = {
+        {"enabled", response->aggregates_enabled()},
+        {"completed", response->aggregates_penny_completed()},
+        {"status", aggregates_status},
+        {"decision_complete", aggregates_decision_complete},
+        {"decision_state", aggregates_decision_state},
+        {"has_eval", aggregates_has_eval},
+        {"snapshots", aggregates_snapshots},
+        {"eval", {
+            {"data", agg_eval_data},
+            {"duplicate", agg_eval_dup},
+            {"retransmitted", agg_eval_rtx},
+            {"non_retransmitted", agg_eval_nonrtx}
+        }},
+        {"flows", {
+            {"monitored", agg_flows_monitored},
+            {"finished", agg_flows_finished},
+            {"closed_loop", agg_flows_closed},
+            {"not_closed_loop", agg_flows_not_closed},
+            {"rst", agg_flows_rst},
+            {"duplicates_exceeded", agg_flows_dup_exceeded}
+        }}
+    };
+
+    // individual_flows is ALWAYS emitted as a categorised object even
+    // when the aggregate phase reached a decision -- the decision is
+    // usually grounded in per-flow categorisation, and the caller
+    // wants to see which flows landed in which bucket. Counts come
+    // from std::max(aggregate-snapshot-count, summary-array-size) so
+    // we track whichever source has more visibility (mirrors worker).
+    const auto cl_count = std::max<std::uint64_t>(
+        agg_flows_closed,
+        static_cast<std::uint64_t>(closed_loop_array.size()));
+    const auto ncl_count = std::max<std::uint64_t>(
+        agg_flows_not_closed,
+        static_cast<std::uint64_t>(not_closed_loop_array.size()));
+    const auto de_count = std::max<std::uint64_t>(
+        agg_flows_dup_exceeded,
+        static_cast<std::uint64_t>(dup_exceeded_array.size()));
+    test_obj["individual_flows"] = {
         {"tracked_syn", response->flows_tracked_syn()},
-        {"tracked_data", response->flows_tracked_data()}
+        {"tracked_data", response->flows_tracked_data()},
+        {"closed_loop", {
+            {"count", cl_count},
+            {"flows", closed_loop_array}
+        }},
+        {"not_closed_loop", {
+            {"count", ncl_count},
+            {"flows", not_closed_loop_array}
+        }},
+        {"duplicates_exceeded", {
+            {"count", de_count},
+            {"flows", dup_exceeded_array}
+        }}
     };
-    summary["penny_completed"] = response->penny_completed();
-    summary["aggregates_completed"] = response->aggregates_penny_completed();
-    summary["aggregates_enabled"] = response->aggregates_enabled();
-    summary["aggregates_status"] = aggregates_status;
-    summary["aggregates_decision_complete"] = aggregates_decision_complete;
-    summary["aggregates_decision_state"] = aggregates_decision_state;
-    summary["aggregates_has_eval"] = aggregates_has_eval;
-    summary["aggregates_snapshots"] = aggregates_snapshots;
-    summary["aggregates_eval"] = {
-        {"data", agg_eval_data},
-        {"duplicate", agg_eval_dup},
-        {"retransmitted", agg_eval_rtx},
-        {"non_retransmitted", agg_eval_nonrtx}
+
+    test_obj["overall"] = {
+        {"packets", {
+            {"processed", response->packets_processed()},
+            {"forwarded", response->packets_forwarded()},
+            {"errors", response->forward_errors()},
+            {"pure_ack", response->pure_ack_packets()},
+            {"data", response->data_packets()},
+            {"duplicate", response->duplicate_packets()},
+            {"in_order", response->in_order_packets()},
+            {"out_of_order", response->out_of_order_packets()},
+            {"retransmitted", response->retransmitted_packets()},
+            {"non_retransmitted", response->non_retransmitted_packets()}
+        }}
     };
-    summary["aggregate_flows"] = {
-        {"monitored", agg_flows_monitored},
-        {"finished", agg_flows_finished},
-        {"closed_loop", agg_flows_closed},
-        {"not_closed_loop", agg_flows_not_closed},
-        {"rst", agg_flows_rst},
-        {"duplicates_exceeded", agg_flows_dup_exceeded}
-    };
+
+    if (!passive_block.is_null() && passive_block.is_object()) {
+        test_obj["passive"] = passive_block;
+    }
+
+    nlohmann::json summary;
+    summary["test"] = test_obj;
     response->set_json_summary(summary.dump());
+
+    // Loud, framed end banner mirroring the start banner above.
+    TCPLOG_INFO("════════════════════════════════════════════════════════════════════");
+    TCPLOG_INFO("  <<< gRPC StartTest COMPLETED");
+    TCPLOG_INFO("      test_id=%s status=%s",
+                response->test_id().c_str(),
+                response->status().c_str());
+    TCPLOG_INFO("      packets: processed=%llu forwarded=%llu errors=%llu",
+                static_cast<unsigned long long>(response->packets_processed()),
+                static_cast<unsigned long long>(response->packets_forwarded()),
+                static_cast<unsigned long long>(response->forward_errors()));
+    TCPLOG_INFO("      aggregates: enabled=%d status=%s decision=%s",
+                aggregates_enabled ? 1 : 0,
+                aggregates_status.c_str(),
+                aggregates_decision_state.c_str());
+    TCPLOG_INFO("════════════════════════════════════════════════════════════════════");
+
+    // Per-test cleanup. All packet/flow counters and runtime globals
+    // (PerThreadStats, RuntimeSetup, aggregates status) live in the
+    // worker subprocess that has already exited above -- the kernel
+    // reaped them when the subprocess died, so nothing carries over
+    // into the next StartTest call.
+    //
+    // The only per-call resources held by THIS server process were:
+    //   * worker_cfg / opts / output / parsed JSON  -- function-local,
+    //     destroyed when this stack frame unwinds on return.
+    //   * temp config file (when a config override was provided) --
+    //     already removed in the spawn_worker_process block above.
+    //
+    // We don't have to do anything else, but we emit an explicit
+    // cleanup log so the lifecycle of each gRPC test is unambiguous.
+    TCPLOG_INFO("[grpc_cleanup] test_id=%s -- per-test counters and state cleared",
+                response->test_id().c_str());
 
     return ::grpc::Status::OK;
 }

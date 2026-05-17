@@ -234,7 +234,32 @@ void ActiveTestPipelineRunner::finalize(ModeResult& result) {
     result.packets_forwarded = total_pkts_forwarded_;
     result.forward_errors = total_forward_errors_;
     result.closed_loop_flow_summaries = closed_loop_flow_summaries_;
+    result.not_closed_loop_flow_summaries = not_closed_loop_flow_summaries_;
     result.duplicate_exceeded_flow_summaries = duplicate_exceeded_flow_summaries_;
+
+    // Copy this thread's packet-level counters off PerThreadStats onto
+    // the ModeResult so they survive the driver's per-thread fold.
+    // FlowEngine increments these on every packet (pure_ack / data /
+    // duplicate / in_order / out_of_order / retransmitted /
+    // non_retransmitted), but the active pipeline previously never
+    // wrote them back to its ModeResult -- so in gRPC mode the summary
+    // came out as `data=0, in_order=0, ...` while only `forwarded` (a
+    // runner-local counter) and `processed` (rescued by the driver's
+    // max() fallback against aggregate_counters().packets) showed real
+    // numbers.
+    //
+    // We read this thread's slot only -- the driver later sums across
+    // threads when folding per-thread ModeResults into the aggregate.
+    const auto& tls_counters = openpenny::app::current_thread_counters();
+    result.packets_processed         = tls_counters.packets;
+    result.pure_ack_packets          = tls_counters.pure_ack_packets;
+    result.data_packets              = tls_counters.data_packets;
+    result.duplicate_packets         = tls_counters.duplicate_packets;
+    result.in_order_packets          = tls_counters.in_order_packets;
+    result.out_of_order_packets      = tls_counters.out_of_order_packets;
+    result.retransmitted_packets     = tls_counters.retransmitted_packets;
+    result.non_retransmitted_packets = tls_counters.non_retransmitted_packets;
+    result.pending_retransmissions   = tls_counters.pending_retransmissions;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +364,9 @@ void ActiveTestPipelineRunner::complete_flow_with_summary(const FlowKey& key, co
     const auto summary = format_closed_loop_flow_summary(key, existing->flow);
     if (final_decision == penny::FlowEngine::FlowDecision::FINISHED_CLOSED_LOOP) {
         closed_loop_flow_summaries_.push_back(summary);
+    }
+    if (final_decision == penny::FlowEngine::FlowDecision::FINISHED_NOT_CLOSED_LOOP) {
+        not_closed_loop_flow_summaries_.push_back(summary);
     }
     if (existing->state == penny::FlowTrackingState::INTERRUPTED_DUPLICATE_EXCEEDED ||
         final_decision == penny::FlowEngine::FlowDecision::FINISHED_DUPLICATE_EXCEEDED) {

@@ -242,6 +242,7 @@ private:
     std::size_t total_pkts_forwarded_{0};
     std::size_t total_forward_errors_{0};
     std::vector<std::string> closed_loop_flow_summaries_;
+    std::vector<std::string> not_closed_loop_flow_summaries_;
     std::vector<std::string> duplicate_exceeded_flow_summaries_;
 
     /**

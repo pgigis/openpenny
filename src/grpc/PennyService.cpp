@@ -481,104 +481,6 @@ nlohmann::json yaml_to_json(const YAML::Node& node) {
     }
     return nullptr;
 }
-
-// Recursive YAML map merge. Mirrors merge_yaml_nodes() in Config.cpp:
-// when both nodes are maps, keys from `overlay` win over `base` and
-// nested maps merge recursively. Used by resolve_includes_in_place().
-YAML::Node merge_yaml_overlay(const YAML::Node& base, const YAML::Node& overlay) {
-    if (!base)    return YAML::Clone(overlay);
-    if (!overlay) return YAML::Clone(base);
-    if (!base.IsMap() || !overlay.IsMap()) {
-        return YAML::Clone(overlay);
-    }
-    YAML::Node out(YAML::NodeType::Map);
-    for (auto it = base.begin(); it != base.end(); ++it) {
-        out[it->first.as<std::string>()] = YAML::Clone(it->second);
-    }
-    for (auto it = overlay.begin(); it != overlay.end(); ++it) {
-        const auto key = it->first.as<std::string>();
-        out[key] = merge_yaml_overlay(out[key], it->second);
-    }
-    return out;
-}
-
-// Expand a YAML config's `includes:` block in place, loading each
-// referenced file relative to @p config_path's directory and merging
-// the loaded content into root[section]. Existing root[section]
-// entries (e.g. from gRPC override JSON applied earlier) win on
-// conflicts -- same precedence as Config::from_file's own resolver.
-//
-// After resolution `includes:` is removed from the root so the worker
-// does not re-resolve includes that would re-clobber the explicit
-// sections written here.
-//
-// Without this, the daemon's override-merge path wrote `merged` with
-// only the literal `includes:` map (no explicit `egress`, etc.),
-// leaving the gRPC client unable to control egress without sending its
-// own `egress:` block.
-bool resolve_includes_in_place(YAML::Node& root, const std::string& config_path) {
-    if (!root || !root.IsMap()) return true;
-    auto includes = root["includes"];
-    if (!includes) return true;
-    if (!includes.IsMap()) return false;
-
-    namespace fs = std::filesystem;
-    const fs::path base_dir = fs::path(config_path).parent_path();
-
-    for (auto it = includes.begin(); it != includes.end(); ++it) {
-        // One bad include shouldn't tank the whole resolution. Each
-        // iteration is wrapped so we skip the offender and continue.
-        try {
-            const auto section = it->first.as<std::string>();
-            const auto& spec   = it->second;
-
-            std::string path_str;
-            std::string explicit_section = section;
-            bool        section_explicit = false;
-
-            if (spec.IsScalar()) {
-                path_str = spec.as<std::string>();
-            } else if (spec.IsMap()) {
-                if (!spec["path"]) continue;
-                path_str = spec["path"].as<std::string>();
-                if (auto s = spec["section"]) {
-                    explicit_section = s.as<std::string>();
-                    section_explicit = true;
-                }
-            } else {
-                continue;
-            }
-
-            fs::path inc_path = path_str;
-            if (inc_path.is_relative()) inc_path = base_dir / inc_path;
-
-            YAML::Node loaded = YAML::LoadFile(inc_path.string());
-
-            YAML::Node section_node;
-            if (loaded[explicit_section]) section_node = loaded[explicit_section];
-            else if (!section_explicit)   section_node = loaded;
-            else                          continue;
-
-            root[section] = root[section]
-                ? merge_yaml_overlay(section_node, root[section])
-                : YAML::Clone(section_node);
-        } catch (...) {
-            // Skip this include; the merge below will not re-resolve it,
-            // so the worker's own resolver gets a chance later if the
-            // includes block survives (we still remove it below, so the
-            // bad section may just stay empty -- acceptable for now).
-            continue;
-        }
-    }
-
-    try {
-        root.remove("includes");
-    } catch (...) {
-        // Not fatal -- worker's own resolver tolerates an absent or
-        // unusual includes block.
-    }
-    return true;
-}
 } // namespace
 
 ::grpc::Status PennyServiceImpl::ApplyConfig(::grpc::ServerContext*,
@@ -869,28 +771,6 @@ bool resolve_includes_in_place(YAML::Node& root, const std::string& config_path)
             base_cfg = YAML::LoadFile(worker_cfg.config_path);
         } catch (const std::exception& e) {
             TCPLOG_ERROR("Failed to load base config %s: %s", worker_cfg.config_path.c_str(), e.what());
-        }
-        // Expand `includes:` in place so the merged JSON carries explicit
-        // top-level sections (egress, traffic_policy, runtime_policy,
-        // platform, ...) and the worker reads them directly instead of
-        // re-resolving includes against the temp file's directory.
-        //
-        // Defensive: any yaml-cpp exception here would otherwise bubble
-        // out of StartTest and surface as a generic
-        // "Unexpected error in RPC handling" to the gRPC client. Log
-        // and fall back to the unresolved YAML; the worker will still
-        // run its own resolver at load time, so the only regression is
-        // that overrides may not interact correctly with includes
-        // (which is exactly what we wanted to fix, but graceful
-        // degradation beats a 500-style RPC failure).
-        try {
-            resolve_includes_in_place(base_cfg, worker_cfg.config_path);
-        } catch (const std::exception& e) {
-            TCPLOG_ERROR("resolve_includes_in_place failed for %s: %s",
-                         worker_cfg.config_path.c_str(), e.what());
-        } catch (...) {
-            TCPLOG_ERROR("resolve_includes_in_place threw an unknown exception for %s",
-                         worker_cfg.config_path.c_str());
         }
         nlohmann::json base_json = yaml_to_json(base_cfg);
         nlohmann::json merged = base_json;

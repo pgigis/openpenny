@@ -227,13 +227,6 @@ void apply_desired_config_to_legacy(Config& cfg, const DesiredConfig& desired) {
     cfg.queue = desired.platform.queue;
     cfg.queue_count = std::max(1u, desired.platform.queue_count);
     cfg.worker_cpus = desired.platform.worker_cpus;
-    // The legacy `cfg.xdp_runtime.enable` flag controls whether the real
-    // AF_XDP reader runs. The CLI sets it from `--source xdp`; pennyd has
-    // no equivalent flag, so derive it from the desired platform backend
-    // here. Without this, gRPC clients always hit
-    // "AF_XDP reader disabled in configuration".
-    cfg.xdp_runtime.enable =
-        desired.platform.backend == PlatformBackend::AfXdp;
     cfg.xdp_drv_mode = desired.platform.prefer_xdp_driver_mode;
     cfg.zerocopy = desired.platform.request_zerocopy;
     cfg.frame_size = desired.platform.frame_size;

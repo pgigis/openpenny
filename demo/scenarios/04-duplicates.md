@@ -44,6 +44,11 @@ DUPLICATE_RATE=0.5 \
 
 ## Run it (gRPC)
 
+The maintained gRPC demo client is the legitimate baseline:
+`demo/scenarios/grpc/demo_call.py`. The duplicate-heavy scenario is
+driven by `demo_traffic.sh` above; adapt the single gRPC client override
+if you need to run this variant through gRPC.
+
 ```bash
 # reeves2
 sudo ./build/pennyd \
@@ -52,7 +57,7 @@ sudo ./build/pennyd \
   --worker-bin ./build/penny_worker
 
 # reeves2 (separately)
-python3 demo/scenarios/grpc/04_duplicates.py
+python3 demo/scenarios/grpc/demo_call.py
 ```
 
 ## Expected

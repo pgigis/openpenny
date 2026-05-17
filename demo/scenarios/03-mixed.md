@@ -44,6 +44,11 @@ IPERF_SERVER=<reeves3> \
 
 ## Run it (gRPC)
 
+The maintained gRPC demo client is the legitimate baseline:
+`demo/scenarios/grpc/demo_call.py`. The mixed scenario is driven by
+`demo_traffic.sh` above; adapt the single gRPC client override if you need
+to run this variant through gRPC.
+
 ```bash
 # reeves2
 sudo ./build/pennyd \
@@ -51,8 +56,8 @@ sudo ./build/pennyd \
   --listen 0.0.0.0:50051 \
   --worker-bin ./build/penny_worker
 
-# reeves2 (separately) — runs the legit and spoofed tests back to back
-python3 demo/scenarios/grpc/03_mixed.py
+# reeves2 (separately)
+python3 demo/scenarios/grpc/demo_call.py
 ```
 
 ## Expected

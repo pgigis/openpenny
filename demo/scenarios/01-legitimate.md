@@ -51,7 +51,7 @@ sudo ./build/pennyd \
   --worker-bin ./build/penny_worker
 
 # reeves2 (separately)
-python3 demo/scenarios/grpc/01_legitimate.py
+python3 demo/scenarios/grpc/demo_call.py
 ```
 
 ## Expected

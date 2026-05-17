@@ -317,61 +317,13 @@ int main(int argc, char** argv) {
     const uint64_t closed_loop_flows_found = std::max<std::uint64_t>(
         agg_snapshot.flows_closed_loop,
         res.closed_loop_flow_summaries.size());
+    const uint64_t not_closed_loop_flows_found = std::max<std::uint64_t>(
+        agg_snapshot.flows_not_closed_loop,
+        res.not_closed_loop_flow_summaries.size());
     const uint64_t duplicate_exceeded_flows_found = std::max<std::uint64_t>(
         agg_snapshot.flows_duplicates_exceeded,
         res.duplicate_exceeded_flow_summaries.size());
-    // Emit JSON summary similar to CLI output.
-    nlohmann::json j;
-    j["test_id"] = args.test_id;
-    j["status"] = "ok";
-    j["packets"] = {
-        {"processed", res.packets_processed},
-        {"forwarded", res.packets_forwarded},
-        {"errors", res.forward_errors},
-        {"pure_ack", res.pure_ack_packets},
-        {"data", res.data_packets},
-        {"duplicate", res.duplicate_packets},
-        {"in_order", res.in_order_packets},
-        {"out_of_order", res.out_of_order_packets},
-        {"retransmitted", res.retransmitted_packets},
-        {"non_retransmitted", res.non_retransmitted_packets}
-    };
-    j["flows"] = {
-        {"tracked_syn", res.flows_tracked_syn},
-        {"tracked_data", res.flows_tracked_data}
-    };
-    j["penny_completed"] = res.penny_completed;
-    j["aggregates_completed"] = res.aggregates_penny_completed;
-    j["aggregates_enabled"] = summary.aggregates_enabled;
-    j["aggregates_status"] = aggregates_status_str;
-    j["aggregates_decision_complete"] = aggregates_done;
-    j["aggregates_decision_state"] = aggregates_decision_state;
-    j["aggregates_has_eval"] = aggregates_has_eval;
-    j["aggregates_snapshots"] = aggregates_snapshots;
-    j["aggregates_eval"] = {
-        {"data", agg_eval_data},
-        {"duplicate", agg_eval_dup},
-        {"retransmitted", agg_eval_rtx},
-        {"non_retransmitted", agg_eval_nonrtx}
-    };
-    j["aggregate_flows"] = {
-        {"monitored", agg_snapshot.flows_monitored},
-        {"finished", agg_snapshot.flows_finished},
-        {"closed_loop", agg_snapshot.flows_closed_loop},
-        {"not_closed_loop", agg_snapshot.flows_not_closed_loop},
-        {"rst", agg_snapshot.flows_rst},
-        {"duplicates_exceeded", agg_snapshot.flows_duplicates_exceeded}
-    };
-    j["closed_loop_flows_found"] = closed_loop_flows_found;
-    j["duplicate_exceeded_flows_found"] = duplicate_exceeded_flows_found;
-    j["closed_loop_flows"] = nlohmann::json::array();
-    for (const auto& line : res.closed_loop_flow_summaries) {
-        j["closed_loop_flows"].push_back(line);
-    }
-    j["duplicate_exceeded_flows"] = nlohmann::json::array();
-    for (const auto& line : res.duplicate_exceeded_flow_summaries) {
-        j["duplicate_exceeded_flows"].push_back(line);
-    }
+    // Compute end_state first so it can sit at the top of the test object.
     std::string end_state;
     if (aggregates_done) {
         end_state = "Aggregates completed (" + aggregates_status_str + ")";
@@ -390,8 +342,89 @@ int main(int argc, char** argv) {
         end_state += ", found " + std::to_string(duplicate_exceeded_flows_found) + " duplicate-exceeded flow";
         if (duplicate_exceeded_flows_found != 1) end_state += "s";
     }
-    j["end_state"] = end_state;
-    // Aggregate snapshot counters, if available.
+
+    // Emit JSON summary in the structured "test" shape:
+    //   test -> { aggregates, individual_flows, overall }
+    // individual_flows is replaced by the literal string "N/A" when
+    // the aggregate phase has reached a decision (closed_loop /
+    // not_closed_loop / duplicates_exceeded), because per-flow
+    // analysis is either skipped or not the deciding signal in that
+    // case.
+    nlohmann::json test_obj;
+    test_obj["id"] = args.test_id;
+    test_obj["status"] = "ok";
+    test_obj["end_state"] = end_state;
+    test_obj["penny_completed"] = res.penny_completed;
+
+    test_obj["aggregates"] = {
+        {"enabled", summary.aggregates_enabled},
+        {"completed", res.aggregates_penny_completed},
+        {"status", aggregates_status_str},
+        {"decision_complete", aggregates_done},
+        {"decision_state", aggregates_decision_state},
+        {"has_eval", aggregates_has_eval},
+        {"snapshots", aggregates_snapshots},
+        {"eval", {
+            {"data", agg_eval_data},
+            {"duplicate", agg_eval_dup},
+            {"retransmitted", agg_eval_rtx},
+            {"non_retransmitted", agg_eval_nonrtx}
+        }},
+        {"flows", {
+            {"monitored", agg_snapshot.flows_monitored},
+            {"finished", agg_snapshot.flows_finished},
+            {"closed_loop", agg_snapshot.flows_closed_loop},
+            {"not_closed_loop", agg_snapshot.flows_not_closed_loop},
+            {"rst", agg_snapshot.flows_rst},
+            {"duplicates_exceeded", agg_snapshot.flows_duplicates_exceeded}
+        }}
+    };
+
+    // individual_flows is ALWAYS emitted as a categorised object even
+    // when the aggregate phase reached a decision -- because the
+    // decision itself is usually grounded in per-flow categorisation,
+    // and the user wants to see which flows landed in which bucket.
+    // Each category has its own (count, flows[]) sub-object; empty
+    // arrays are kept rather than omitted so the schema is stable.
+    nlohmann::json cl_flows = nlohmann::json::array();
+    for (const auto& line : res.closed_loop_flow_summaries) cl_flows.push_back(line);
+    nlohmann::json ncl_flows = nlohmann::json::array();
+    for (const auto& line : res.not_closed_loop_flow_summaries) ncl_flows.push_back(line);
+    nlohmann::json de_flows = nlohmann::json::array();
+    for (const auto& line : res.duplicate_exceeded_flow_summaries) de_flows.push_back(line);
+    test_obj["individual_flows"] = {
+        {"tracked_syn", res.flows_tracked_syn},
+        {"tracked_data", res.flows_tracked_data},
+        {"closed_loop", {
+            {"count", closed_loop_flows_found},
+            {"flows", cl_flows}
+        }},
+        {"not_closed_loop", {
+            {"count", not_closed_loop_flows_found},
+            {"flows", ncl_flows}
+        }},
+        {"duplicates_exceeded", {
+            {"count", duplicate_exceeded_flows_found},
+            {"flows", de_flows}
+        }}
+    };
+
+    test_obj["overall"] = {
+        {"packets", {
+            {"processed", res.packets_processed},
+            {"forwarded", res.packets_forwarded},
+            {"errors", res.forward_errors},
+            {"pure_ack", res.pure_ack_packets},
+            {"data", res.data_packets},
+            {"duplicate", res.duplicate_packets},
+            {"in_order", res.in_order_packets},
+            {"out_of_order", res.out_of_order_packets},
+            {"retransmitted", res.retransmitted_packets},
+            {"non_retransmitted", res.non_retransmitted_packets}
+        }}
+    };
+
+    // Passive-mode detail block (only when passive flows finished).
     if (res.passive_flows_finished > 0 || !res.passive_gap_summaries.empty()) {
         nlohmann::json passive;
         passive["finished"] = res.passive_flows_finished;
@@ -404,8 +437,11 @@ int main(int argc, char** argv) {
             details.push_back(line);
         }
         passive["details"] = details;
-        j["passive"] = passive;
+        test_obj["passive"] = passive;
     }
+
+    nlohmann::json j;
+    j["test"] = test_obj;
     std::cout << "json=" << j.dump() << "\n";
     // No explicit fd cleanup needed: the PacketSink owns its fd internally
     // and closes it on destruction when drive_pipeline_threaded returns.

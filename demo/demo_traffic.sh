@@ -66,6 +66,22 @@
 
 set -euo pipefail
 
+# Enable job control so every backgrounded pipeline gets its OWN
+# process group, while still sharing this script's controlling tty.
+# Two reasons we need this:
+#   1. Clean teardown -- cleanup() does `kill -- -PID` (negative PID =
+#      signal entire pgroup). Without job control, `( ... ) &` would
+#      inherit the script's pgroup and the recorded PID wouldn't be a
+#      valid PGID, so the kill would no-op and iperf3/sudo/sed/tee
+#      would survive Ctrl+C.
+#   2. Sudo tty_tickets -- sudo's credential cache is keyed by tty.
+#      `setsid` would give each bg pipeline a fresh session with no
+#      tty, so the cache from our `sudo -v` pre-auth wouldn't apply
+#      and the spawned sudo would prompt for a password it can't read.
+#      Job-control pgroups keep the same controlling tty, so the
+#      cached credentials are honoured.
+set -m
+
 # -----------------------------------------------------------------------------
 # CONFIG -- override any of these from the environment.
 # -----------------------------------------------------------------------------
@@ -73,33 +89,53 @@ set -euo pipefail
 # Where the legitimate TCP client connects. The receiver host runs server.py
 # (or whatever listener you have) on this host:port.
 LEGIT_SRC_HOST="${LEGIT_SRC_HOST:-$(hostname)}"   # informational; appears in log lines
-LEGIT_DST_HOST="${LEGIT_DST_HOST:-198.51.100.20}"
-LEGIT_DST_PORT="${LEGIT_DST_PORT:-9000}"
-LEGIT_INTERVAL_SECS="${LEGIT_INTERVAL_SECS:-1.0}" # seconds between client.py sends
+LEGIT_DST_HOST="${LEGIT_DST_HOST:-192.168.43.3}"
+LEGIT_DST_PORT="${LEGIT_DST_PORT:-5201}"
+LEGIT_PARALLEL_STREAMS="${LEGIT_PARALLEL_STREAMS:-16}" # iperf3 -P
 
-# Spoofed-flow knobs. These map onto spoofed_client.py via run.sh spoof.
-SPOOFED_IFACE="${SPOOFED_IFACE:-ens5f0np0}"
+# Spoofed-flow knobs. These map onto spoofed_client.py's CLI directly.
+SPOOFED_IFACE="${SPOOFED_IFACE:-ens5f1np1}"
 SPOOFED_SRC_IP="${SPOOFED_SRC_IP:-198.51.100.10}"
-SPOOFED_DST_IP="${SPOOFED_DST_IP:-198.51.100.20}"
-SPOOFED_DST_PORT="${SPOOFED_DST_PORT:-9000}"
-SPOOFED_FLOWS="${SPOOFED_FLOWS:-1}"
+SPOOFED_DST_IP="${SPOOFED_DST_IP:-192.168.43.3}"
+SPOOFED_DST_PORT="${SPOOFED_DST_PORT:-5201}"
+SPOOFED_FLOWS="${SPOOFED_FLOWS:-30}"
+SPOOFED_PAYLOAD_SIZE="${SPOOFED_PAYLOAD_SIZE:-64}"
+# Per-flow packet count is randomised uniformly in [MIN, MAX]. Each
+# flow runs as its own spoofed_client.py process so the count can vary.
+SPOOFED_COUNT_MIN="${SPOOFED_COUNT_MIN:-300}"
+SPOOFED_COUNT_MAX="${SPOOFED_COUNT_MAX:-600}"
 
 # Wall-clock cap for any one scenario. The orchestrator runs each
 # generator under `timeout`, so this is the only knob you need to bound
-# a demo segment cleanly.
-DURATION_SECONDS="${DURATION_SECONDS:-30}"
+# a demo segment cleanly. Also passed as iperf3's -t for legitimate mode.
+DURATION_SECONDS="${DURATION_SECONDS:-60}"
+
+# Extra seconds the `timeout` wrapper gets beyond DURATION_SECONDS, so
+# iperf3 finishes its test naturally and gets time to exchange FIN +
+# results before being terminated. Without this, timeout kills iperf3
+# mid-close and some streams die with RST instead of a clean FIN --
+# openpenny then doesn't count them as closed-loop flows.
+TIMEOUT_GRACE_SECS="${TIMEOUT_GRACE_SECS:-10}"
 
 # Spoofed flow pacing. PACKET_RATE is in packets per second; we convert
 # it to spoofed_client.py's --interval below.
 PACKET_RATE="${PACKET_RATE:-50}"
 
 # Per-packet duplicate probability for `duplicates` mode. Range [0.0, 1.0].
-# spoofed_client.py exposes this as --duplication-prob.
-DUPLICATE_RATE="${DUPLICATE_RATE:-0.5}"
+# spoofed_client.py exposes this as --duplication-prob. 20% is enough
+# to comfortably trip openpenny's duplicate-fraction threshold without
+# swamping the receiver.
+DUPLICATE_RATE="${DUPLICATE_RATE:-0.2}"
 
-# How long mixed mode waits between starting legit and starting spoofed,
-# so the legit flow is established before spoofed background appears.
-MIXED_STAGGER_SECS="${MIXED_STAGGER_SECS:-3}"
+# Mixed mode now fires spoofed FIRST, lets the first
+# MIXED_SPOOF_LEAD_PACKETS packets land, then starts a small number of
+# slow legit iperf3 streams. MIXED_LEGIT_BANDWIDTH is per-stream; "auto"
+# computes a value that aggregates to roughly the spoofed throughput
+# (PACKET_RATE * SPOOFED_FLOWS * (SPOOFED_PAYLOAD_SIZE + ~54B hdr) * 8)
+# so the legit flows don't drown the spoofed traffic out on the wire.
+MIXED_SPOOF_LEAD_PACKETS="${MIXED_SPOOF_LEAD_PACKETS:-75}" # in [50, 100]
+MIXED_LEGIT_PARALLEL="${MIXED_LEGIT_PARALLEL:-5}"
+MIXED_LEGIT_BANDWIDTH="${MIXED_LEGIT_BANDWIDTH:-auto}"     # iperf3 -b, "auto" or "200K"/"1M"/etc.
 
 # Walkthrough pacing.
 #   ""  -> press-Enter prompt between scenarios.
@@ -114,13 +150,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE}/.." && pwd)"
 TG_DIR="${REPO_ROOT}/tools/traffic_generator"
 RUN_SH="${TG_DIR}/run.sh"
+TG_VENV_PY="${TG_DIR}/.venv/bin/python"
+SPOOFED_SCRIPT="${TG_DIR}/spoofed_client.py"
 
-PID_FILE="${PID_FILE:-/tmp/openpenny-demo-traffic.pids}"
-LOG_FILE="${LOG_FILE:-/tmp/openpenny-demo-traffic.log}"
+# State files are per-EUID so a sudo run and a non-sudo run don't
+# collide on each other's tee target. If the previous file was created
+# by the other user, an "append" tee would die with EACCES, the pipe
+# would break, and SIGPIPE would kill the actual traffic generator
+# before anything went on the wire.
+PID_FILE="${PID_FILE:-/tmp/openpenny-demo-traffic.${EUID}.pids}"
+LOG_FILE="${LOG_FILE:-/tmp/openpenny-demo-traffic.${EUID}.log}"
 # Markers file: one line per scenario boundary. A tailer on the
 # openpenny pane can follow this to line up verdicts with scenario
 # starts/ends when scrubbing back through a recording.
-MARKERS_FILE="${MARKERS_FILE:-/tmp/openpenny-demo-traffic.markers}"
+MARKERS_FILE="${MARKERS_FILE:-/tmp/openpenny-demo-traffic.${EUID}.markers}"
 
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -239,9 +282,47 @@ require() {
     fi
 }
 
+# Pre-authenticate sudo before any spoofed scenario kicks off. Raw-
+# socket injection needs root, and the spoofed fan-out launches
+# ${SPOOFED_FLOWS} parallel processes -- without a primed sudo cache
+# each one would race to prompt for a password. No-op when already
+# root or under DRY_RUN.
+ensure_sudo() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        say "${C_SETUP}" "sudo" "already root; no sudo needed"
+        return 0
+    fi
+    require sudo "sudo"
+    say "${C_SETUP}" "sudo" "pre-authenticating sudo (you may be prompted)"
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        return 0
+    fi
+    if ! sudo -v; then
+        say "${C_SETUP}" "sudo" "sudo authentication failed; spoofed scenarios need root for raw sockets."
+        exit 1
+    fi
+    # Keep the sudo timestamp warm in the background for the full run,
+    # so a long duration doesn't lose the cache halfway through.
+    ( while kill -0 "$$" 2>/dev/null; do sudo -nv 2>/dev/null || exit; sleep 30; done ) &
+    record_pid "$!"
+}
+
 ensure_environment() {
     require timeout "GNU coreutils 'timeout'"
     require python3 "Python 3"
+    require iperf3 "iperf3"
+    # Pre-create state files so tee in the launch_* pipelines never
+    # racing-creates them mid-run. If a stale file is owned by a
+    # different EUID and we can't touch it, fail loud rather than
+    # letting SIGPIPE silently kill children later.
+    local f
+    for f in "${LOG_FILE}" "${MARKERS_FILE}" "${PID_FILE}"; do
+        mkdir -p "$(dirname "${f}")"
+        if ! ( : >> "${f}" ) 2>/dev/null; then
+            say "${C_SETUP}" "setup" "cannot write to ${f}; remove it or set LOG_FILE/MARKERS_FILE/PID_FILE in env."
+            exit 1
+        fi
+    done
     if [[ ! -x "${RUN_SH}" ]]; then
         say "${C_SETUP}" "setup" "tools/traffic_generator/run.sh not found or not executable at ${RUN_SH}"
         exit 1
@@ -263,14 +344,65 @@ spoof_interval_from_rate() {
     awk -v r="${rate}" 'BEGIN { if (r > 0) printf "%.6f", 1.0 / r; else printf "0.0"; }'
 }
 
-# Roughly how many packets-per-flow give us DURATION_SECONDS at the
-# configured rate. spoofed_client.py exits when each flow has sent its
-# count; we also wrap it in `timeout` as a hard cap so this is a
-# soft guideline rather than a strict deadline.
-spoof_count_for_duration() {
-    local duration="${1}" rate="${2}"
-    awk -v d="${duration}" -v r="${rate}" \
-        'BEGIN { c = d * r; if (c < 1) c = 1; printf "%d", c; }'
+# Per-stream bps that aggregates to roughly the spoofed wire rate
+# (PACKET_RATE * SPOOFED_FLOWS * (payload + ~54B TCP/IP hdr) * 8) when
+# divided across N legit streams. Bottoms out at 1 so iperf3 doesn't
+# choke on -b 0.
+compute_auto_bandwidth() {
+    local streams="${1}"
+    local spoof_bps per_stream_bps
+    spoof_bps=$(( PACKET_RATE * SPOOFED_FLOWS * (SPOOFED_PAYLOAD_SIZE + 54) * 8 ))
+    per_stream_bps=$(( spoof_bps / streams ))
+    (( per_stream_bps < 1 )) && per_stream_bps=1
+    printf "%d" "${per_stream_bps}"
+}
+
+# Resolve an iperf3 bandwidth spec: pass through "100K"/"1M"/etc. as-is,
+# expand "auto" via compute_auto_bandwidth. Empty input -> empty output
+# (caller will omit -b).
+resolve_bandwidth() {
+    local spec="${1}" streams="${2}"
+    if [[ -z "${spec}" ]]; then
+        printf ""
+    elif [[ "${spec}" == "auto" ]]; then
+        compute_auto_bandwidth "${streams}"
+    else
+        printf "%s" "${spec}"
+    fi
+}
+
+# Launch an iperf3 client. Always runs unprivileged: if we were entered
+# via sudo (EUID 0 with SUDO_USER set) drop back to the original user
+# so iperf3 doesn't pointlessly run as root. The spoofed generator is
+# the only thing that legitimately needs root in this script.
+#
+# launch_legit_iperf3 <log-tag> <bg|fg> <parallel-streams> <bandwidth-spec>
+#   bandwidth-spec: "auto", a literal iperf3 -b value, or "" for no cap.
+launch_legit_iperf3() {
+    local tag="$1" sched="$2" parallel="$3" bw_spec="${4:-}"
+    local launcher
+    if [[ "${sched}" == "bg" ]]; then launcher=launch_bg; else launcher=launch_fg; fi
+
+    local bandwidth
+    bandwidth="$(resolve_bandwidth "${bw_spec}" "${parallel}")"
+
+    local cmd=(iperf3 -c "${LEGIT_DST_HOST}" -p "${LEGIT_DST_PORT}"
+               -P "${parallel}" -Z -t "${DURATION_SECONDS}")
+    if [[ -n "${bandwidth}" ]]; then
+        cmd+=(-b "${bandwidth}")
+    fi
+    if [[ "${EUID}" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+        cmd=(sudo -u "${SUDO_USER}" "${cmd[@]}")
+    fi
+
+    # Give the timeout wrapper more headroom than iperf3's -t so iperf3
+    # finishes the test naturally and exchanges FIN + results before
+    # being killed. Without the grace, `timeout 60s iperf3 -t 60` would
+    # SIGTERM iperf3 mid-close and some streams would die with RST --
+    # openpenny then wouldn't count them as closed-loop flows ("iperf3:
+    # interrupt - the client has terminated").
+    local hard_cap=$(( DURATION_SECONDS + TIMEOUT_GRACE_SECS ))
+    "${launcher}" "${tag}" "${hard_cap}" "${cmd[@]}"
 }
 
 record_pid() {
@@ -281,6 +413,12 @@ record_pid() {
 
 # Run a command in the background under `timeout`, log its stdout/stderr,
 # and remember its PID for later cleanup. Honours DRY_RUN.
+#
+# Because `set -m` is on, the `( ... ) &` subshell becomes the leader
+# of its own process group whose PGID equals the subshell PID we
+# record. cleanup() can then signal `-PID` to take down the whole
+# group (timeout, the real command, sed, tee, and any sudo wrapper)
+# in one shot, instead of just the subshell.
 launch_bg() {
     # launch_bg <log-tag> <duration> <cmd...>
     local tag="$1" duration="$2"; shift 2
@@ -288,7 +426,6 @@ launch_bg() {
         printf "[dry-run %s]  timeout %ss %s\n" "${tag}" "${duration}" "$*"
         return 0
     fi
-    # Use stdbuf so the demo screen stays responsive instead of buffering.
     ( stdbuf -oL -eL timeout "${duration}s" "$@" 2>&1 \
         | sed -u "s/^/[${tag}] /" \
         | tee -a "${LOG_FILE}" ) &
@@ -314,19 +451,26 @@ cleanup() {
         return 0
     fi
     say "${C_CLEAN}" "cleanup" "stopping background generators"
+    local pid
+    # Each recorded PID is the leader of a process group we created
+    # via setsid in launch_bg. `kill -- -PID` (negative PID) signals
+    # the entire group at once -- so timeout, sed, tee, sudo, and the
+    # actual python/iperf3 all get hit, not just the bash subshell at
+    # the top. Fall back to a bare-PID signal for entries recorded
+    # without setsid (e.g. the sudo keep-warm loop in ensure_sudo).
     while read -r pid; do
         [[ -z "${pid}" ]] && continue
-        if kill -0 "${pid}" 2>/dev/null; then
-            kill "${pid}" 2>/dev/null || true
-        fi
+        kill -TERM -- "-${pid}" 2>/dev/null \
+            || kill -TERM "${pid}" 2>/dev/null \
+            || true
     done < "${PID_FILE}"
     # Give them a moment, then force.
     sleep 1
     while read -r pid; do
         [[ -z "${pid}" ]] && continue
-        if kill -0 "${pid}" 2>/dev/null; then
-            kill -9 "${pid}" 2>/dev/null || true
-        fi
+        kill -KILL -- "-${pid}" 2>/dev/null \
+            || kill -KILL "${pid}" 2>/dev/null \
+            || true
     done < "${PID_FILE}"
     rm -f "${PID_FILE}"
 }
@@ -345,96 +489,172 @@ trap on_signal INT TERM
 # -----------------------------------------------------------------------------
 
 mode_legitimate() {
-    # Real SYN, real ACKs from the receiver, payload, clean FIN.
-    # openpenny should reach a CLOSED_LOOP verdict on this flow.
+    # Real SYN, real ACKs from the receiver, payload, clean FIN, across
+    # ${LEGIT_PARALLEL_STREAMS} parallel iperf3 streams. openpenny should
+    # reach a CLOSED_LOOP verdict on these flows.
     banner "${C_LEGIT}" "legitimate" \
         "legitimate (closed-loop control)" \
-        "real TCP client ${LEGIT_SRC_HOST} -> ${LEGIT_DST_HOST}:${LEGIT_DST_PORT}, ${DURATION_SECONDS}s" \
-        "CLOSED_LOOP verdict on the flow"
-    launch_fg "legitimate" "${DURATION_SECONDS}" \
-        "${RUN_SH}" client "${LEGIT_DST_HOST}" "${LEGIT_DST_PORT}" \
-            --interval "${LEGIT_INTERVAL_SECS}"
+        "iperf3 ${LEGIT_SRC_HOST} -> ${LEGIT_DST_HOST}:${LEGIT_DST_PORT}, -P ${LEGIT_PARALLEL_STREAMS} -Z -t ${DURATION_SECONDS}" \
+        "CLOSED_LOOP verdict on the flow(s)"
+    launch_legit_iperf3 "legitimate" fg "${LEGIT_PARALLEL_STREAMS}" ""
     recap "${C_LEGIT}" "legitimate" \
-        "real handshake to ${LEGIT_DST_HOST}:${LEGIT_DST_PORT} for ${DURATION_SECONDS}s; openpenny pane should show CLOSED_LOOP."
+        "ran iperf3 -P ${LEGIT_PARALLEL_STREAMS} -Z -t ${DURATION_SECONDS} to ${LEGIT_DST_HOST}:${LEGIT_DST_PORT}; openpenny pane should show CLOSED_LOOP."
 }
 
-# Internal: spoofed launcher shared by spoofed/mixed/duplicates so all
-# three end up calling tools/traffic_generator/run.sh spoof identically,
-# parameterised only by the duplication probability and the foreground
-# vs background choice.
+# Internal: spoofed launcher shared by spoofed/mixed/duplicates. Fires
+# ${SPOOFED_FLOWS} parallel spoofed_client.py instances (one per flow),
+# each with --flows 1 and a per-flow random --count in
+# [SPOOFED_COUNT_MIN, SPOOFED_COUNT_MAX]. This is the only way to get
+# per-flow random packet counts: spoofed_client.py's --count is shared
+# across all flows in a single invocation.
+#
+# Runs the venv python directly, under `sudo -E` only when we're not
+# already root. `--preflight` is only attached to flow #1 so we get one
+# round of diagnostics without 30 copies of it spamming the console.
 _launch_spoof() {
     # _launch_spoof <log-tag> <bg|fg> <dup-prob>
     local tag="$1" sched="$2" dup="$3"
-    local interval count
+    local interval
     interval="$(spoof_interval_from_rate "${PACKET_RATE}")"
-    count="$(spoof_count_for_duration "${DURATION_SECONDS}" "${PACKET_RATE}")"
 
-    local launcher
-    if [[ "${sched}" == "bg" ]]; then launcher=launch_bg; else launcher=launch_fg; fi
+    # Pick the venv python; fall back to plain python3 if the venv
+    # hasn't been created yet (ensure_environment nudges run.sh install
+    # in that case, but stay defensive).
+    local py="${TG_VENV_PY}"
+    if [[ ! -x "${py}" ]]; then
+        py="$(command -v python3 || true)"
+    fi
 
-    "${launcher}" "${tag}" "${DURATION_SECONDS}" \
-        "${RUN_SH}" spoof "${SPOOFED_IFACE}" \
-            "${SPOOFED_DST_IP}" "${SPOOFED_DST_PORT}" "${SPOOFED_SRC_IP}" \
-            --flows "${SPOOFED_FLOWS}" \
-            --count "${count}" \
-            --interval "${interval}" \
-            --duplication-prob "${dup}"
+    # Raw-socket injection needs root; preserve env so the venv's
+    # site-packages (scapy) stay importable.
+    local sudo_prefix=()
+    if [[ "${EUID}" -ne 0 ]]; then
+        sudo_prefix=(sudo -E)
+    fi
+
+    local span=$(( SPOOFED_COUNT_MAX - SPOOFED_COUNT_MIN + 1 ))
+    if (( span <= 0 )); then span=1; fi
+
+    local i count preflight_arg
+    for (( i = 1; i <= SPOOFED_FLOWS; i++ )); do
+        count=$(( SPOOFED_COUNT_MIN + RANDOM % span ))
+        if (( i == 1 )); then
+            preflight_arg="--preflight"
+        else
+            preflight_arg=""
+        fi
+        # Always launch into the background so all flows run concurrently;
+        # the caller's `sched=fg` semantics are honoured by waiting at
+        # the end of this function.
+        launch_bg "${tag}#${i}" "${DURATION_SECONDS}" \
+            "${sudo_prefix[@]}" "${py}" "${SPOOFED_SCRIPT}" \
+                --iface "${SPOOFED_IFACE}" \
+                --routed \
+                --dest-ip "${SPOOFED_DST_IP}" \
+                --dest-port "${SPOOFED_DST_PORT}" \
+                --src-ip "${SPOOFED_SRC_IP}" \
+                --flows 1 \
+                --count "${count}" \
+                --payload-size "${SPOOFED_PAYLOAD_SIZE}" \
+                --interval "${interval}" \
+                --duplication-prob "${dup}" \
+                ${preflight_arg}
+    done
+
+    # For fg semantics (caller wants this call to block), wait for the
+    # whole fan-out to finish. For bg (mixed mode), return now and let
+    # the caller's own `wait` cover everything.
+    if [[ "${sched}" == "fg" && "${DRY_RUN}" != "1" ]]; then
+        wait
+    fi
 }
 
 mode_spoofed() {
     # Forged source IP means the receiver's ACKs (if any) go nowhere,
     # the conversation never closes, and openpenny's flow engine sees
-    # an open-loop flow -- the closed-loop check fails.
-    local count
-    count="$(spoof_count_for_duration "${DURATION_SECONDS}" "${PACKET_RATE}")"
+    # open-loop flows -- the closed-loop check fails on each one.
+    # Spoofed-only by design: no legit iperf3 side-channel here, so the
+    # aggregate forged_src -> dest is entirely open-loop. mode_mixed is
+    # the variant that intentionally adds legit flows on the wire.
+    ensure_sudo
     banner "${C_SPOOF}" "spoofed" \
-        "spoofed (forged source IP)" \
-        "~${count} pkts @ ${PACKET_RATE}pps src=${SPOOFED_SRC_IP} dst=${SPOOFED_DST_IP}:${SPOOFED_DST_PORT}" \
-        "closed-loop check FAILS (no return path)"
+        "spoofed (forged source IP, spoofed-only)" \
+        "${SPOOFED_FLOWS} spoofed @ ${PACKET_RATE}pps src=${SPOOFED_SRC_IP} -> ${SPOOFED_DST_IP}:${SPOOFED_DST_PORT}" \
+        "closed-loop FAILS on the ${SPOOFED_FLOWS} spoofed flows (no legit traffic on the wire)"
+
+    say "${C_SPOOF}" "spoofed" "starting spoofed fan-out (${SPOOFED_FLOWS} flows, sudo)"
     _launch_spoof "spoofed" fg 0.0
     recap "${C_SPOOF}" "spoofed" \
-        "sent ~${count} forged-source pkts to ${SPOOFED_DST_IP}:${SPOOFED_DST_PORT}; openpenny pane should show closed-loop failed."
+        "${SPOOFED_FLOWS} spoofed flows only; openpenny pane should show open-loop on the forged_src -> dest aggregate."
 }
 
 mode_mixed() {
-    # Both flows on the same wire, same destination. openpenny should
-    # still reach the CLOSED_LOOP verdict for the legit flow while
-    # flagging the spoofed background.
-    banner "${C_MIX}" "mixed" \
-        "mixed (legit + spoofed on the same wire)" \
-        "legit ${LEGIT_DST_HOST}:${LEGIT_DST_PORT} + spoofed ${SPOOFED_SRC_IP} -> ${SPOOFED_DST_IP} @ ${PACKET_RATE}pps" \
-        "CLOSED_LOOP for legit flow; spoofed flow fails closed-loop check"
-    say "${C_MIX}" "mixed" "starting legitimate flow first"
-    launch_bg "legitimate" "${DURATION_SECONDS}" \
-        "${RUN_SH}" client "${LEGIT_DST_HOST}" "${LEGIT_DST_PORT}" \
-            --interval "${LEGIT_INTERVAL_SECS}"
-    say "${C_MIX}" "mixed" "waiting ${MIXED_STAGGER_SECS}s before adding spoofed background"
-    if [[ "${DRY_RUN}" != "1" ]]; then
-        sleep "${MIXED_STAGGER_SECS}"
+    ensure_sudo
+    # Spoofed fires first. After the first MIXED_SPOOF_LEAD_PACKETS
+    # packets have had time to land on the wire (lead = N / PACKET_RATE
+    # seconds), we add ${MIXED_LEGIT_PARALLEL} slow iperf3 streams
+    # whose aggregate bandwidth roughly matches the spoofed throughput
+    # -- so the legit flows can't drown the spoofed traffic out for
+    # openpenny's flow engine.
+    local lead_secs bandwidth_arg spoof_bps per_stream_bps
+    lead_secs="$(awk -v p="${MIXED_SPOOF_LEAD_PACKETS}" -v r="${PACKET_RATE}" \
+        'BEGIN { if (r > 0) printf "%.2f", p / r; else printf "0.0"; }')"
+
+    if [[ "${MIXED_LEGIT_BANDWIDTH}" == "auto" ]]; then
+        # Wire-rate estimate per spoofed packet: payload + ~54B TCP/IP
+        # headers. Aggregate across all spoofed flows, then split evenly
+        # across the legit streams. Bottom out at 1 bps so iperf3
+        # doesn't choke on -b 0.
+        spoof_bps=$(( PACKET_RATE * SPOOFED_FLOWS * (SPOOFED_PAYLOAD_SIZE + 54) * 8 ))
+        per_stream_bps=$(( spoof_bps / MIXED_LEGIT_PARALLEL ))
+        (( per_stream_bps < 1 )) && per_stream_bps=1
+        bandwidth_arg="${per_stream_bps}"
+    else
+        bandwidth_arg="${MIXED_LEGIT_BANDWIDTH}"
     fi
-    say "${C_MIX}" "mixed" "starting spoofed background"
+
+    banner "${C_MIX}" "mixed" \
+        "mixed (spoofed first, then matched-rate legit)" \
+        "spoofed ${SPOOFED_FLOWS} flows @ ${PACKET_RATE}pps src=${SPOOFED_SRC_IP}; after ~${lead_secs}s, iperf3 -P ${MIXED_LEGIT_PARALLEL} -b ${bandwidth_arg} -> ${LEGIT_DST_HOST}:${LEGIT_DST_PORT}" \
+        "CLOSED_LOOP for the legit half; closed-loop check FAILS for spoofed"
+
+    say "${C_MIX}" "mixed" "starting spoofed fan-out first (${SPOOFED_FLOWS} flows)"
     _launch_spoof "spoofed" bg 0.0
-    say "${C_MIX}" "mixed" "both generators running for ${DURATION_SECONDS}s"
+
+    say "${C_MIX}" "mixed" \
+        "waiting ~${lead_secs}s (${MIXED_SPOOF_LEAD_PACKETS} pkts @ ${PACKET_RATE}pps) before legit kicks in"
+    if [[ "${DRY_RUN}" != "1" ]]; then
+        sleep "${lead_secs}"
+    fi
+
+    say "${C_MIX}" "mixed" \
+        "starting ${MIXED_LEGIT_PARALLEL} slow legit flows (-b ${bandwidth_arg} per stream, unprivileged)"
+    launch_legit_iperf3 "legitimate" bg "${MIXED_LEGIT_PARALLEL}" "${bandwidth_arg}"
+
+    say "${C_MIX}" "mixed" "both generators running"
     if [[ "${DRY_RUN}" != "1" ]]; then
         wait
     fi
     recap "${C_MIX}" "mixed" \
-        "ran legit + spoofed concurrently for ${DURATION_SECONDS}s; openpenny pane should show CLOSED_LOOP only for the legit flow."
+        "spoofed first then ${MIXED_LEGIT_PARALLEL} matched-rate legit flows; openpenny pane should show CLOSED_LOOP only for the legit half."
 }
 
 mode_duplicates() {
     # Stresses aggregate analysis: the flow engine's
     # duplicate-fraction threshold is the relevant knob to watch on
-    # openpenny's side.
-    local count
-    count="$(spoof_count_for_duration "${DURATION_SECONDS}" "${PACKET_RATE}")"
+    # openpenny's side. Same fan-out as spoofed mode, but every spoofed
+    # flow carries the duplicate-probability dial. NO legit iperf3
+    # flows here -- this scenario is intentionally spoofed-only so the
+    # duplicate-fraction reading isn't diluted by clean closed-loop
+    # traffic on the aggregate.
+    ensure_sudo
     banner "${C_DUP}" "duplicates" \
-        "duplicates (duplicate-heavy spoofed flow)" \
-        "~${count} pkts @ ${PACKET_RATE}pps, dup-prob=${DUPLICATE_RATE} on ${SPOOFED_IFACE}" \
-        "duplicate-fraction threshold trips on the aggregate"
+        "duplicates (duplicate-heavy spoofed only)" \
+        "${SPOOFED_FLOWS} spoofed @ ${PACKET_RATE}pps dup-prob=${DUPLICATE_RATE} on ${SPOOFED_IFACE}" \
+        "duplicate-fraction threshold trips on the spoofed aggregate"
     _launch_spoof "duplicates" fg "${DUPLICATE_RATE}"
     recap "${C_DUP}" "duplicates" \
-        "sent duplicate-heavy spoofed flow (dup-prob=${DUPLICATE_RATE}); openpenny pane should show duplicate-fraction threshold tripped."
+        "${SPOOFED_FLOWS} duplicate-heavy spoofed flows (dup-prob=${DUPLICATE_RATE}); openpenny pane should show duplicate-fraction threshold tripped."
 }
 
 mode_walkthrough() {

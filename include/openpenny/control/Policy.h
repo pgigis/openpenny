@@ -44,7 +44,7 @@ struct TestThresholds {
     double max_duplicate_ratio{0.15};
     double max_reordering_ratio{0.8};
     double retransmission_observation_miss_rate{0.05};
-    double retransmission_timeout_multiplier{3.0};
+    double retransmission_timeout_in_seconds{3.0};
     double admission_grace_period_seconds{3.0};
     double monitored_flow_idle_expiry_seconds{0.0};
     double drop_state_seconds{0.0};

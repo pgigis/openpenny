@@ -42,7 +42,7 @@ message TestThresholds {
   optional double max_duplicate_ratio = 2;
   optional double max_reordering_ratio = 3;
   optional double retransmission_observation_miss_rate = 4;
-  optional double retransmission_timeout_multiplier = 5;
+  optional double retransmission_timeout_in_seconds = 5;
   optional double admission_grace_period_seconds = 6;
   optional double monitored_flow_idle_expiry_seconds = 7;
   optional double drop_state_seconds = 8;
@@ -117,23 +117,29 @@ message RuntimeStatusResponse {
 }
 
 message StartTestRequest {
-  // Legacy flow-selection shortcut. New clients should use TrafficPolicy.
+  // DEPRECATED: legacy flow-selection shortcut. New clients should send a
+  // TrafficPolicy via SetTrafficPolicy / ApplyConfig, or include a
+  // `traffic_policy:` block in `config_override_json`. The daemon will
+  // synthesise a single-rule policy from prefix/mask_bits when no
+  // traffic_policy override is given.
   string prefix = 1;      // e.g. "10.0.0.0"
   uint32 mask_bits = 2;   // e.g. 24
 
   // Optional label for caller correlation.
   string test_id = 3;
 
-  // Optional forwarding controls.
-  optional bool forward_to_tun = 4; // Default: true if unset.
-  optional string tun_name = 5;     // Default: "xdp-tu" if unset.
-  optional string mode = 6;         // "active" (default) or "passive".
-  optional string stats_socket_path = 7; // Unix datagram socket path for live stats.
-  optional bool tun_multi_queue = 8;    // Attempt multi-queue TUN (default true).
-  optional uint32 tun_mtu = 9;          // MTU to set on TUN or forward interface.
-  optional bool forward_raw_socket = 10; // Forward via raw socket bound to an interface.
-  optional string forward_device = 11;   // Interface name for forwarding (TUN or raw).
-  optional string config_override_json = 12; // Inline JSON to override monitoring config for this request.
+  // Optional forwarding controls. Prefer the typed `egress:` block in
+  // `config_override_json` for new clients; the shorthand fields below
+  // are kept for backwards compatibility.
+  optional bool forward_to_tun = 4;       // shorthand for egress.kind in {tun, none}
+  optional string tun_name = 5;           // shorthand for egress.device
+  optional string mode = 6;               // "active" (default) or "passive"
+  optional string stats_socket_path = 7;  // Unix datagram socket path for live stats
+  optional bool tun_multi_queue = 8;      // shorthand for egress.tun.multi_queue
+  optional uint32 tun_mtu = 9;            // shorthand for egress.tun.mtu
+  optional bool forward_raw_socket = 10;  // shorthand for egress.kind = raw_socket
+  optional string forward_device = 11;    // shorthand for egress.device
+  optional string config_override_json = 12; // Inline JSON overriding traffic_policy / runtime_policy / platform / egress.
 }
 
 message StartTestResponse {
@@ -156,17 +162,25 @@ message StartTestResponse {
   uint64 flows_tracked_syn = 14;
   uint64 flows_tracked_data = 15;
   bool penny_completed = 16;
+  // DEPRECATED: alias of `aggregates_decision_complete`. Will be removed
+  // in a future revision.
   bool aggregates_penny_completed = 17;
   bool aggregates_enabled = 18;
 
-  // Active-mode aggregate evaluation details (CLI-like).
-  string aggregates_status = 20; // pending | closed_loop | not_closed_loop | duplicates_exceeded | n/a
-  bool aggregates_decision_complete = 21; // True if aggregate evaluation reached a terminal decision.
-  bool aggregates_has_eval = 22; // True if eval counters represent a completed aggregate decision.
-  uint64 aggregates_eval_data_packets = 23;
-  uint64 aggregates_eval_duplicate_packets = 24;
-  uint64 aggregates_eval_retransmitted_packets = 25;
-  uint64 aggregates_eval_non_retransmitted_packets = 26;
+  // Active-mode aggregate evaluation details. The contract is:
+  //   aggregates_status              — string verdict (pending | closed_loop |
+  //                                    not_closed_loop | duplicates_exceeded | n/a)
+  //   aggregates_decision_complete   — bool: aggregate reached a terminal decision.
+  // The remaining `aggregates_eval_*` / `aggregates_has_eval` fields are
+  // DEPRECATED and kept only for backward compatibility; use the two
+  // primary fields above.
+  string aggregates_status = 20;
+  bool aggregates_decision_complete = 21;
+  bool aggregates_has_eval = 22; // DEPRECATED: redundant with aggregates_decision_complete.
+  uint64 aggregates_eval_data_packets = 23;          // DEPRECATED.
+  uint64 aggregates_eval_duplicate_packets = 24;     // DEPRECATED.
+  uint64 aggregates_eval_retransmitted_packets = 25; // DEPRECATED.
+  uint64 aggregates_eval_non_retransmitted_packets = 26; // DEPRECATED.
   uint64 aggregates_snapshots = 27; // Drop snapshots collected across queues.
   uint64 aggregate_flows_monitored = 28;
   uint64 aggregate_flows_finished = 29;

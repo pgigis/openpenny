@@ -11,24 +11,47 @@
 OpenPenny tells you whether TCP traffic entering your network is **genuinely
 non-spoofed**. It implements the Penny test
 ([SIGCOMM '24](https://dl.acm.org/doi/10.1145/3651890.3672259)): drop a small
-number of packets in a redirected slice of traffic and watch which packets got
+number of packets in a redirected slice of traffic and watch which packets get
 retransmitted. Genuine TCP senders retransmit; spoofed sources do not.
 
-The tool supports two modes:
+Two modes:
 
-- **Active.** Redirect a slice, drop a few packets, observe retransmissions.
-  Confirms whether the redirected slice contains closed-loop traffic.
-- **Passive.** Mirror traffic only. Track sequence coverage, gaps,
-  duplicates, FIN/RST, and idle periods. Useful as a pre-filter before an
-  active check.
+- **Active.** Drop a few packets in the slice; observe retransmissions.
+- **Passive.** Observe only — sequence coverage, gaps, duplicates, FIN/RST,
+  idle expiry. No packets are dropped.
 
-Capture runs over **AF_XDP** (default), **AF_PACKET** for copy-mode taps, or
-**DPDK**, with optional forwarding to a TUN device or raw socket. Interaction
-through **CLI** (`openpenny_cli`) or the **gRPC daemon** (`pennyd` + `penny_worker`).
+Capture is over **AF_XDP** (default), **AF_PACKET** (copy-mode tap), or
+**DPDK**. Optional forwarding to a TUN device or raw socket. Drive it from
+the **CLI** (`openpenny_cli`) or the **gRPC daemon** (`pennyd` +
+`penny_worker`).
 
 <p align="center">
   <img src="docs/images/slice-traffic-figure.png" alt="Traffic slicing and analysis" />
 </p>
+
+## Quick start
+
+```bash
+# Build the CLI (XDP-only).
+cmake -S . -B build -DOPENPENNY_WITH_XDP=ON -DOPENPENNY_WITH_DPDK=OFF
+cmake --build build
+
+# Run an active test on TCP/5201 traffic.
+sudo ./build/openpenny_cli \
+  --config examples/configs/config_minimal_active.yaml \
+  --iface <ifname> --tun xdp-tun
+```
+
+For passive observation, swap to `config_minimal_passive.yaml` and add
+`--mode passive`. The two minimal configs are single-file, no includes;
+production-shaped equivalents that split policy and platform live at
+`examples/configs/config_default.yaml` and `config_passive.yaml`.
+
+Other entry points:
+
+- gRPC daemon: see [`docs/run/grpc-guide.md`](docs/run/grpc-guide.md).
+- Threshold reference: [`docs/run/tuning-reference.md`](docs/run/tuning-reference.md).
+- More config examples: [`docs/run/configuration-examples.md`](docs/run/configuration-examples.md).
 
 ## Requirements
 
@@ -39,79 +62,23 @@ through **CLI** (`openpenny_cli`) or the **gRPC daemon** (`pennyd` + `penny_work
 | Libraries       | `libbpf`, `libxdp`, `libelf`, `libpcap`, `openssl`.        |
 | Optional (DPDK) | `libdpdk` plus hugepages and driver binding.               |
 | Optional (gRPC) | `libgrpc++`, `grpc_cpp_plugin`, Protobuf headers, `protoc`.|
-| Optional (Py)   | Python 3 with `grpcio` and `grpcio-tools` for samples.     |
 
-## Build
-
-XDP-only CLI:
+## Build flavours
 
 ```bash
-cmake -S . -B build -DOPENPENNY_WITH_XDP=ON -DOPENPENNY_WITH_DPDK=OFF
-cmake --build build
-```
-
-CLI plus gRPC:
-
-```bash
+# CLI + gRPC daemon
 cmake -S . -B build \
   -DOPENPENNY_WITH_XDP=ON \
   -DgRPC_DIR=/path/to/lib/cmake/gRPC \
   -DProtobuf_DIR=/path/to/lib/cmake/protobuf \
   -DGRPC_CPP_PLUGIN=/usr/bin/grpc_cpp_plugin
-cmake --build build
-```
 
-DPDK:
-
-```bash
+# DPDK
 cmake -S . -B build -DOPENPENNY_WITH_DPDK=ON -DOPENPENNY_WITH_XDP=OFF
-cmake --build build
 ```
 
-The eBPF program is built automatically; rebuild explicitly with
-`cmake --build build --target xdp_bpf`.
-
-## Quick start
-
-CLI, active mode (XDP + TUN):
-
-```bash
-sudo ./build/openpenny_cli \
-  --config examples/configs/config_default.yaml \
-  --mode active \
-  --prefix 192.168.41.0/24 \
-  --iface <ifname> --queue 0 \
-  --tun xdp-tun
-```
-
-CLI, passive mode (no forwarding needed; the kernel keeps delivering
-packets to the real application):
-
-```bash
-sudo ./build/openpenny_cli \
-  --config examples/configs/config_default.yaml \
-  --mode passive \
-  --prefix 192.168.41.0/24 \
-  --iface <ifname> --queue 0
-```
-
-gRPC daemon:
-
-```bash
-./build/pennyd \
-  --config examples/configs/config_default.yaml \
-  --listen 0.0.0.0:50051 \
-  --worker-bin ./build/penny_worker
-
-python3 examples/grpc_client.py \
-  --addr localhost:50051 \
-  --prefix 192.168.41.0 --mask-bits 24
-```
-
-See `examples/grpc_active_example.py` and `examples/grpc_passive_example.py`
-for tailored payloads. To forward via a raw socket or AF_PACKET instead of
-TUN, set `egress.kind: raw_socket` (or `raw_nic`) in the YAML — see
-[configuration examples](docs/run/configuration-examples.md#egress-where-matched-packets-go).
+The eBPF program is built automatically; rebuild with
+`cmake --build build --target xdp_bpf` if you only need the BPF artifact.
 
 ## Architecture (per queue)
 
@@ -162,23 +129,20 @@ TUN, set `egress.kind: raw_socket` (or `raw_nic`) in the YAML — see
                   Summary  →  CLI / gRPC reply
 ```
 
-`OpenpennyPipelineDriver` spawns one worker per queue and selects the
-ingress backend through `net::create_packet_source`. Each worker owns
-its own packet source; egress is a single `PacketSink` shared across
-all workers.
+One worker per RX queue. Each worker owns its packet source; egress is a
+single `PacketSink` shared across all workers.
 
 ## Repository layout
 
-Full map: [`docs/layout.md`](docs/layout.md). High-level:
+Full map: [`docs/layout.md`](docs/layout.md). High level:
 
-- `src/`, `include/` — core library, pipelines, CLI, gRPC daemon/worker.
+- `src/`, `include/` — core library, pipelines, CLI, gRPC daemon and worker.
 - `src/ingress/` — AF_XDP/eBPF, AF_PACKET mirror, DPDK backends.
 - `ebpf/af_xdp/` — eBPF runtime program.
 - `proto/` — gRPC service definition.
 - `examples/` — configs and sample gRPC clients.
 - `tools/traffic_generator/`, `tools/af_xdp/` — test traffic and AF_XDP
   diagnostics.
-- `scripts/` — install helpers and utilities.
 - `docs/` — start at [`docs/README.md`](docs/README.md).
 
 ## References
@@ -191,11 +155,10 @@ Full map: [`docs/layout.md`](docs/layout.md). High-level:
 ## Project
 
 - Repository: <https://github.com/pgigis/openpenny>
-- Contributing: see [`.github/pull_request_template.md`](.github/pull_request_template.md);
-  use Issues for bugs/features.
-- Security: [`docs/project/SECURITY.md`](docs/project/SECURITY.md).
-- Third-party licenses: [`docs/project/DEPENDENCIES-LICENSES.md`](docs/project/DEPENDENCIES-LICENSES.md).
 - License: [BSD-2-Clause](LICENSE).
+- Security policy: [`docs/project/SECURITY.md`](docs/project/SECURITY.md).
+- Third-party licenses:
+  [`docs/project/DEPENDENCIES-LICENSES.md`](docs/project/DEPENDENCIES-LICENSES.md).
 
 Primary author: **Petros Gigis** ([`pgigis`](https://github.com/pgigis)).
 Contributors: <https://github.com/pgigis/openpenny/graphs/contributors>.
